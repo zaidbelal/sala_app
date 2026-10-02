@@ -10,21 +10,22 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # استخدام Xcode 16.2 الذي يتعرف رسمياً على كلمة sending في Firebase
+      - name: Select Xcode 16.2
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
-      - name: Recreate iOS Platform Cleanly
+      - name: Setup iOS Environment
         run: |
           rm -rf ios macos/ios
           flutter config --no-enable-swift-package-manager
           flutter create --platforms=ios --org com.salaapp .
-          
-          # كتابة platform 15.0 في بداية Podfile بشكل قطعي
-          echo "platform :ios, '15.0'" > ios/Podfile.new
-          cat ios/Podfile >> ios/Podfile.new
-          mv ios/Podfile.new ios/Podfile
+          sed -i '' "s/# platform :ios, '.*'/platform :ios, '15.0'/g" ios/Podfile
+          sed -i '' "s/platform :ios, '.*'/platform :ios, '15.0'/g" ios/Podfile
 
       - name: Install Dependencies
         run: flutter pub get
