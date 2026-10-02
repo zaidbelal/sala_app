@@ -10,9 +10,6 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Force Xcode 15.4
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
-
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -20,21 +17,17 @@ jobs:
 
       - name: Recreate iOS Platform Cleanly
         run: |
-          rm -rf ios
+          rm -rf ios macos/ios
           flutter config --no-enable-swift-package-manager
           flutter create --platforms=ios --org com.salaapp .
-          sed -i '' "s/# platform :ios, '.*'/platform :ios, '14.0'/g" ios/Podfile
-          sed -i '' "s/platform :ios, '.*'/platform :ios, '14.0'/g" ios/Podfile
+          
+          # كتابة platform 15.0 في بداية Podfile بشكل قطعي
+          echo "platform :ios, '15.0'" > ios/Podfile.new
+          cat ios/Podfile >> ios/Podfile.new
+          mv ios/Podfile.new ios/Podfile
 
       - name: Install Dependencies
         run: flutter pub get
-
-      - name: Install Pods & Fix Firebase
-        run: |
-          cd ios
-          pod install --repo-update
-          find Pods -name "FirebaseDataEncoder.swift" -exec sed -i '' 's/sending //g' {} +
-          cd ..
 
       - name: Build iOS Application
         run: flutter build ios --release --no-codesign
