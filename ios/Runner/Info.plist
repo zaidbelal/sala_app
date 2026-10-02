@@ -2,7 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-
     <key>CFBundleDevelopmentRegion</key>
     <string>ar</string>
     <key>CFBundleLocalizations</key>
@@ -39,10 +38,19 @@
     <key>NSPhotoLibraryAddUsageDescription</key>
     <string>يحتاج تطبيق سَلة لحفظ الفواتير والإيصالات الحرارية في معرض الصور الخاص بك.</string>
 
+    <!-- 🔥 تم الإضافة: إذن البصمة والوجه (Face ID / Touch ID) -->
+    <key>NSFaceIDUsageDescription</key>
+    <string>يحتاج التطبيق لاستخدام بصمة الوجه أو الإصبع لتأكيد الهوية بأمان.</string>
+
+    <!-- 🔥 تم الإضافة: لكي تعمل خرائط جوجل ولا تسبب شاشة بيضاء -->
+    <key>io.flutter.embedded_views_preview</key>
+    <true/>
+
     <!-- إشعارات الدفع عن بُعد فقط لـ Apple APNs -->
     <key>UIBackgroundModes</key>
     <array>
         <string>remote-notification</string>
+        <string>fetch</string>
     </array>
 
     <!-- مخططات التطبيقات الخارجية للاتصال والخرائط -->
@@ -75,6 +83,5 @@
     <true/>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
-
 </dict>
 </plist>

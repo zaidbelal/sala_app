@@ -1,3 +1,7 @@
+// ==================================================
+// FILE: lib\main.dart
+// ==================================================
+
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -5,7 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_remote_config/firebase_remote_config.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:firebase_crashlytics/firebase_crashlytics.dart'; // ✅ إضافة استيراد Crashlytics
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:sala/core/services/firebase_service.dart';
 import 'package:sala/core/services/local_storage.dart';
 import 'package:sala/core/services/realtime_hub.dart';
@@ -21,7 +25,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 // ✅ تنظيف النصوص من أي محارف مخفية أو رموز اتجاه تسبب خطأ ISO-8859-1
 String _clean(String val) => val.replaceAll(RegExp(r'[^\x20-\x7E]'), '').trim();
 
-// ✅ قراءة المتغيرات وتطهيرها برمجياً قبل تمريرها لـ Firebase
+// ✅ قراءة المتغيرات وتطهيرها برمجياً قبل تمريرها لـ Firebase (للويب)
 FirebaseOptions get webFirebaseOptions {
   final apiKey = _clean(const String.fromEnvironment('FIREBASE_API_KEY'));
   final authDomain =
@@ -46,22 +50,41 @@ FirebaseOptions get webFirebaseOptions {
   );
 }
 
+// 🔥 تم الإضافة: إعدادات فايربيز الخاصة بالآيفون (لتجاوز مشكلة البناء السحابي في الويندوز)
+const FirebaseOptions iosFirebaseOptions = FirebaseOptions(
+  apiKey: 'AIzaSyC_O1Uu7f5sCrg5Xy2uP1JNeb_qgBPMqjo',
+  appId: '1:846679653389:ios:362d95f5793128e5902944',
+  messagingSenderId: '846679653389',
+  projectId: 'app-sala-b42dd',
+  storageBucket: 'app-sala-b42dd.firebasestorage.app',
+  iosBundleId: 'com.example.sala',
+);
+
+// 🔥 تم الإضافة: دالة تحدد أي إعدادات يتم استخدامها حسب نوع الجهاز
+FirebaseOptions? get currentPlatformOptions {
+  if (kIsWeb) return webFirebaseOptions;
+  if (defaultTargetPlatform == TargetPlatform.iOS) return iosFirebaseOptions;
+  return null; // الأندرويد سيستخدم google-services.json كالمعتاد
+}
+
 // ✅ يجب أن يكون top-level — Flutter يشغّله في isolate منفصل عند الإغلاق
 @pragma('vm:entry-point')
 Future<void> firebaseBackgroundHandler(RemoteMessage message) async {
   if (Firebase.apps.isEmpty) {
+    // 🔥 تم التعديل هنا ليدعم الآيفون
     await Firebase.initializeApp(
-      options: kIsWeb ? webFirebaseOptions : null,
+      options: currentPlatformOptions,
     );
   }
   try {
     await AppStorage.initialize();
   } catch (_) {}
   await NotificationService.instance.initLocalNotifications();
-  
+
   // إجبار إظهار الإشعار بصوت التطبيق المخصص دائماً حتى لو كان مغلقاً
   await NotificationService.instance.showNotification(message);
 }
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -77,9 +100,12 @@ void main() async {
     }
     FlutterError.presentError(details);
   };
+
   if (kDebugMode) debugPrint("==== 1. بدء تهيئة Firebase ====");
+
+  // 🔥 تم التعديل هنا ليدعم الآيفون
   await Firebase.initializeApp(
-    options: kIsWeb ? webFirebaseOptions : null,
+    options: currentPlatformOptions,
   );
 
   // ✅ تسجيل معالج رسائل الخلفية الإلزامي لاستقبال إشعارات السائقين والطلبات عند إغلاق التطبيق

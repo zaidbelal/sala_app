@@ -5,6 +5,7 @@ import 'package:sala/core/services/local_storage.dart';
 import 'app_colors.dart';
 import 'app_radius.dart';
 import 'app_text_styles.dart';
+import 'package:flutter/cupertino.dart';
 
 // مزود إدارة مظهر التطبيق (داكن/فاتح)
 final themeProvider = StateProvider<ThemeMode>((ref) {
