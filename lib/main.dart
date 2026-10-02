@@ -50,16 +50,14 @@ FirebaseOptions get webFirebaseOptions {
   );
 }
 
-// 🔥 تم الإضافة: إعدادات فايربيز الخاصة بالآيفون (لتجاوز مشكلة البناء السحابي في الويندوز)
 const FirebaseOptions iosFirebaseOptions = FirebaseOptions(
   apiKey: 'AIzaSyC_O1Uu7f5sCrg5Xy2uP1JNeb_qgBPMqjo',
   appId: '1:846679653389:ios:362d95f5793128e5902944',
   messagingSenderId: '846679653389',
   projectId: 'app-sala-b42dd',
   storageBucket: 'app-sala-b42dd.firebasestorage.app',
-  iosBundleId: 'com.example.sala',
+  // تم حذف سطر iosBundleId لتجنب كراش Sideloadly
 );
-
 // 🔥 تم الإضافة: دالة تحدد أي إعدادات يتم استخدامها حسب نوع الجهاز
 FirebaseOptions? get currentPlatformOptions {
   if (kIsWeb) return webFirebaseOptions;
@@ -146,8 +144,8 @@ void main() async {
   _warmUpCache(container);
 
   unawaited(_initializeRemoteConfig());
-
-  if (!kIsWeb) {
+// إيقاف الإشعارات للآيفون مؤقتاً لتجنب الكراش بسبب حساب أبل المجاني
+  if (!kIsWeb && defaultTargetPlatform != TargetPlatform.iOS) {
     unawaited(_initializeNotifications());
   }
 }
