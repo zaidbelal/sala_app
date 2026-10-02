@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "سلة — تشغيل عادي ✅",
+      "request": "launch",
+      "type": "dart",
+      "flutterMode": "profile",
+      "noDebug": true,
+      "args": ["--no-sound-null-safety"]
+    },
+    {
+      "name": "سلة — Debug (للتطوير فقط)",
+      "request": "launch",
+      "type": "dart",
+      "flutterMode": "debug"
+    }
+  ]
+}

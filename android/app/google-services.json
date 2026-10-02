@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "846679653389",
+    "project_id": "app-sala-b42dd",
+    "storage_bucket": "app-sala-b42dd.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:846679653389:android:3d185c855d2b73dd902944",
+        "android_client_info": {
+          "package_name": "com.salaapp.sala"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAH7vDwpFainJt7_WLgzojDZxseHL-rAbc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

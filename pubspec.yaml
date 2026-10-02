@@ -1,0 +1,109 @@
+name: sala
+description: منصة توصيل B2B احترافية لليمن
+# publish_to: 'none'
+version: 1.0.1+2
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  gal: ^2.3.0
+  firebase_remote_config: ^5.1.5
+
+  # ════════════════════════════════════════
+  # قاعدة البيانات — Firebase
+  # ════════════════════════════════════════
+  firebase_core: ^3.3.0
+  firebase_auth: ^5.7.0
+  cloud_firestore: ^5.6.0
+  firebase_storage: ^12.4.0
+  cloud_functions: ^5.2.0
+  firebase_messaging: ^15.1.0
+  firebase_app_check: ^0.3.2+10
+  firebase_crashlytics: ^4.3.10
+
+  # ════════════════════════════════════════
+  # إدارة الحالة — Riverpod
+  # ════════════════════════════════════════
+  flutter_riverpod: ^2.5.1
+
+  # ════════════════════════════════════════
+  # التنقل — GoRouter
+  # ════════════════════════════════════════
+  go_router: ^14.2.0
+
+  # ════════════════════════════════════════
+  # الباركود والـ QR Code
+  # ════════════════════════════════════════
+  qr_flutter: ^4.1.0
+
+  # ════════════════════════════════════════
+  # الخطوط والأيقونات
+  # ════════════════════════════════════════
+  google_fonts: ^6.2.1
+  flutter_svg: ^2.0.10+1
+  iconsax: ^0.0.8
+
+  # ════════════════════════════════════════
+  # الخرائط والموقع
+  # ════════════════════════════════════════
+  latlong2: ^0.9.1
+  geolocator: ^13.0.2
+  google_maps_flutter: ^2.10.0
+
+  # ════════════════════════════════════════
+  # الإشعارات المحلية
+  # ════════════════════════════════════════
+  flutter_local_notifications: ^18.0.0
+
+  # ════════════════════════════════════════
+  # الصور
+  # ════════════════════════════════════════
+  cached_network_image: ^3.4.1
+  flutter_cache_manager: ^3.4.1
+  image_picker: ^1.1.2
+
+  # ════════════════════════════════════════
+  # التخزين المحلي والتشفير
+  # ════════════════════════════════════════
+  shared_preferences: ^2.3.2
+  flutter_secure_storage: ^9.2.2
+  crypto: ^3.0.3
+
+  # ════════════════════════════════════════
+  # الشبكة
+  # ════════════════════════════════════════
+  connectivity_plus: ^6.0.3
+  http: ^1.6.0
+
+  # ════════════════════════════════════════
+  # واجهة المستخدم
+  # ════════════════════════════════════════
+  gap: ^3.0.1
+
+  # ════════════════════════════════════════
+  # الملفات والمشاركة
+  # ════════════════════════════════════════
+  path_provider: ^2.1.4
+  share_plus: ^10.1.4
+  url_launcher: ^6.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.1
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/icons/app_icon.png
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icons/app_icon.png"
+  min_sdk_android: 21

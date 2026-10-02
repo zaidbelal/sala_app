@@ -1,0 +1,15 @@
+# Flutter build & dependencies
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# Node modules
+node_modules/
+**/node_modules/
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+*.log
