@@ -15,6 +15,9 @@ class AppStorage {
   static bool _initialized = false;
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(
+      accessibility: KeychainAccessibility.first_unlock,
+    ),
   );
 
   // ══════════════════════════════════════════

@@ -77,8 +77,7 @@ Future<void> firebaseBackgroundHandler(RemoteMessage message) async {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // تعطيل الجلب الخارجي للخطوط بشكل كامل والاعتماد على خط Cairo المحلي
-  GoogleFonts.config.allowRuntimeFetching = false;
+  GoogleFonts.config.allowRuntimeFetching = true;
   FlutterError.onError = (details) {
     final errorStr = details.exception.toString();
     if (errorStr.contains('fonts.gstatic.com') ||
@@ -88,8 +87,7 @@ void main() async {
     }
     FlutterError.presentError(details);
   };
-// 1. تهيئة Firebase مع حماية مهلة صارمة لمنع تعليق إقلاع الآيفون
-  if (kDebugMode) debugPrint("==== 1. بدء تهيئة Firebase ====");
+
   try {
     await Firebase.initializeApp(
       options: kIsWeb ? webFirebaseOptions : null,
@@ -99,46 +97,27 @@ void main() async {
       FirebaseMessaging.onBackgroundMessage(firebaseBackgroundHandler);
     }
   } catch (e) {
-    debugPrint(
-        "⚠️ تعذر تهيئة Firebase عند بدء التشغيل (سيتم تجاوزها لفتح الواجهة): $e");
-  }
-  // 2. محاولة مزامنة Auth بدون تجميد التشغيل
-  if (kDebugMode) debugPrint("==== 2. بدء تهيئة المستخدم ====");
-  try {
-    if (Firebase.apps.isNotEmpty) {
-      await FirebaseAuth.instance
-          .authStateChanges()
-          .first
-          .timeout(const Duration(seconds: 2));
-    }
-  } catch (_) {
-    if (kDebugMode) debugPrint("تجاوزنا Auth بسبب التأخر أو غياب الشبكة");
+    debugPrint("⚠️ تعذر تهيئة Firebase عند بدء التشغيل: $e");
   }
 
-  // 3. تهيئة التخزين المحلي والكاش
-  if (kDebugMode) debugPrint("==== 3. تهيئة التخزين المحلي ====");
   try {
     await AppStorage.initialize();
   } catch (e) {
     debugPrint("خطأ في AppStorage: $e");
   }
 
-  if (kDebugMode) debugPrint("==== 4. تهيئة الكاش ====");
   try {
     await AppCache.instance.init();
   } catch (e) {
     debugPrint("خطأ في AppCache: $e");
   }
 
-  if (kDebugMode) debugPrint("==== 5. تهيئة الخدمات ====");
   try {
     FirebaseService.initialize();
   } catch (_) {}
 
   final container = ProviderContainer();
 
-  // 6. تشغيل الواجهة بشكل مضمون 100% مهما حدث في الخدمات السابقة
-  if (kDebugMode) debugPrint("==== 6. تشغيل واجهة التطبيق! ====");
   runApp(
     UncontrolledProviderScope(
       container: container,
@@ -146,7 +125,6 @@ void main() async {
     ),
   );
 
-  // تشغيل الخدمات الحية في الخلفية بعد تحميل الشاشة
   try {
     RealtimeHub().init(container);
   } catch (_) {}

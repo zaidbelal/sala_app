@@ -60,13 +60,10 @@ class SessionChecker {
 
   static Future<SessionResult> check() async {
     try {
-      final sessionFuture = _checkSession();
-      final minimumSplashDuration = Future<void>.delayed(
-        const Duration(milliseconds: 800),
+      final result = await _checkSession().timeout(
+        const Duration(milliseconds: 2500),
+        onTimeout: () => localSessionResult(),
       );
-
-      final result = await sessionFuture;
-      await minimumSplashDuration;
       return result;
     } catch (_) {
       return localSessionResult();
@@ -74,117 +71,70 @@ class SessionChecker {
   }
 
   static Future<SessionResult> _checkSession() async {
-    User? authUser;
-
     try {
-      authUser = FirebaseAuth.instance.currentUser;
-      if (authUser == null &&
-          AppStorage.isLoggedIn &&
-          !AppStorage.isSessionExpired) {
-        authUser = await FirebaseAuth.instance
-            .authStateChanges()
-            .firstWhere((user) => user != null)
-            .timeout(const Duration(seconds: 3));
+      final userId = AppStorage.userId;
+      if (!AppStorage.isLoggedIn || userId == null || userId.trim().isEmpty) {
+        return SessionResult.unauthenticated;
       }
-    } catch (e) {
-      debugPrint("FirebaseAuth init error: $e");
-      return SessionResult.unauthenticated;
-    }
 
-    final userId = AppStorage.userId;
+      if (AppStorage.isSessionExpired) {
+        await AppStorage.clearUserData();
+        return SessionResult.unauthenticated;
+      }
 
-    if (!AppStorage.isLoggedIn || userId == null || userId.trim().isEmpty) {
-      await AppStorage.clearUserData();
-      return SessionResult.unauthenticated;
-    }
+      final authUser = FirebaseAuth.instance.currentUser;
+      if (authUser != null && authUser.uid != userId.trim()) {
+        return localSessionResult();
+      }
 
-    if (AppStorage.isSessionExpired) {
-      await AppStorage.clearUserData();
-      return SessionResult.unauthenticated;
-    }
-
-    if (authUser == null || authUser.uid != userId.trim()) {
-      return localSessionResult();
-    }
-
-    try {
       final profileSnapshot = await FirebaseFirestore.instance
           .collection('profiles')
           .doc(userId)
           .get(const GetOptions(source: Source.serverAndCache))
-          .timeout(const Duration(seconds: 4));
+          .timeout(const Duration(seconds: 2));
 
-      if (!profileSnapshot.exists || profileSnapshot.data() == null) {
-        if (profileSnapshot.metadata.isFromCache) {
-          return localSessionResult();
-        }
-        try {
-          await FirebaseAuth.instance
-              .signOut()
-              .timeout(const Duration(seconds: 2));
-        } catch (_) {}
-        await AppStorage.clearUserData();
-        return SessionResult.unauthenticated;
-      }
+      if (profileSnapshot.exists && profileSnapshot.data() != null) {
+        final data = profileSnapshot.data()!;
+        final isActive = data['is_active'] as bool? ?? false;
+        final isBanned = data['is_banned'] == true;
+        final serverRole =
+            data['role']?.toString().trim().toLowerCase() ?? 'merchant';
 
-      final data = profileSnapshot.data()!;
-      final isActive = data['is_active'] as bool? ?? false;
-      final isBanned = data['is_banned'] == true;
-      final serverRole = data['role']?.toString().trim().toLowerCase();
-      final accountStatus =
-          data['account_status']?.toString().trim().toLowerCase() ?? '';
-
-      if (isBanned || (!isActive && accountStatus != 'pending')) {
-        try {
-          await FirebaseAuth.instance
-              .signOut()
-              .timeout(const Duration(seconds: 2));
-        } catch (_) {}
-        await AppStorage.clearUserData();
-        return SessionResult.unauthenticated;
-      }
-
-      if (!isActive) {
-        await AppStorage.setIsActive(false);
-        await AppStorage.setIsBanned(false);
-        return SessionResult.pending;
-      }
-
-      if (serverRole == null || serverRole.isEmpty) {
-        await AppStorage.clearUserData();
-        return SessionResult.unauthenticated;
-      }
-
-      await AppStorage.setIsActive(true);
-      await AppStorage.setIsBanned(false);
-
-      await AppStorage.saveUserData(
-        userId: userId,
-        role: serverRole,
-        name: data['full_name']?.toString(),
-        phone: data['phone_number']?.toString(),
-      );
-
-      RealtimeHub().startForUser(userId, role: serverRole);
-
-      switch (serverRole) {
-        case 'admin':
-        case 'super_admin':
-        case 'accountant':
-        case 'warehouse_manager':
-          return SessionResult.admin;
-
-        case 'driver':
-          return SessionResult.driver;
-
-        case 'merchant':
-          return SessionResult.merchant;
-
-        default:
+        if (isBanned) {
           await AppStorage.clearUserData();
           return SessionResult.unauthenticated;
+        }
+
+        if (!isActive) {
+          await AppStorage.setIsActive(false);
+          return SessionResult.pending;
+        }
+
+        await AppStorage.setIsActive(true);
+        await AppStorage.saveUserData(
+          userId: userId,
+          role: serverRole,
+          name: data['full_name']?.toString(),
+          phone: data['phone_number']?.toString(),
+        );
+
+        RealtimeHub().startForUser(userId, role: serverRole);
+
+        switch (serverRole) {
+          case 'admin':
+          case 'super_admin':
+          case 'accountant':
+          case 'warehouse_manager':
+            return SessionResult.admin;
+          case 'driver':
+            return SessionResult.driver;
+          default:
+            return SessionResult.merchant;
+        }
       }
-    } catch (error) {
+
+      return localSessionResult();
+    } catch (_) {
       return localSessionResult();
     }
   }

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../controllers/session_checker.dart';
 
@@ -53,8 +54,8 @@ class _SplashAnimatorState extends State<SplashAnimator>
     _startSequence();
     _listenToSession();
 
-    // 🚀 صمام أمان إجباري للآيفون: تخطي التعليق والانتقال لشاشة الدخول بعد 3 ثوانٍ مهما حدث
-    Future.delayed(const Duration(seconds: 3), () {
+    // 🚀 صمام أمان فوري للآيفون: إجبار الانتقال بعد 2.5 ثانية إذا حدث أي تأخير
+    Timer(const Duration(milliseconds: 2500), () {
       if (mounted && !_animationDone) {
         _animationDone = true;
         _sessionResult ??= SessionChecker.localSessionResult();
@@ -193,13 +194,14 @@ class _SplashAnimatorState extends State<SplashAnimator>
   Future<void> _listenToSession() async {
     try {
       _sessionResult = await widget.sessionFuture.timeout(
-        const Duration(seconds: 6),
+        const Duration(milliseconds: 2200),
       );
     } catch (_) {
-      // عند بطء الإنترنت نستخدم الجلسة المحفوظة محلياً
       _sessionResult = SessionChecker.localSessionResult();
     }
-    _tryNavigate();
+    if (mounted) {
+      _tryNavigate();
+    }
   }
 
   void _tryNavigate() {
