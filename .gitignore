@@ -8,3 +8,12 @@ node_modules/
 .idea/
 .vscode/
 *.iml
+.dart_tool/
+.packages
+build/
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+*.ipa
+*.zip
