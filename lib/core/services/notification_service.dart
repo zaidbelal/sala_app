@@ -63,68 +63,65 @@ class NotificationService {
   static final GlobalKey<NavigatorState> navigatorKey =
       GlobalKey<NavigatorState>();
   static String? pendingRoute;
-
-  // ── تهيئة المكتبة المحلية مع فرض تشغيل صوت الإشعار الرسمي لأندرويد ──
+// ── تهيئة المكتبة المحلية مع فرض تشغيل صوت الإشعار الرسمي لأندرويد و iOS ──
   Future<void> initLocalNotifications({bool isBackground = false}) async {
-    // 🚀 القناة الرسمية للطلبات العامة
-    const ordersChannel = AndroidNotificationChannel(
-      'sala_orders_channel_v3',
-      'طلبات سلة',
-      description: 'إشعارات الطلبات وتحديثات الحالة والمرتجعات',
-      importance: Importance.max,
-      playSound: true,
-      enableVibration: true,
-      enableLights: true,
-    );
+    try {
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        const ordersChannel = AndroidNotificationChannel(
+          'sala_orders_channel_v3',
+          'طلبات سلة',
+          description: 'إشعارات الطلبات وتحديثات الحالة والمرتجعات',
+          importance: Importance.max,
+          playSound: true,
+          enableVibration: true,
+          enableLights: true,
+        );
 
-    // 🚀 قناة إشعارات السائقين المعتمدة لمنع إسقاط إشعاراتهم في أندرويد 8+
-    const driverChannel = AndroidNotificationChannel(
-      'sala_orders_channel',
-      'طلبات السائقين',
-      description: 'إشعارات الطلبات الجديدة للسائق مع الرنين',
-      importance: Importance.max,
-      playSound: true,
-      enableVibration: true,
-      sound: RawResourceAndroidNotificationSound('sala_notification'),
-    );
+        const driverChannel = AndroidNotificationChannel(
+          'sala_orders_channel',
+          'طلبات السائقين',
+          description: 'إشعارات الطلبات الجديدة للسائق مع الرنين',
+          importance: Importance.max,
+          playSound: true,
+          enableVibration: true,
+          sound: RawResourceAndroidNotificationSound('sala_notification'),
+        );
 
-    final androidPlugin = _localNotif.resolvePlatformSpecificImplementation<
-        AndroidFlutterLocalNotificationsPlugin>();
-    await androidPlugin?.createNotificationChannel(ordersChannel);
-    await androidPlugin?.createNotificationChannel(driverChannel);
+        final androidPlugin = _localNotif.resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>();
+        await androidPlugin?.createNotificationChannel(ordersChannel);
+        await androidPlugin?.createNotificationChannel(driverChannel);
 
-    // طلب الإذن فقط أثناء تشغيل التطبيق في الواجهة وليس في الـ Isolate الخلفي
-    if (!isBackground) {
-      try {
-        await androidPlugin?.requestNotificationsPermission();
-      } catch (_) {}
-    }
+        if (!isBackground) {
+          await androidPlugin?.requestNotificationsPermission();
+        }
+      }
 
-    const initSettings = InitializationSettings(
-      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-      iOS: DarwinInitializationSettings(
-        requestAlertPermission: true,
-        requestBadgePermission: true,
-        requestSoundPermission: true,
-      ),
-    );
+      const initSettings = InitializationSettings(
+        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        iOS: DarwinInitializationSettings(
+          requestAlertPermission: false,
+          requestBadgePermission: false,
+          requestSoundPermission: false,
+        ),
+      );
 
-    await _localNotif.initialize(
-      initSettings,
-      onDidReceiveNotificationResponse: _onTap,
-    );
+      await _localNotif.initialize(
+        initSettings,
+        onDidReceiveNotificationResponse: _onTap,
+      );
+    } catch (_) {}
   }
 
   Future<void> init() async {
     try {
-      // طلب الإذن لمرة واحدة فقط مع مهلة أمان صارمة لمنع التعليق على الأجهزة بدون خدمات Google
       await _messaging
           .requestPermission(
             alert: true,
             badge: true,
             sound: true,
           )
-          .timeout(const Duration(seconds: 4));
+          .timeout(const Duration(seconds: 2));
 
       await _messaging
           .setForegroundNotificationPresentationOptions(
@@ -132,38 +129,23 @@ class NotificationService {
             badge: true,
             sound: true,
           )
-          .timeout(const Duration(seconds: 2));
+          .timeout(const Duration(seconds: 1));
     } catch (_) {}
-    // 2. تهيئة المكتبة المحلية
+
     await initLocalNotifications();
 
-    // 3. معالجة FCM
-    await _onMessageSub?.cancel();
-    await _onMessageOpenedSub?.cancel();
-    _onMessageSub = FirebaseMessaging.onMessage.listen(showNotification);
-    _onMessageOpenedSub =
-        FirebaseMessaging.onMessageOpenedApp.listen(_handleFcmTap);
-
-    // معالجة الإشعار السحابي مع حماية المهلة
     try {
+      await _onMessageSub?.cancel();
+      await _onMessageOpenedSub?.cancel();
+      _onMessageSub = FirebaseMessaging.onMessage.listen(showNotification);
+      _onMessageOpenedSub =
+          FirebaseMessaging.onMessageOpenedApp.listen(_handleFcmTap);
+
       final initial = await _messaging
           .getInitialMessage()
-          .timeout(const Duration(seconds: 3), onTimeout: () => null);
+          .timeout(const Duration(seconds: 1), onTimeout: () => null);
       if (initial != null) {
         _handleFcmTap(initial);
-      }
-    } catch (_) {}
-
-    // معالجة الإشعار المحلي مع حماية المهلة
-    try {
-      final launchDetails = await _localNotif
-          .getNotificationAppLaunchDetails()
-          .timeout(const Duration(seconds: 2), onTimeout: () => null);
-      if (launchDetails != null && launchDetails.didNotificationLaunchApp) {
-        final payload = launchDetails.notificationResponse?.payload;
-        if (payload != null && payload.isNotEmpty) {
-          _navigateTo(payload);
-        }
       }
     } catch (_) {}
   }

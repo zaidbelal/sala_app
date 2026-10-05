@@ -22,10 +22,8 @@ class SessionChecker {
 
   static SessionResult localSessionResult() {
     try {
-      final authUser = FirebaseAuth.instance.currentUser;
-      if (!AppStorage.isLoggedIn ||
-          authUser == null ||
-          authUser.uid != AppStorage.userId) {
+      final userId = AppStorage.userId;
+      if (!AppStorage.isLoggedIn || userId == null || userId.trim().isEmpty) {
         return SessionResult.unauthenticated;
       }
 
@@ -61,7 +59,7 @@ class SessionChecker {
   static Future<SessionResult> check() async {
     try {
       final result = await _checkSession().timeout(
-        const Duration(milliseconds: 2500),
+        const Duration(milliseconds: 1500),
         onTimeout: () => localSessionResult(),
       );
       return result;
@@ -82,16 +80,11 @@ class SessionChecker {
         return SessionResult.unauthenticated;
       }
 
-      final authUser = FirebaseAuth.instance.currentUser;
-      if (authUser != null && authUser.uid != userId.trim()) {
-        return localSessionResult();
-      }
-
       final profileSnapshot = await FirebaseFirestore.instance
           .collection('profiles')
           .doc(userId)
           .get(const GetOptions(source: Source.serverAndCache))
-          .timeout(const Duration(seconds: 2));
+          .timeout(const Duration(milliseconds: 1200));
 
       if (profileSnapshot.exists && profileSnapshot.data() != null) {
         final data = profileSnapshot.data()!;

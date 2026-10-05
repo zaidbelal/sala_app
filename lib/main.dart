@@ -91,9 +91,9 @@ void main() async {
   try {
     await Firebase.initializeApp(
       options: kIsWeb ? webFirebaseOptions : null,
-    ).timeout(const Duration(seconds: 3));
+    );
 
-    if (!kIsWeb && Firebase.apps.isNotEmpty) {
+    if (!kIsWeb && defaultTargetPlatform != TargetPlatform.iOS) {
       FirebaseMessaging.onBackgroundMessage(firebaseBackgroundHandler);
     }
   } catch (e) {
@@ -133,7 +133,6 @@ void main() async {
 
   if (Firebase.apps.isNotEmpty) {
     unawaited(_initializeRemoteConfig());
-
     if (!kIsWeb) {
       unawaited(_initializeNotifications());
     }

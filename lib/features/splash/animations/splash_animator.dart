@@ -54,8 +54,8 @@ class _SplashAnimatorState extends State<SplashAnimator>
     _startSequence();
     _listenToSession();
 
-    // 🚀 صمام أمان فوري للآيفون: إجبار الانتقال بعد 2.5 ثانية إذا حدث أي تأخير
-    Timer(const Duration(milliseconds: 2500), () {
+// صمام أمان لنظام iOS للتنقل الفوري
+    Timer(const Duration(milliseconds: 1500), () {
       if (mounted && !_animationDone) {
         _animationDone = true;
         _sessionResult ??= SessionChecker.localSessionResult();

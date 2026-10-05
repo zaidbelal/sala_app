@@ -66,27 +66,20 @@ final appRouterProvider = Provider<GoRouter>((ref) {
       if (path == AppRoutes.splash) {
         return null;
       }
-
       final firebaseUser = FirebaseAuth.instance.currentUser;
 
       // حماية من التوجيه الخاطئ أثناء تهيئة المستخدم لأول مرة
-      if (firebaseUser == null && AppStorage.userId == null) {
+      if (AppStorage.userId == null || AppStorage.userId!.isEmpty) {
         if (!publicRoutes.contains(path)) {
           return AppRoutes.login;
         }
         return null;
       }
-// ✅ حماية الجلسة أوفلاين: عدم طرد التاجر إذا كان مسجلاً محلياً والجلسة سارية
-      final bool sessionExpiredOrMismatch =
-          (AppStorage.isLoggedIn && AppStorage.isSessionExpired) ||
-              (firebaseUser != null &&
-                  AppStorage.userId != null &&
-                  firebaseUser.uid != AppStorage.userId);
 
-      // لا نعتبر الجلسة ملغاة لمجرد تأخر رد فايربيز أثناء غياب الإنترنت
-      final bool sessionInvalid = sessionExpiredOrMismatch;
+      final bool sessionExpired =
+          AppStorage.isLoggedIn && AppStorage.isSessionExpired;
 
-      if (sessionInvalid) {
+      if (sessionExpired) {
         if (!publicRoutes.contains(path)) {
           return AppRoutes.login;
         }
