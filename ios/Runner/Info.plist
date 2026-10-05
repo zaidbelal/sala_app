@@ -49,6 +49,16 @@
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<!-- أذونات النظام المطلوبة لمنع إغلاق أو تجميد التطبيق على iOS -->
+	<key>NSCameraUsageDescription</key>
+	<string>يحتاج التطبيق للكاميرا لمسح باركود المنتجات</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>يحتاج التطبيق لتحديد موقع متجرك لتوصيل الطلبات</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>يحتاج التطبيق للوصول للصور لحفظ ومشاركة الفواتير</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>يحتاج التطبيق لإذن حفظ الفواتير في ألبوم الصور</string>
+
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>

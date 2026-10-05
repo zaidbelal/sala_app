@@ -88,22 +88,20 @@ void main() async {
     }
     FlutterError.presentError(details);
   };
-
-  // 1. تهيئة Firebase مع حماية من الانهيار على iOS لمنع تعليق الشاشة البيضاء
+// 1. تهيئة Firebase مع حماية مهلة صارمة لمنع تعليق إقلاع الآيفون
   if (kDebugMode) debugPrint("==== 1. بدء تهيئة Firebase ====");
   try {
     await Firebase.initializeApp(
       options: kIsWeb ? webFirebaseOptions : null,
-    );
+    ).timeout(const Duration(seconds: 3));
 
-    if (!kIsWeb) {
+    if (!kIsWeb && Firebase.apps.isNotEmpty) {
       FirebaseMessaging.onBackgroundMessage(firebaseBackgroundHandler);
     }
   } catch (e) {
     debugPrint(
         "⚠️ تعذر تهيئة Firebase عند بدء التشغيل (سيتم تجاوزها لفتح الواجهة): $e");
   }
-
   // 2. محاولة مزامنة Auth بدون تجميد التشغيل
   if (kDebugMode) debugPrint("==== 2. بدء تهيئة المستخدم ====");
   try {

@@ -52,6 +52,15 @@ class _SplashAnimatorState extends State<SplashAnimator>
     _setupAnimations();
     _startSequence();
     _listenToSession();
+
+    // 🚀 صمام أمان إجباري للآيفون: تخطي التعليق والانتقال لشاشة الدخول بعد 3 ثوانٍ مهما حدث
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted && !_animationDone) {
+        _animationDone = true;
+        _sessionResult ??= SessionChecker.localSessionResult();
+        widget.onAnimationComplete(_sessionResult!);
+      }
+    });
   }
 
   @override
