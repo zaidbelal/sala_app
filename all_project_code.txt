@@ -682,6 +682,10 @@ class _ErrorScreen extends StatelessWidget {
 // FILE: lib\main.dart
 // ==================================================
 
+// ==================================================
+// FILE: lib/main.dart
+// ==================================================
+
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -689,7 +693,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_remote_config/firebase_remote_config.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:firebase_crashlytics/firebase_crashlytics.dart'; // ✅ إضافة استيراد Crashlytics
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:sala/core/services/firebase_service.dart';
 import 'package:sala/core/services/local_storage.dart';
 import 'package:sala/core/services/realtime_hub.dart';
@@ -733,17 +737,18 @@ FirebaseOptions get webFirebaseOptions {
 // ✅ يجب أن يكون top-level — Flutter يشغّله في isolate منفصل عند الإغلاق
 @pragma('vm:entry-point')
 Future<void> firebaseBackgroundHandler(RemoteMessage message) async {
-  if (Firebase.apps.isEmpty) {
-    await Firebase.initializeApp(
-      options: kIsWeb ? webFirebaseOptions : null,
-    );
-  }
+  try {
+    if (Firebase.apps.isEmpty) {
+      await Firebase.initializeApp(
+        options: kIsWeb ? webFirebaseOptions : null,
+      );
+    }
+  } catch (_) {}
+
   try {
     await AppStorage.initialize();
   } catch (_) {}
 
-  // إذا كانت الرسالة تحتوي على كائن notification فنظام أندرويد يعرضها تلقائياً
-  // ويتم استدعاء الإشعار يدوياً فقط لرسائل البيانات الصامتة (Data-only) منعاً للتكرار
   if (message.notification == null) {
     try {
       await NotificationService.instance
@@ -763,42 +768,62 @@ void main() async {
     if (errorStr.contains('fonts.gstatic.com') ||
         errorStr.contains('Failed to load font') ||
         errorStr.contains('MultiImageStreamCompleter')) {
-      // اعتراض أخطاء الخطوط والصور الشبكية لمنع تسجيلها كأخطاء قاتلة
       return;
     }
     FlutterError.presentError(details);
   };
-  if (kDebugMode) debugPrint("==== 1. بدء تهيئة Firebase ====");
-  await Firebase.initializeApp(
-    options: kIsWeb ? webFirebaseOptions : null,
-  );
 
-  // ✅ تسجيل معالج رسائل الخلفية الإلزامي لاستقبال إشعارات السائقين والطلبات عند إغلاق التطبيق
-  if (!kIsWeb) {
-    FirebaseMessaging.onBackgroundMessage(firebaseBackgroundHandler);
+  // 1. تهيئة Firebase مع حماية من الانهيار على iOS لمنع تعليق الشاشة البيضاء
+  if (kDebugMode) debugPrint("==== 1. بدء تهيئة Firebase ====");
+  try {
+    await Firebase.initializeApp(
+      options: kIsWeb ? webFirebaseOptions : null,
+    );
+
+    if (!kIsWeb) {
+      FirebaseMessaging.onBackgroundMessage(firebaseBackgroundHandler);
+    }
+  } catch (e) {
+    debugPrint(
+        "⚠️ تعذر تهيئة Firebase عند بدء التشغيل (سيتم تجاوزها لفتح الواجهة): $e");
   }
 
+  // 2. محاولة مزامنة Auth بدون تجميد التشغيل
   if (kDebugMode) debugPrint("==== 2. بدء تهيئة المستخدم ====");
   try {
-    await FirebaseAuth.instance
-        .authStateChanges()
-        .first
-        .timeout(const Duration(seconds: 3));
+    if (Firebase.apps.isNotEmpty) {
+      await FirebaseAuth.instance
+          .authStateChanges()
+          .first
+          .timeout(const Duration(seconds: 2));
+    }
   } catch (_) {
-    if (kDebugMode) debugPrint("تجاوزنا Auth بسبب بطء المحاكي");
+    if (kDebugMode) debugPrint("تجاوزنا Auth بسبب التأخر أو غياب الشبكة");
   }
 
+  // 3. تهيئة التخزين المحلي والكاش
   if (kDebugMode) debugPrint("==== 3. تهيئة التخزين المحلي ====");
-  await AppStorage.initialize();
+  try {
+    await AppStorage.initialize();
+  } catch (e) {
+    debugPrint("خطأ في AppStorage: $e");
+  }
 
   if (kDebugMode) debugPrint("==== 4. تهيئة الكاش ====");
-  await AppCache.instance.init();
+  try {
+    await AppCache.instance.init();
+  } catch (e) {
+    debugPrint("خطأ في AppCache: $e");
+  }
 
   if (kDebugMode) debugPrint("==== 5. تهيئة الخدمات ====");
-  FirebaseService.initialize();
+  try {
+    FirebaseService.initialize();
+  } catch (_) {}
 
   final container = ProviderContainer();
 
+  // 6. تشغيل الواجهة بشكل مضمون 100% مهما حدث في الخدمات السابقة
   if (kDebugMode) debugPrint("==== 6. تشغيل واجهة التطبيق! ====");
   runApp(
     UncontrolledProviderScope(
@@ -807,13 +832,19 @@ void main() async {
     ),
   );
 
-  RealtimeHub().init(container);
+  // تشغيل الخدمات الحية في الخلفية بعد تحميل الشاشة
+  try {
+    RealtimeHub().init(container);
+  } catch (_) {}
+
   _warmUpCache(container);
 
-  unawaited(_initializeRemoteConfig());
+  if (Firebase.apps.isNotEmpty) {
+    unawaited(_initializeRemoteConfig());
 
-  if (!kIsWeb) {
-    unawaited(_initializeNotifications());
+    if (!kIsWeb) {
+      unawaited(_initializeNotifications());
+    }
   }
 }
 
@@ -852,7 +883,6 @@ Future<void> _initializeNotifications() async {
       debugPrint('Notification initialization failed: $error');
       debugPrintStack(stackTrace: stackTrace);
     }
-    // ✅ تسجيل الخطأ في Crashlytics حتى في Release ليتابع الفريق المشكلة
     if (!kIsWeb) {
       try {
         await FirebaseCrashlytics.instance.recordError(
@@ -863,14 +893,6 @@ Future<void> _initializeNotifications() async {
         );
       } catch (_) {}
     }
-    // ✅ إظهار إشعار محلي للمستخدم ليعلم بأن الإشعارات معطّلة (مهم لتدفق عمل التاجر)
-    try {
-      await NotificationService.instance.showLocalNotification(
-        title: '⚠️ تنبيه: الإشعارات غير مفعّلة',
-        body:
-            'يرجى تفعيل الإشعارات من إعدادات النظام لتصلك تحديثات الطلبات الجديدة',
-      );
-    } catch (_) {}
   }
 }
 
@@ -905,9 +927,6 @@ class _SalaAppState extends ConsumerState<SalaApp> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  /// ✅ تجديد صلاحية الجلسة عند استئناف التطبيق من الخلفية.
-  /// يمنع تسجيل خروج مفاجئ لمستخدم أبقت التطبيق مفتوحاً أكثر من
-  /// 30 يوماً متواصلة (مثل جهاز POS في متجر).
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && AppStorage.isLoggedIn) {
@@ -921,14 +940,14 @@ class _SalaAppState extends ConsumerState<SalaApp> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     final router = ref.watch(appRouterProvider);
-    final currentTheme = ref.watch(themeProvider); // 👈 مراقبة حالة الثيم
+    final currentTheme = ref.watch(themeProvider);
 
     return MaterialApp.router(
       title: 'سلة',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light,
       darkTheme: AppTheme.dark,
-      themeMode: currentTheme, // 👈 تطبيق الثيم المختار
+      themeMode: currentTheme,
       routerConfig: router,
       locale: const Locale('ar'),
       builder: (context, child) {
@@ -1617,6 +1636,7 @@ import 'package:sala/core/services/local_storage.dart';
 import 'app_colors.dart';
 import 'app_radius.dart';
 import 'app_text_styles.dart';
+import 'package:flutter/cupertino.dart';
 
 // مزود إدارة مظهر التطبيق (داكن/فاتح)
 final themeProvider = StateProvider<ThemeMode>((ref) {
