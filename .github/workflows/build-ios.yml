@@ -17,14 +17,23 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Fix iOS directory structure
+      - name: Configure and Enable iOS Platform
         run: |
+          # نقل مجلد ios إلى الجذر إذا كان بالخطأ داخل macos
           if [ -d "macos/ios" ] && [ ! -d "ios" ]; then
-            cp -r macos/ios ios
+            mv macos/ios ios
           fi
+          
+          # تهيئة إعدادات منصة iOS الرسمية في Flutter
+          flutter config --enable-ios
+          flutter create --platforms=ios .
 
-      - name: Get Dependencies
-        run: flutter pub get
+      - name: Install Pods & Dependencies
+        run: |
+          flutter pub get
+          cd ios
+          pod install --repo-update
+          cd ..
 
       - name: Build iOS (No Codesign)
         run: flutter build ios --release --no-codesign
