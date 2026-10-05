@@ -8,16 +8,16 @@
       xcode: latest
       cocoapods: default
     scripts:
-      - name: Get Flutter dependencies
+      - name: Prepare Flutter and Generate Configs
         script: |
           flutter packages pub get
+          flutter build ios --config-only --no-codesign
       - name: Install CocoaPods
         script: |
           cd ios && pod install && cd ..
       - name: Build and Package Unsigned IPA
         script: |
           set -e
-          # 1. Build Xcode archive without signing
           xcodebuild -workspace ios/Runner.xcworkspace \
                      -scheme Runner \
                      -configuration Release \
@@ -28,7 +28,6 @@
                      CODE_SIGNING_ALLOWED=NO \
                      archive
 
-          # 2. Package into IPA format
           mkdir -p build/Payload
           cp -R build/ios/Runner.xcarchive/Products/Applications/Runner.app build/Payload/
           cd build
