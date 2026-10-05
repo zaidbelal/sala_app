@@ -2,14 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-
-	<!-- ═══════════════════════════════════════════
-	     معلومات التطبيق الأساسية
-	════════════════════════════════════════════ -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>سَلة</string>
+	<string>Sala</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -26,46 +24,30 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
-
-	<!-- ═══════════════════════════════════════════
-	     إذن الموقع — أثناء استخدام التطبيق فقط (آمن ومعتمد من أبل)
-	════════════════════════════════════════════ -->
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>يحتاج تطبيق سَلة لموقعك لتحديد عنوان المتجر وتوصيل طلبات الجملة بدقة.</string>
-
-	<!-- ═══════════════════════════════════════════
-	     إذن الكاميرا ومكتبة الصور — الباركود، الفواتير، وصور المنتجات
-	════════════════════════════════════════════ -->
-	<key>NSCameraUsageDescription</key>
-	<string>يحتاج تطبيق سَلة للكاميرا لمسح باركود المنتجات لإضافتها للسلة والتقاط صور الفواتير والمنتجات.</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>يحتاج تطبيق سَلة للوصول إلى الصور لرفع ومشاركة صور الفواتير والمنتجات.</string>
-	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>يحتاج تطبيق سَلة لحفظ الفواتير والإيصالات الحرارية في معرض الصور الخاص بك.</string>
-
-	<!-- ═══════════════════════════════════════════
-	     الإشعارات في الخلفية (FCM)
-	════════════════════════════════════════════ -->
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>remote-notification</string>
-		<string>fetch</string>
-	</array>
-
-	<!-- ═══════════════════════════════════════════
-	     تطبيقات الخرائط، الاتصال، والملاحة الخارجية
-	════════════════════════════════════════════ -->
-	<key>LSApplicationQueriesSchemes</key>
-	<array>
-		<string>maps</string>
-		<string>comgooglemaps</string>
-		<string>tel</string>
-	</array>
-
-	<!-- ═══════════════════════════════════════════
-	     إعدادات الشاشة والآيباد (حل مشكلة رفض الآيباد)
-	════════════════════════════════════════════ -->
-	<key>UIRequiresFullScreen</key>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneClassName</key>
+					<string>UIWindowScene</string>
+					<key>UISceneConfigurationName</key>
+					<string>flutter</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+					<key>UISceneStoryboardFile</key>
+					<string>Main</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
@@ -74,19 +56,15 @@
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-
-	<key>UIViewControllerBasedStatusBarAppearance</key>
-	<false/>
-	<key>CADisableMinimumFrameDurationOnPhone</key>
-	<true/>
-	<key>UIApplicationSupportsIndirectInputEvents</key>
-	<true/>
-
 </dict>
 </plist>
