@@ -20,24 +20,12 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    // إخفاء شريط الحالة أثناء الـ Splash
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-  }
-
-  @override
-  void dispose() {
-    // إعادة شريط الحالة
-    SystemChrome.setEnabledSystemUIMode(
-      SystemUiMode.manual,
-      overlays: SystemUiOverlay.values,
-    );
-    super.dispose();
+    // تم حذف SystemUiMode.immersiveSticky لمنع تجميد الأنيميشن في iOS
   }
 
   void _onAnimationComplete(SessionResult result) {
     if (!mounted) return;
 
-    // الحفاظ على مسار الإشعار المعلق وعدم الكتابة فوقه بالمسار الافتراضي
     final pending = NotificationService.pendingRoute;
     if (pending != null && pending.isNotEmpty && result.isAuthenticated) {
       NotificationService.pendingRoute = null;
@@ -61,7 +49,6 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
         ),
         child: Stack(
           children: [
-            // ── زخرفة خلفية علوية ──
             Positioned(
               top: -80,
               right: -60,
@@ -70,8 +57,6 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
                 color: Colors.white.withValues(alpha: 0.05),
               ),
             ),
-
-            // ── زخرفة خلفية سفلية ──
             Positioned(
               bottom: -100,
               left: -80,
@@ -80,8 +65,6 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
                 color: Colors.white.withValues(alpha: 0.04),
               ),
             ),
-
-            // ── زخرفة وسطى ──
             Positioned(
               top: MediaQuery.of(context).size.height * 0.12,
               left: -40,
@@ -90,8 +73,6 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
                 color: Colors.white.withValues(alpha: 0.03),
               ),
             ),
-
-            // ── الأنيميشن الرئيسي ──
             Center(
               child: SplashAnimator(
                 logo: const SalaLogo(
@@ -104,8 +85,6 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
                 onAnimationComplete: _onAnimationComplete,
               ),
             ),
-
-            // ── نص سفلي ──
             Positioned(
               bottom: 40,
               left: 0,

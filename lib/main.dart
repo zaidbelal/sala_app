@@ -74,9 +74,20 @@ Future<void> firebaseBackgroundHandler(RemoteMessage message) async {
   }
 }
 
+// خيارات Firebase لنظام iOS مباشرة برمجياً لضمان عدم التعليق نهائياً
+FirebaseOptions get iosFirebaseOptions => const FirebaseOptions(
+      apiKey: 'AIzaSyC_O1Uu7f5sCrg5Xy2uP1JNeb_qgBPMqjo',
+      appId: '1:846679653389:ios:362d95f5793128e5902944',
+      messagingSenderId: '846679653389',
+      projectId: 'app-sala-b42dd',
+      storageBucket: 'app-sala-b42dd.firebasestorage.app',
+      iosBundleId: 'com.example.sala',
+    );
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // منع أي خطأ في تحميل الخطوط أو الصور من إيقاف تشغيل التطبيق
   GoogleFonts.config.allowRuntimeFetching = true;
   FlutterError.onError = (details) {
     final errorStr = details.exception.toString();
@@ -88,18 +99,7 @@ void main() async {
     FlutterError.presentError(details);
   };
 
-  try {
-    await Firebase.initializeApp(
-      options: kIsWeb ? webFirebaseOptions : null,
-    );
-
-    if (!kIsWeb && defaultTargetPlatform != TargetPlatform.iOS) {
-      FirebaseMessaging.onBackgroundMessage(firebaseBackgroundHandler);
-    }
-  } catch (e) {
-    debugPrint("⚠️ تعذر تهيئة Firebase عند بدء التشغيل: $e");
-  }
-
+  // 1. تهيئة التخزين المحلي أولاً (لأنه سريع جداً ومحلي)
   try {
     await AppStorage.initialize();
   } catch (e) {
@@ -112,12 +112,30 @@ void main() async {
     debugPrint("خطأ في AppCache: $e");
   }
 
+  // 2. تهيئة Firebase مع تمرير الخيارات صراحة لنظام iOS لمنع التعليق
+  try {
+    if (kIsWeb) {
+      await Firebase.initializeApp(options: webFirebaseOptions);
+    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+      await Firebase.initializeApp(options: iosFirebaseOptions);
+    } else {
+      await Firebase.initializeApp();
+    }
+
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      FirebaseMessaging.onBackgroundMessage(firebaseBackgroundHandler);
+    }
+  } catch (e) {
+    debugPrint("⚠️ تعذر تهيئة Firebase عند بدء التشغيل: $e");
+  }
+
   try {
     FirebaseService.initialize();
   } catch (_) {}
 
   final container = ProviderContainer();
 
+  // 3. تشغيل الواجهة فوراً دون انتظار أي مهام سحابية
   runApp(
     UncontrolledProviderScope(
       container: container,
@@ -125,18 +143,21 @@ void main() async {
     ),
   );
 
-  try {
-    RealtimeHub().init(container);
-  } catch (_) {}
+  // 4. تشغيل الخدمات الخلفية بعد أن تفتح واجهة التطبيق
+  Future.microtask(() async {
+    try {
+      RealtimeHub().init(container);
+    } catch (_) {}
 
-  _warmUpCache(container);
+    _warmUpCache(container);
 
-  if (Firebase.apps.isNotEmpty) {
-    unawaited(_initializeRemoteConfig());
-    if (!kIsWeb) {
-      unawaited(_initializeNotifications());
+    if (Firebase.apps.isNotEmpty) {
+      unawaited(_initializeRemoteConfig());
+      if (!kIsWeb) {
+        unawaited(_initializeNotifications());
+      }
     }
-  }
+  });
 }
 
 /// تهيئة Remote Config في الخلفية

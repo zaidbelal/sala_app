@@ -161,31 +161,23 @@ class _SplashAnimatorState extends State<SplashAnimator>
   Future<void> _startSequence() async {
     try {
       if (_disposed || !mounted) return;
-      await Future.delayed(const Duration(milliseconds: 80));
-      if (_disposed || !mounted) return;
-      if (_logoController.isAnimating || _logoController.isCompleted) return;
       await _logoController.forward();
 
       if (_disposed || !mounted) return;
-      await Future.delayed(const Duration(milliseconds: 80));
-      if (_disposed || !mounted) return;
-      if (_nameController.isAnimating || _nameController.isCompleted) return;
       await _nameController.forward();
 
       if (_disposed || !mounted) return;
-      await Future.delayed(const Duration(milliseconds: 180));
-      if (_disposed || !mounted) return;
-      if (_nameFallController.isAnimating || _nameFallController.isCompleted)
-        return;
       await _nameFallController.forward();
 
       if (_disposed || !mounted) return;
-      await Future.delayed(const Duration(milliseconds: 350));
-      if (_disposed || !mounted) return;
+      await Future.delayed(const Duration(milliseconds: 300));
 
       _animationDone = true;
       _tryNavigate();
-    } catch (_) {}
+    } catch (_) {
+      _animationDone = true;
+      _tryNavigate();
+    }
   }
 
   // ══════════════════════════════════════════
