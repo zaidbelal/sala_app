@@ -1,0 +1,109 @@
+﻿rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function getUserRole() {
+      return request.auth.token.role != null 
+        ? request.auth.token.role 
+        : get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.role;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && getUserRole() in ['admin', 'super_admin', 'accountant', 'warehouse_manager'];
+    }
+
+    function isDriver() {
+      return isSignedIn() && getUserRole() == 'driver';
+    }
+
+    // ─── الحسابات الشخصية: التاجر يقرأ حسابه فقط، والإدارة والسائق يقرؤون بيانات التوصيل ───
+    match /profiles/{userId} {
+      allow read: if isSignedIn() && (isAdmin() || isDriver() || request.auth.uid == userId);
+      allow create: if isSignedIn() && request.auth.uid == userId;
+      // منع التاجر من ترقية دوره أو فك الحظر عن نفسه
+      allow update: if isAdmin() || (
+        isSignedIn() && request.auth.uid == userId &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.is_banned == resource.data.is_banned &&
+        request.resource.data.is_active == resource.data.is_active
+      );
+      allow delete: if isAdmin();
+    }
+
+    // ─── الكتالوج: متاح للقراءة للجميع والتعديل للإدارة فقط ───
+    match /categories/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    
+    match /brands/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    
+    match /products/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ─── الطلبات: حماية صارمة لمنع التاجر من رؤية طلبات غيره أو التلاعب بالأسعار ───
+    match /orders/{orderId} {
+      allow read: if isSignedIn() && (
+        isAdmin() || 
+        isDriver() || 
+        resource.data.merchant_id == request.auth.uid
+      );
+      allow create: if isSignedIn() && request.resource.data.merchant_id == request.auth.uid;
+   allow update: if isSignedIn() && (
+        isAdmin() || 
+        isDriver() || 
+        (
+          resource.data.merchant_id == request.auth.uid && 
+          (resource.data.status == 'pending' || resource.data.status == 'delivered' || resource.data.status == 'return_requested') &&
+          request.resource.data.merchant_id == resource.data.merchant_id &&
+          request.resource.data.total == resource.data.total
+        )
+      );
+    }
+    
+    // ─── عناصر الطلب: إغلاق الثغرة (لا يمكن قراءتها أو تعديلها إلا لأطراف الطلب فقط) ───
+    match /order_items/{itemId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin() || isDriver();
+    }
+
+    // ─── المرتجعات: التاجر يرى مرتجعاته فقط والإدارة تديرها ───
+    match /order_returns/{returnId} {
+      allow read: if isSignedIn() && (isAdmin() || isDriver() || resource.data.merchant_id == request.auth.uid);
+      allow create: if isSignedIn() && request.resource.data.merchant_id == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // ─── الإشعارات ───
+    match /user_notifications/{notifId} {
+      allow read, update: if isSignedIn() && resource.data.user_id == request.auth.uid;
+      allow create: if isSignedIn();
+    }
+
+    match /broadcast_notifications/{notifId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+    
+    // ─── الإحصائيات ───
+    match /stats/{statId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin() || isDriver();
+    }
+
+    // ─── حظر قراءة أو كتابة أكواد الـ OTP من التطبيق مباشرة (فقط عبر Cloud Functions) ───
+    match /otp_codes/{phone} {
+      allow read, write: if false; 
+    }
+  }
+}
