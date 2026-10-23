@@ -11,7 +11,7 @@ import GoogleMaps // 👈 1. استيراد مكتبة خرائط قوقل
   ) -> Bool {
     // 🗺️ 2. تفعيل مفتاح خرائط قوقل للآيفون قبل تسجيل الـ Plugins لمنع الانهيار
     GMSServices.provideAPIKey("AIzaSyC_O1Uu7f5sCrg5Xy2uP1JNeb_qgBPMqjo")
-ئط_قو
+
     // تسجيل الإشعارات الفورية الأصلية لنظام iOS
     if #available(iOS 10.0, *) {
       UNUserNotificationCenter.current().delegate = self as UNUserNotificationCenterDelegate
