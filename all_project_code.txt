@@ -43445,13 +43445,13 @@ class LedgerService {
       final serverList = snap.docs
           .map((d) => LedgerCustomer.fromMap({'id': d.id, ...d.data()}))
           .toList();
-
-      // 🛡️ دمج الزبائن المعلقين أوفلاين لضمان ظهورهم الفوري للتاجر
-      final pendingQueue = AppStorage.getPendingLedgerTxs(cleanMerchantId)
-          .where((t) => t['type'] == 'add_customer');
-
+// 🛡️ دمج الزبائن الجدد المعلقين أوفلاين وتطبيق تعديلات الرصيد اللحظية
+      final allPending = AppStorage.getPendingLedgerTxs(cleanMerchantId);
+      final pendingNewCustomers =
+          allPending.where((t) => t['type'] == 'add_customer');
       final serverIds = serverList.map((c) => c.id).toSet();
-      for (final p in pendingQueue) {
+
+      for (final p in pendingNewCustomers) {
         final custId = p['customer_id']?.toString() ?? '';
         if (custId.isNotEmpty && !serverIds.contains(custId)) {
           serverList.insert(
@@ -43468,6 +43468,38 @@ class LedgerService {
               updatedAt: DateTime.now(),
             ),
           );
+        }
+      }
+
+      // ✅ تطبيق فوارق الديون والسدادات المعلقة أوفلاين على أرصدة الزبائن في الشاشة الرئيسية
+      final pendingTxs = allPending
+          .where((t) => t['type'] == 'debt' || t['type'] == 'payment');
+      if (pendingTxs.isNotEmpty) {
+        for (int i = 0; i < serverList.length; i++) {
+          final c = serverList[i];
+          final customerPending =
+              pendingTxs.where((t) => t['customer_id'] == c.id);
+          if (customerPending.isNotEmpty) {
+            double delta = 0.0;
+            for (final tx in customerPending) {
+              final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+              delta += (tx['type'] == 'debt') ? amt : -amt;
+            }
+            if (delta != 0.0) {
+              serverList[i] = LedgerCustomer(
+                id: c.id,
+                merchantId: c.merchantId,
+                name: c.name,
+                phone: c.phone,
+                currentBalance: sanitizeMoney(c.currentBalance + delta),
+                creditLimit: c.creditLimit,
+                salaryDay: c.salaryDay,
+                lastReminderSentAt: c.lastReminderSentAt,
+                createdAt: c.createdAt,
+                updatedAt: c.updatedAt,
+              );
+            }
+          }
         }
       }
 
@@ -43996,7 +44028,7 @@ class LedgerService {
     return synced;
   }
 
-// ─── استماع فوري للقيود مرتبة زمنياً من الأحدث للأقدم ───
+// ─── استماع فوري للقيود محصن أمنياً ومطابق لقواعد Firestore الصارمة ───
   Stream<List<LedgerEntry>> watchCustomerEntries(String customerId,
       {int limit = 50}) {
     final currentMerchantId = AppStorage.userId ?? '';
@@ -44005,20 +44037,20 @@ class LedgerService {
       return const Stream.empty();
     }
 
-    // الفرز الزمني المباشر من السيرفر لضمان جلب أحدث الحركات المالية دائماً
+    // ✅ الاستعلام يتضمن شرط التاجر والعمليات غير المشطوبة لضمان حماية الأمان واستغلال كامل حد الـ limit
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
+        .where('merchant_id', isEqualTo: currentMerchantId.trim())
         .where('customer_id', isEqualTo: cleanCustomerId)
+        .where('is_voided', isEqualTo: false)
         .orderBy('created_at', descending: true)
         .limit(limit);
 
     return query.snapshots(includeMetadataChanges: true).map((snap) {
       final list = snap.docs
-          .where((d) =>
-              d.data()['merchant_id'] == currentMerchantId.trim() &&
-              d.data()['is_voided'] != true)
           .map((d) => LedgerEntry.fromMap({'id': d.id, ...d.data()}))
           .toList();
+
       final pendingQueue = AppStorage.getPendingLedgerTxs(currentMerchantId)
           .where((t) => t['customer_id'] == cleanCustomerId);
 

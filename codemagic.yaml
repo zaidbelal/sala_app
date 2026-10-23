@@ -1,0 +1,15 @@
+workflows:
+  default-workflow:
+    name: Default Workflow
+    instance_type: mac_mini_m2
+    environment:
+      flutter: stable
+    scripts:
+      - name: Disable Swift Package Manager
+        script: |
+          flutter config --no-enable-swift-package-manager
+      - name: Install Pods
+        script: |
+          cd ios && pod install
+    artifacts:
+      - build/ios/ipa/*.ipa
