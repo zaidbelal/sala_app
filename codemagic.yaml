@@ -8,6 +8,9 @@ workflows:
       - name: Disable Swift Package Manager
         script: |
           flutter config --no-enable-swift-package-manager
+      - name: Get Flutter Packages
+        script: |
+          flutter pub get
       - name: Install Pods
         script: |
           cd ios && pod install
