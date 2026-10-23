@@ -44,6 +44,9 @@ post_install do |installer|
       # مطابقة إصدار النظام ليكون 16.0 متوافقاً مع السطر الأول
       config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '16.0'
       config.build_settings['ENABLE_BITCODE'] = 'NO'
+      
+      # هذا هو السطر الجديد لمنع خطأ الـ Bridging Headers مع وحدات Swift
+      config.build_settings['SWIFT_INSTALL_OBJC_HEADER'] = 'NO'
     end
   end
 
