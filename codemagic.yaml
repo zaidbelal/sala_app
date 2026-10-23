@@ -14,5 +14,8 @@ workflows:
       - name: Install Pods
         script: |
           cd ios && pod install
+      - name: Build iOS IPA
+        script: |
+          flutter build ipa --release --no-codesign
     artifacts:
       - build/ios/ipa/*.ipa
