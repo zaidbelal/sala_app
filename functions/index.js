@@ -1762,10 +1762,11 @@ exports.recordLedgerTransaction = onCall(
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
 
-   tx.set(entryRef, entryData);
+ tx.set(entryRef, entryData);
       tx.update(customerRef, {
         current_balance: newBalance,
-        last_transaction_id: entryId, // 👈 ختم المعرف لمنع الازدواجية في واجهة التطبيق
+        last_transaction_id: entryId,
+        applied_tx_ids: admin.firestore.FieldValue.arrayUnion(entryId), // 👈 حفظ مصفوفة المعرفات لضمان عدم ازدواجية الرصيد أوفلاين
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 // 🚀 تحديث ملخص ديون التاجر التراكمي ذرياً مع حماية الأرقام العشرية من انحراف IEEE 754

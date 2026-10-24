@@ -1,3 +1,4 @@
+# نعتمد iOS 14.0 كحد أدنى ليعمل التطبيق على جميع أجهزة الآيفون الحديثة والقديمة
 platform :ios, '16.0'
 
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
@@ -27,6 +28,7 @@ flutter_ios_podfile_setup
 
 target 'Runner' do
   use_frameworks! :linkage => :static
+  use_modular_headers!
 
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
 

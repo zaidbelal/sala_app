@@ -10,6 +10,7 @@ import 'local_storage.dart';
 import 'notification_service.dart';
 import 'connectivity_service.dart';
 import 'package:sala/core/services/app_cache.dart';
+import 'package:sala/features/merchant/cart/providers/cart_provider.dart';
 
 // ══════════════════════════════════════════════════════════
 //  RealtimeHub — Production-Grade
@@ -265,7 +266,16 @@ class RealtimeHub {
       await AppStorage.setIsActive(isActive);
       if (isBanned || (!isActive && data['account_status'] != 'pending')) {
         final navContext = NotificationService.navigatorKey.currentContext;
+        final container = _container;
         dispose();
+        if (container != null) {
+          try {
+            container.read(cartProvider.notifier).clear();
+            container.invalidate(cartProvider);
+            container.invalidate(realtimeNotifsProvider);
+            container.invalidate(merchantOrdersProvider);
+          } catch (_) {}
+        }
         try {
           await NotificationService.instance
               .detachTokenFromFirestore(userId)

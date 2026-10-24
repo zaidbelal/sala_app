@@ -251,26 +251,35 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     custSnap.data!.data() != null) {
                   final serverCustomer = LedgerCustomer.fromMap(
                       {'id': custSnap.data!.id, ...custSnap.data!.data()!});
-
-                  final serverLastTxId = custSnap.data!
-                          .data()!['last_transaction_id']
-                          ?.toString() ??
-                      '';
+                  final dataMap = custSnap.data!.data()!;
+                  final serverAppliedIds =
+                      (dataMap['applied_tx_ids'] as List<dynamic>? ?? [])
+                          .map((e) => e.toString())
+                          .toSet();
+                  final serverLastTxId =
+                      dataMap['last_transaction_id']?.toString();
+                  if (serverLastTxId != null && serverLastTxId.isNotEmpty) {
+                    serverAppliedIds.add(serverLastTxId);
+                  }
 
                   final pendingTxs =
                       AppStorage.getPendingLedgerTxs(_customer.merchantId)
                           .where((t) => t['customer_id'] == _customer.id);
 
                   double pendingDelta = 0.0;
-                  // 🔒 احتساب العمليات المعلقة محلياً التي لم تسوَّ على السيرفر بعد
+                  final isOfflineCache = custSnap.data!.metadata.isFromCache;
+
                   for (final tx in pendingTxs) {
                     final txType = tx['type']?.toString();
                     if (txType == 'add_customer' || txType == 'void_request')
                       continue;
                     final txId = tx['id']?.toString() ?? '';
-                    // 🛡️ تجاوز الحركات التي أكد السيرفر معالجتها مسبقاً لمنع التكرار
-                    if (txId == serverLastTxId ||
-                        _locallyDismissedEntryIds.contains(txId)) continue;
+
+                    // حماية قطعية: إذا استلم السيرفر القيد، نتجاوز إضافته لمنع ازدواجية الرصيد
+                    if (!isOfflineCache && serverAppliedIds.contains(txId))
+                      continue;
+                    if (_locallyDismissedEntryIds.contains(txId)) continue;
+
                     final isDebt = txType == 'debt';
                     final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
                     pendingDelta += isDebt ? amt : -amt;
@@ -674,7 +683,30 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                                         color: context.textPrimary,
                                       ),
                                     ),
-                                    if (item.notes != null &&
+                                    if (item.items.isNotEmpty)
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                            vertical: 2),
+                                        child: Text(
+                                          item.items.map((it) {
+                                            final name = it['name'] ??
+                                                it['product_name'] ??
+                                                'صنف';
+                                            final q = it['quantity'] ?? 1;
+                                            final u = it['unit_label'] ?? '';
+                                            return '$name ($q $u)';
+                                          }).join(' ، '),
+                                          style: const TextStyle(
+                                            fontFamily: 'Cairo',
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w700,
+                                            color: AppColors.primary,
+                                          ),
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      )
+                                    else if (item.notes != null &&
                                         item.notes!.isNotEmpty)
                                       Text(
                                         item.notes!,

@@ -167,73 +167,96 @@ class LedgerService {
     return _db
         .collection('merchant_customers')
         .where('merchant_id', isEqualTo: cleanMerchantId)
-        .orderBy('current_balance', descending: true)
         .limit(limit)
         .snapshots(includeMetadataChanges: true)
         .asyncMap((snap) async {
-      final serverList = snap.docs
-          .map((d) => LedgerCustomer.fromMap({'id': d.id, ...d.data()}))
-          .toList();
-// 🛡️ دمج الزبائن الجدد المعلقين أوفلاين وتطبيق تعديلات الرصيد اللحظية
+      final serverMap = <String, LedgerCustomer>{};
+      final serverDocRaws = <String, Map<String, dynamic>>{};
+
+      for (final d in snap.docs) {
+        serverMap[d.id] = LedgerCustomer.fromMap({'id': d.id, ...d.data()});
+        serverDocRaws[d.id] = d.data();
+      }
+
+      // 🛡️ دمج الكاش المحلي التراكمي لمنع محو الزبائن خارج الـ limit(200)
+      final existingLocalCached = await getCachedCustomers(cleanMerchantId);
+      for (final cached in existingLocalCached) {
+        if (!serverMap.containsKey(cached.id)) {
+          serverMap[cached.id] = cached;
+        }
+      }
+
       final allPending = AppStorage.getPendingLedgerTxs(cleanMerchantId);
       final pendingNewCustomers =
           allPending.where((t) => t['type'] == 'add_customer');
-      final serverIds = serverList.map((c) => c.id).toSet();
 
       for (final p in pendingNewCustomers) {
         final custId = p['customer_id']?.toString() ?? '';
-        if (custId.isNotEmpty && !serverIds.contains(custId)) {
-          serverList.insert(
-            0,
-            LedgerCustomer(
-              id: custId,
-              merchantId: cleanMerchantId,
-              name: p['name'] ?? 'زبون',
-              phone: p['phone'] ?? '',
-              currentBalance: 0.0,
-              creditLimit: (p['credit_limit'] as num?)?.toDouble() ?? 0.0,
-              salaryDay: p['salary_day'],
-              createdAt: DateTime.now(),
-              updatedAt: DateTime.now(),
-            ),
+        if (custId.isNotEmpty && !serverMap.containsKey(custId)) {
+          serverMap[custId] = LedgerCustomer(
+            id: custId,
+            merchantId: cleanMerchantId,
+            name: p['name'] ?? 'زبون',
+            phone: p['phone'] ?? '',
+            currentBalance: 0.0,
+            creditLimit: (p['credit_limit'] as num?)?.toDouble() ?? 0.0,
+            salaryDay: p['salary_day'],
+            createdAt: DateTime.now(),
+            updatedAt: DateTime.now(),
           );
         }
       }
 
-      // ✅ تطبيق فوارق الديون والسدادات المعلقة أوفلاين على أرصدة الزبائن في الشاشة الرئيسية
+      // 🔒 التحقق المحاسبي: إضافة فوارق الأوفلاين فقط للحركات التي لم يُقيدها السيرفر بعد
       final pendingTxs = allPending
           .where((t) => t['type'] == 'debt' || t['type'] == 'payment');
-      if (pendingTxs.isNotEmpty) {
-        for (int i = 0; i < serverList.length; i++) {
-          final c = serverList[i];
-          final customerPending =
-              pendingTxs.where((t) => t['customer_id'] == c.id);
-          if (customerPending.isNotEmpty) {
-            double delta = 0.0;
-            for (final tx in customerPending) {
-              final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-              delta += (tx['type'] == 'debt') ? amt : -amt;
-            }
-            if (delta != 0.0) {
-              serverList[i] = LedgerCustomer(
-                id: c.id,
-                merchantId: c.merchantId,
-                name: c.name,
-                phone: c.phone,
-                currentBalance: sanitizeMoney(c.currentBalance + delta),
-                creditLimit: c.creditLimit,
-                salaryDay: c.salaryDay,
-                lastReminderSentAt: c.lastReminderSentAt,
-                createdAt: c.createdAt,
-                updatedAt: c.updatedAt,
-              );
-            }
-          }
+      final isOfflineSnapshot = snap.metadata.isFromCache;
+
+      for (final entry in serverMap.entries) {
+        final c = entry.value;
+        final docRaw = serverDocRaws[c.id];
+        final appliedIds = (docRaw?['applied_tx_ids'] as List<dynamic>? ?? [])
+            .map((e) => e.toString())
+            .toSet();
+        final lastTxId = docRaw?['last_transaction_id']?.toString();
+        if (lastTxId != null && lastTxId.isNotEmpty) {
+          appliedIds.add(lastTxId);
+        }
+
+        final unappliedPending = pendingTxs.where((tx) {
+          if (tx['customer_id'] != c.id) return false;
+          final txId = tx['id']?.toString() ?? '';
+          if (isOfflineSnapshot) return true;
+          return !appliedIds.contains(txId);
+        });
+
+        double delta = 0.0;
+        for (final tx in unappliedPending) {
+          final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+          delta += (tx['type'] == 'debt') ? amt : -amt;
+        }
+
+        if (delta != 0.0) {
+          serverMap[c.id] = LedgerCustomer(
+            id: c.id,
+            merchantId: c.merchantId,
+            name: c.name,
+            phone: c.phone,
+            currentBalance: sanitizeMoney(c.currentBalance + delta),
+            creditLimit: c.creditLimit,
+            salaryDay: c.salaryDay,
+            lastReminderSentAt: c.lastReminderSentAt,
+            createdAt: c.createdAt,
+            updatedAt: c.updatedAt,
+          );
         }
       }
 
-      unawaited(_cacheCustomersLocally(merchantId, serverList));
-      return serverList;
+      final combinedList = serverMap.values.toList()
+        ..sort((a, b) => b.currentBalance.compareTo(a.currentBalance));
+
+      unawaited(_cacheCustomersLocally(cleanMerchantId, combinedList));
+      return combinedList;
     });
   }
 
@@ -559,12 +582,24 @@ class LedgerService {
       }
       return;
     }
-
     final hasInternet = await ConnectivityHelper.hasActiveInternet();
-    if (!hasInternet) {
-      final targetAmount = knownAmount ?? 0.0;
-      final isDebtTarget = knownIsDebt ?? true;
+    final targetAmount = knownAmount ?? 0.0;
+    final isDebtTarget = knownIsDebt ?? true;
 
+    // 🔒 تدوين نية الإبطال في WAL فوراً سواء كان الهاتف متصلاً أو أوفلاين
+    await WalService.instance.writeIntent(
+      transactionId: cleanEntryId,
+      type: WalOperationType.ledgerTransaction,
+      payload: {
+        'action': 'void',
+        'merchant_id': cleanMerchantId,
+        'customer_id': cleanCustomerId,
+        'amount': targetAmount,
+        'is_debt': isDebtTarget,
+      },
+    );
+
+    if (!hasInternet) {
       await AppStorage.savePendingLedgerTx({
         'id': 'void_$cleanEntryId',
         'merchant_id': cleanMerchantId,
@@ -596,17 +631,6 @@ class LedgerService {
       }
       return;
     }
-
-    await WalService.instance.writeIntent(
-      transactionId: cleanEntryId,
-      type: WalOperationType.ledgerTransaction,
-      payload: {
-        'action': 'void',
-        'merchant_id': cleanMerchantId,
-        'customer_id': cleanCustomerId,
-      },
-    );
-
     try {
       final callable = _functions.httpsCallable(
         'voidLedgerTransaction',
@@ -1021,9 +1045,13 @@ class LedgerService {
     final List<List<String>> tableRows = [];
 
     if (openingBalance.abs() > 0.01) {
+      final oldestEntryDate = chronologicalEntries.isNotEmpty
+          ? '${chronologicalEntries.first.createdAt.year}/${chronologicalEntries.first.createdAt.month.toString().padLeft(2, '0')}/${chronologicalEntries.first.createdAt.day.toString().padLeft(2, '0')}'
+          : dateStr;
+
       tableRows.add([
         '—',
-        '$dateStr\n$timeStr',
+        'ما قبل\n$oldestEntryDate',
         'رصيد سابق',
         'رصيد مرحل سابق للحركات المعروضة بالكشف',
         '—',

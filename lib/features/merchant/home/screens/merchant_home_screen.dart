@@ -18,7 +18,7 @@ import 'tabs/profile_tab.dart';
 import '../../ledger/screens/ledger_tab.dart';
 import '../../ledger/services/ledger_service.dart';
 import 'package:sala/core/services/wal_service.dart';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:sala/core/services/app_cache.dart';
 
 final _activeTabProvider = StateProvider<int>((ref) => 0);
@@ -183,29 +183,44 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
           } else {
             // محاولة ذكية: إذا كان الخطأ بسبب حذف/نفاد صنف معين، نعيد البضاعة الصالحة للسلة ونشعر التاجر
             await WalService.instance.markAborted(orderId);
-            final cachedProducts = AppCache.instance.getProducts() ?? [];
-            // 🛡️ المنتجات النشطة الصالحة فقط هي الموجودة في الكاش وحالتها سليمة
-            final activeProductIds = cachedProducts
-                .where(
-                    (p) => p['is_deleted'] != true && p['is_active'] != false)
-                .map((p) => p['id'].toString())
-                .toSet();
+            List<Map<String, dynamic>> availableProducts =
+                AppCache.instance.getProducts() ?? [];
+            if (availableProducts.isEmpty) {
+              try {
+                final snap = await FirebaseFirestore.instance
+                    .collection('products')
+                    .where('is_deleted', isEqualTo: false)
+                    .where('is_active', isEqualTo: true)
+                    .limit(500)
+                    .get(const GetOptions(source: Source.serverAndCache));
+                availableProducts =
+                    snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+              } catch (_) {}
+            }
+
+            final activeProductMap = {
+              for (final p in availableProducts)
+                if (p['is_deleted'] != true && p['is_active'] != false)
+                  p['id'].toString(): p
+            };
+
             final cartMap = <String, dynamic>{};
             final errorStr = e.toString();
+
             for (final item in pending['items']) {
               final productId = item['product_id']?.toString() ?? '';
               final productName = item['product_name']?.toString() ?? '';
 
-              // ✅ فحص دقيق وشامل بالمعرّف والاسم لمنع إعادة المنتجات المحذوفة للسلة
-              final isExplicitlyDeleted = (productId.isNotEmpty &&
+              final isExplicitlyFailed = (productId.isNotEmpty &&
                       errorStr.contains(productId)) ||
                   (productName.isNotEmpty && errorStr.contains(productName));
-              final isMissingFromActiveCache = activeProductIds.isNotEmpty &&
-                  !activeProductIds.contains(productId);
+              final liveProduct = activeProductMap[productId];
 
-              if (isExplicitlyDeleted || isMissingFromActiveCache) {
+              // إذا كان المنتج محذوفاً أو غير متوفر في الكاتالوج الفعّال لا يُعاد للسلة مطلقاً
+              if (isExplicitlyFailed || liveProduct == null) {
                 continue;
               }
+
               final unitLabel = item['unit_label']?.toString().trim();
               final cartKey = (unitLabel == null ||
                       unitLabel.isEmpty ||
@@ -213,21 +228,16 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
                   ? productId
                   : '${productId}__$unitLabel';
 
-              final cachedProduct = cachedProducts.firstWhere(
-                (p) => p['id'].toString() == productId,
-                orElse: () => <String, dynamic>{},
-              );
-
               cartMap[cartKey] = {
                 'product': {
                   'id': productId,
-                  'name': item['product_name'],
+                  'name': liveProduct['name'] ?? item['product_name'],
                   'price': item['price'],
-                  'brand_id': cachedProduct['brand_id'] ?? '',
-                  'brandId': cachedProduct['brand_id'] ?? '',
-                  'image_url': cachedProduct['image_url'],
-                  'size_ml': cachedProduct['size_ml'],
-                  'items_per_carton': cachedProduct['items_per_carton'],
+                  'brand_id': liveProduct['brand_id'] ?? '',
+                  'brandId': liveProduct['brand_id'] ?? '',
+                  'image_url': liveProduct['image_url'],
+                  'size_ml': liveProduct['size_ml'],
+                  'items_per_carton': liveProduct['items_per_carton'],
                 },
                 'quantity': item['quantity'],
                 'snapshot_at': DateTime.now().millisecondsSinceEpoch,
@@ -239,7 +249,6 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
                   },
               };
             }
-
             if (cartMap.isNotEmpty) {
               final currentCart = ref.read(cartProvider);
               if (currentCart.isEmpty) {

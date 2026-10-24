@@ -351,9 +351,13 @@ class AppStorage {
         if (!kIsWeb && _appDocsPath != null) {
           try {
             final backupFile = File('$_appDocsPath/${key}_backup.json');
-            final tmpFile = File('$_appDocsPath/${key}_backup.tmp');
-            await backupFile.writeAsString(json, flush: true);
-            if (await tmpFile.exists()) await tmpFile.delete();
+            final nonce = DateTime.now().microsecondsSinceEpoch;
+            final tmpFile = File('$_appDocsPath/${key}_backup_$nonce.tmp');
+            await tmpFile.writeAsString(json, flush: true);
+            if (await backupFile.exists()) {
+              await backupFile.delete();
+            }
+            await tmpFile.rename(backupFile.path);
           } catch (_) {}
         }
       }
