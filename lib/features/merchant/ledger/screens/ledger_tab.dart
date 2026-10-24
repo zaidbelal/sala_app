@@ -128,9 +128,8 @@ class _LedgerTabState extends State<LedgerTab> {
                   return true;
                 }).toList();
 
-                // إذا لم توجد نتائج محلية أثناء البحث، يتم تمكين زر البحث السحابي المباشر
-                final bool showRemoteSearchOption =
-                    normQuery.isNotEmpty && filtered.isEmpty;
+                // 🔍 تمكين البحث السحابي دائماً عند كتابة نص للوصول لآلاف الزبائن غير المحملين في الذاكرة
+                final bool showRemoteSearchOption = normQuery.isNotEmpty;
                 return Column(
                   children: [
                     // ── ترويسة دفتر الديون ──
@@ -1338,9 +1337,10 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
     }
 
     final merchantId = AppStorage.userId ?? '';
+    final safeMId =
+        merchantId.length > 5 ? merchantId.substring(0, 5) : merchantId;
     _billTransactionId ??=
-        'pos_${merchantId.substring(0, merchantId.length > 5 ? 5 : merchantId.length)}_${DateTime.now().millisecondsSinceEpoch}';
-
+        'pos_${safeMId}_${DateTime.now().microsecondsSinceEpoch}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}_${_selectedCustomer.id.substring(0, _selectedCustomer.id.length > 4 ? 4 : _selectedCustomer.id.length)}';
     try {
       final itemsPayload = _items.map((i) {
         return {

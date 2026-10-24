@@ -881,8 +881,7 @@ exports.deliverOrderByDriver = onCall(
     }
 
     const orderRef = db.collection("orders").doc(String(orderId).trim());
-
-    // 🚀 معالجة سحابية فائقة للتوقيع: إذا أُرسل كـ Base64، يتم حفظه فوراً في Storage داخل السيرفر
+// 🚀 رفع التوقيع السحابي المتوافق 100% مع Uniform Bucket-Level Access (UBLA)
     let finalSignatureUrl = signatureData || null;
     if (signatureData && typeof signatureData === "string" && signatureData.startsWith("data:image")) {
       try {
@@ -891,17 +890,19 @@ exports.deliverOrderByDriver = onCall(
         const bucket = admin.storage().bucket();
         const fileName = `signatures/order_${orderId}_${Date.now()}.png`;
         const file = bucket.file(fileName);
+        const downloadToken = crypto.randomUUID();
 
         await file.save(buffer, {
-          metadata: { contentType: "image/png" },
-          public: true,
+          metadata: {
+            contentType: "image/png",
+            metadata: { firebaseStorageDownloadTokens: downloadToken },
+          },
         });
-        finalSignatureUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+        finalSignatureUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(fileName)}?alt=media&token=${downloadToken}`;
       } catch (uploadError) {
         console.error("[deliverOrderByDriver] Signature upload fallback:", uploadError);
       }
     }
-
     return await db.runTransaction(async (tx) => {
       const snap = await tx.get(orderRef);
       if (!snap.exists) {
@@ -1761,24 +1762,37 @@ exports.recordLedgerTransaction = onCall(
         created_at: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
+// 🛡️ حماية هندسية: نافذة متحركة (Sliding Window FIFO) لأحدث 50 معرّف لمنع تجاوز 1MB نهائياً
+      const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
+      const updatedApplied = [...existingApplied.slice(-49), entryId];
 
- tx.set(entryRef, entryData);
+      tx.set(entryRef, entryData);
       tx.update(customerRef, {
         current_balance: newBalance,
         last_transaction_id: entryId,
-        applied_tx_ids: admin.firestore.FieldValue.arrayUnion(entryId), // 👈 حفظ مصفوفة المعرفات لضمان عدم ازدواجية الرصيد أوفلاين
+        applied_tx_ids: updatedApplied,
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
-// 🚀 تحديث ملخص ديون التاجر التراكمي ذرياً مع حماية الأرقام العشرية من انحراف IEEE 754
+
+      return {
+        success: true,
+        entryId,
+        newBalance,
+        currentBalance,
+      };
+    });
+
+    // 🚀 تحسين التزامن: تحديث مستند ملخص السوق ذرياً خارج قفل معاملة الزبون لمنع تعارض المعاملات المتزامنة
+    try {
       const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
-      const oldDebtPortion = Math.max(0, currentBalance);
-      const newDebtPortion = Math.max(0, newBalance);
+      const oldDebtPortion = Math.max(0, result.currentBalance);
+      const newDebtPortion = Math.max(0, result.newBalance);
       const debtPortionDelta = Math.round((newDebtPortion - oldDebtPortion) * 100) / 100;
 
-      const isCrossedToDebt = currentBalance <= 0 && newBalance > 0;
-      const isCrossedToZero = currentBalance > 0 && newBalance <= 0;
+      const isCrossedToDebt = result.currentBalance <= 0 && result.newBalance > 0;
+      const isCrossedToZero = result.currentBalance > 0 && result.newBalance <= 0;
 
-      tx.set(summaryRef, {
+      await summaryRef.set({
         merchant_id: merchantId,
         total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
         debtors_count: admin.firestore.FieldValue.increment(
@@ -1786,15 +1800,17 @@ exports.recordLedgerTransaction = onCall(
         ),
         last_updated: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
-      return {
-        success: true,
-        entryId,
-        newBalance,
-      };
-    });
+    } catch (summaryErr) {
+      console.warn("[recordLedgerTransaction] Summary async increment warning:", summaryErr);
+    }
+
+    return {
+      success: true,
+      entryId: result.entryId,
+      newBalance: result.newBalance,
+    };
   }
 );
-
 // 3. شطب وإبطال القيد المالي وعكس الأثر الحسابي ذرياً
 exports.voidLedgerTransaction = onCall(
   { region: "us-central1", cors: true },
@@ -1912,34 +1928,25 @@ exports.reconcileLedgerBalance = onCall(
     const preData = preSnap.data() || {};
     const preLastTxId = preData.last_transaction_id || null;
     const preBalance = Number(preData.current_balance) || 0.0;
-
-    // 🔒 الخطوة 2: استعلام تجميعي يعتمد على شروط تطابق صريحة (Pure Equality) بدون شروط زمنية مشوهة
-    const baseQuery = db.collection("merchant_ledger_entries")
-      .where("merchant_id", "==", merchantId)
+// 🔒 استعلام مؤمن 100% يعمل مباشرة بدون الحاجة لفهارس مركبة معقدة
+    const entriesSnap = await db.collection("merchant_ledger_entries")
       .where("customer_id", "==", cleanCustomerId)
-      .where("is_voided", "==", false);
+      .where("is_voided", "==", false)
+      .get();
 
     let totalDebt = 0;
     let totalPayment = 0;
 
-    try {
-      const [debtSumSnap, paymentSumSnap] = await Promise.all([
-        baseQuery.where("type", "==", "debt").aggregate({ total: admin.firestore.AggregateField.sum("amount") }).get(),
-        baseQuery.where("type", "==", "payment").aggregate({ total: admin.firestore.AggregateField.sum("amount") }).get(),
-      ]);
-
-      totalDebt = Number(debtSumSnap.data()?.total ?? debtSumSnap.get?.("total") ?? 0);
-      totalPayment = Number(paymentSumSnap.data()?.total ?? paymentSumSnap.get?.("total") ?? 0);
-    } catch (aggError) {
-      // آلية تراجع في حال تعذر التجميع السحابي
-      const [debtDocs, paymentDocs] = await Promise.all([
-        baseQuery.where("type", "==", "debt").get(),
-        baseQuery.where("type", "==", "payment").get(),
-      ]);
-      totalDebt = debtDocs.docs.reduce((sum, d) => sum + (Number(d.data().amount) || 0), 0);
-      totalPayment = paymentDocs.docs.reduce((sum, d) => sum + (Number(d.data().amount) || 0), 0);
+    for (const doc of entriesSnap.docs) {
+      const entry = doc.data();
+      if (entry.merchant_id !== merchantId) continue;
+      const amt = Number(entry.amount) || 0;
+      if (entry.type === "debt") {
+        totalDebt += amt;
+      } else if (entry.type === "payment") {
+        totalPayment += amt;
+      }
     }
-
     const calculatedCents = Math.round(totalDebt * 100) - Math.round(totalPayment * 100);
     const calculatedAuthoritativeBalance = calculatedCents / 100;
 

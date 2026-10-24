@@ -4374,9 +4374,13 @@ class AppStorage {
         if (!kIsWeb && _appDocsPath != null) {
           try {
             final backupFile = File('$_appDocsPath/${key}_backup.json');
-            final tmpFile = File('$_appDocsPath/${key}_backup.tmp');
-            await backupFile.writeAsString(json, flush: true);
-            if (await tmpFile.exists()) await tmpFile.delete();
+            final nonce = DateTime.now().microsecondsSinceEpoch;
+            final tmpFile = File('$_appDocsPath/${key}_backup_$nonce.tmp');
+            await tmpFile.writeAsString(json, flush: true);
+            if (await backupFile.exists()) {
+              await backupFile.delete();
+            }
+            await tmpFile.rename(backupFile.path);
           } catch (_) {}
         }
       }
@@ -5205,6 +5209,7 @@ import 'local_storage.dart';
 import 'notification_service.dart';
 import 'connectivity_service.dart';
 import 'package:sala/core/services/app_cache.dart';
+import 'package:sala/features/merchant/cart/providers/cart_provider.dart';
 
 // ══════════════════════════════════════════════════════════
 //  RealtimeHub — Production-Grade
@@ -5460,7 +5465,16 @@ class RealtimeHub {
       await AppStorage.setIsActive(isActive);
       if (isBanned || (!isActive && data['account_status'] != 'pending')) {
         final navContext = NotificationService.navigatorKey.currentContext;
+        final container = _container;
         dispose();
+        if (container != null) {
+          try {
+            container.read(cartProvider.notifier).clear();
+            container.invalidate(cartProvider);
+            container.invalidate(realtimeNotifsProvider);
+            container.invalidate(merchantOrdersProvider);
+          } catch (_) {}
+        }
         try {
           await NotificationService.instance
               .detachTokenFromFirestore(userId)
@@ -34477,7 +34491,7 @@ import 'tabs/profile_tab.dart';
 import '../../ledger/screens/ledger_tab.dart';
 import '../../ledger/services/ledger_service.dart';
 import 'package:sala/core/services/wal_service.dart';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:sala/core/services/app_cache.dart';
 
 final _activeTabProvider = StateProvider<int>((ref) => 0);
@@ -34642,29 +34656,44 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
           } else {
             // محاولة ذكية: إذا كان الخطأ بسبب حذف/نفاد صنف معين، نعيد البضاعة الصالحة للسلة ونشعر التاجر
             await WalService.instance.markAborted(orderId);
-            final cachedProducts = AppCache.instance.getProducts() ?? [];
-            // 🛡️ المنتجات النشطة الصالحة فقط هي الموجودة في الكاش وحالتها سليمة
-            final activeProductIds = cachedProducts
-                .where(
-                    (p) => p['is_deleted'] != true && p['is_active'] != false)
-                .map((p) => p['id'].toString())
-                .toSet();
+            List<Map<String, dynamic>> availableProducts =
+                AppCache.instance.getProducts() ?? [];
+            if (availableProducts.isEmpty) {
+              try {
+                final snap = await FirebaseFirestore.instance
+                    .collection('products')
+                    .where('is_deleted', isEqualTo: false)
+                    .where('is_active', isEqualTo: true)
+                    .limit(500)
+                    .get(const GetOptions(source: Source.serverAndCache));
+                availableProducts =
+                    snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+              } catch (_) {}
+            }
+
+            final activeProductMap = {
+              for (final p in availableProducts)
+                if (p['is_deleted'] != true && p['is_active'] != false)
+                  p['id'].toString(): p
+            };
+
             final cartMap = <String, dynamic>{};
             final errorStr = e.toString();
+
             for (final item in pending['items']) {
               final productId = item['product_id']?.toString() ?? '';
               final productName = item['product_name']?.toString() ?? '';
 
-              // ✅ فحص دقيق وشامل بالمعرّف والاسم لمنع إعادة المنتجات المحذوفة للسلة
-              final isExplicitlyDeleted = (productId.isNotEmpty &&
+              final isExplicitlyFailed = (productId.isNotEmpty &&
                       errorStr.contains(productId)) ||
                   (productName.isNotEmpty && errorStr.contains(productName));
-              final isMissingFromActiveCache = activeProductIds.isNotEmpty &&
-                  !activeProductIds.contains(productId);
+              final liveProduct = activeProductMap[productId];
 
-              if (isExplicitlyDeleted || isMissingFromActiveCache) {
+              // إذا كان المنتج محذوفاً أو غير متوفر في الكاتالوج الفعّال لا يُعاد للسلة مطلقاً
+              if (isExplicitlyFailed || liveProduct == null) {
                 continue;
               }
+
               final unitLabel = item['unit_label']?.toString().trim();
               final cartKey = (unitLabel == null ||
                       unitLabel.isEmpty ||
@@ -34672,21 +34701,16 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
                   ? productId
                   : '${productId}__$unitLabel';
 
-              final cachedProduct = cachedProducts.firstWhere(
-                (p) => p['id'].toString() == productId,
-                orElse: () => <String, dynamic>{},
-              );
-
               cartMap[cartKey] = {
                 'product': {
                   'id': productId,
-                  'name': item['product_name'],
+                  'name': liveProduct['name'] ?? item['product_name'],
                   'price': item['price'],
-                  'brand_id': cachedProduct['brand_id'] ?? '',
-                  'brandId': cachedProduct['brand_id'] ?? '',
-                  'image_url': cachedProduct['image_url'],
-                  'size_ml': cachedProduct['size_ml'],
-                  'items_per_carton': cachedProduct['items_per_carton'],
+                  'brand_id': liveProduct['brand_id'] ?? '',
+                  'brandId': liveProduct['brand_id'] ?? '',
+                  'image_url': liveProduct['image_url'],
+                  'size_ml': liveProduct['size_ml'],
+                  'items_per_carton': liveProduct['items_per_carton'],
                 },
                 'quantity': item['quantity'],
                 'snapshot_at': DateTime.now().millisecondsSinceEpoch,
@@ -34698,7 +34722,6 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
                   },
               };
             }
-
             if (cartMap.isNotEmpty) {
               final currentCart = ref.read(cartProvider);
               if (currentCart.isEmpty) {
@@ -40364,26 +40387,35 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     custSnap.data!.data() != null) {
                   final serverCustomer = LedgerCustomer.fromMap(
                       {'id': custSnap.data!.id, ...custSnap.data!.data()!});
-
-                  final serverLastTxId = custSnap.data!
-                          .data()!['last_transaction_id']
-                          ?.toString() ??
-                      '';
+                  final dataMap = custSnap.data!.data()!;
+                  final serverAppliedIds =
+                      (dataMap['applied_tx_ids'] as List<dynamic>? ?? [])
+                          .map((e) => e.toString())
+                          .toSet();
+                  final serverLastTxId =
+                      dataMap['last_transaction_id']?.toString();
+                  if (serverLastTxId != null && serverLastTxId.isNotEmpty) {
+                    serverAppliedIds.add(serverLastTxId);
+                  }
 
                   final pendingTxs =
                       AppStorage.getPendingLedgerTxs(_customer.merchantId)
                           .where((t) => t['customer_id'] == _customer.id);
 
                   double pendingDelta = 0.0;
-                  // 🔒 احتساب العمليات المعلقة محلياً التي لم تسوَّ على السيرفر بعد
+                  final isOfflineCache = custSnap.data!.metadata.isFromCache;
+
                   for (final tx in pendingTxs) {
                     final txType = tx['type']?.toString();
                     if (txType == 'add_customer' || txType == 'void_request')
                       continue;
                     final txId = tx['id']?.toString() ?? '';
-                    // 🛡️ تجاوز الحركات التي أكد السيرفر معالجتها مسبقاً لمنع التكرار
-                    if (txId == serverLastTxId ||
-                        _locallyDismissedEntryIds.contains(txId)) continue;
+
+                    // حماية قطعية: إذا استلم السيرفر القيد، نتجاوز إضافته لمنع ازدواجية الرصيد
+                    if (!isOfflineCache && serverAppliedIds.contains(txId))
+                      continue;
+                    if (_locallyDismissedEntryIds.contains(txId)) continue;
+
                     final isDebt = txType == 'debt';
                     final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
                     pendingDelta += isDebt ? amt : -amt;
@@ -40787,7 +40819,30 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                                         color: context.textPrimary,
                                       ),
                                     ),
-                                    if (item.notes != null &&
+                                    if (item.items.isNotEmpty)
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                            vertical: 2),
+                                        child: Text(
+                                          item.items.map((it) {
+                                            final name = it['name'] ??
+                                                it['product_name'] ??
+                                                'صنف';
+                                            final q = it['quantity'] ?? 1;
+                                            final u = it['unit_label'] ?? '';
+                                            return '$name ($q $u)';
+                                          }).join(' ، '),
+                                          style: const TextStyle(
+                                            fontFamily: 'Cairo',
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w700,
+                                            color: AppColors.primary,
+                                          ),
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      )
+                                    else if (item.notes != null &&
                                         item.notes!.isNotEmpty)
                                       Text(
                                         item.notes!,
@@ -43438,73 +43493,96 @@ class LedgerService {
     return _db
         .collection('merchant_customers')
         .where('merchant_id', isEqualTo: cleanMerchantId)
-        .orderBy('current_balance', descending: true)
         .limit(limit)
         .snapshots(includeMetadataChanges: true)
         .asyncMap((snap) async {
-      final serverList = snap.docs
-          .map((d) => LedgerCustomer.fromMap({'id': d.id, ...d.data()}))
-          .toList();
-// 🛡️ دمج الزبائن الجدد المعلقين أوفلاين وتطبيق تعديلات الرصيد اللحظية
+      final serverMap = <String, LedgerCustomer>{};
+      final serverDocRaws = <String, Map<String, dynamic>>{};
+
+      for (final d in snap.docs) {
+        serverMap[d.id] = LedgerCustomer.fromMap({'id': d.id, ...d.data()});
+        serverDocRaws[d.id] = d.data();
+      }
+
+      // 🛡️ دمج الكاش المحلي التراكمي لمنع محو الزبائن خارج الـ limit(200)
+      final existingLocalCached = await getCachedCustomers(cleanMerchantId);
+      for (final cached in existingLocalCached) {
+        if (!serverMap.containsKey(cached.id)) {
+          serverMap[cached.id] = cached;
+        }
+      }
+
       final allPending = AppStorage.getPendingLedgerTxs(cleanMerchantId);
       final pendingNewCustomers =
           allPending.where((t) => t['type'] == 'add_customer');
-      final serverIds = serverList.map((c) => c.id).toSet();
 
       for (final p in pendingNewCustomers) {
         final custId = p['customer_id']?.toString() ?? '';
-        if (custId.isNotEmpty && !serverIds.contains(custId)) {
-          serverList.insert(
-            0,
-            LedgerCustomer(
-              id: custId,
-              merchantId: cleanMerchantId,
-              name: p['name'] ?? 'زبون',
-              phone: p['phone'] ?? '',
-              currentBalance: 0.0,
-              creditLimit: (p['credit_limit'] as num?)?.toDouble() ?? 0.0,
-              salaryDay: p['salary_day'],
-              createdAt: DateTime.now(),
-              updatedAt: DateTime.now(),
-            ),
+        if (custId.isNotEmpty && !serverMap.containsKey(custId)) {
+          serverMap[custId] = LedgerCustomer(
+            id: custId,
+            merchantId: cleanMerchantId,
+            name: p['name'] ?? 'زبون',
+            phone: p['phone'] ?? '',
+            currentBalance: 0.0,
+            creditLimit: (p['credit_limit'] as num?)?.toDouble() ?? 0.0,
+            salaryDay: p['salary_day'],
+            createdAt: DateTime.now(),
+            updatedAt: DateTime.now(),
           );
         }
       }
 
-      // ✅ تطبيق فوارق الديون والسدادات المعلقة أوفلاين على أرصدة الزبائن في الشاشة الرئيسية
+      // 🔒 التحقق المحاسبي: إضافة فوارق الأوفلاين فقط للحركات التي لم يُقيدها السيرفر بعد
       final pendingTxs = allPending
           .where((t) => t['type'] == 'debt' || t['type'] == 'payment');
-      if (pendingTxs.isNotEmpty) {
-        for (int i = 0; i < serverList.length; i++) {
-          final c = serverList[i];
-          final customerPending =
-              pendingTxs.where((t) => t['customer_id'] == c.id);
-          if (customerPending.isNotEmpty) {
-            double delta = 0.0;
-            for (final tx in customerPending) {
-              final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-              delta += (tx['type'] == 'debt') ? amt : -amt;
-            }
-            if (delta != 0.0) {
-              serverList[i] = LedgerCustomer(
-                id: c.id,
-                merchantId: c.merchantId,
-                name: c.name,
-                phone: c.phone,
-                currentBalance: sanitizeMoney(c.currentBalance + delta),
-                creditLimit: c.creditLimit,
-                salaryDay: c.salaryDay,
-                lastReminderSentAt: c.lastReminderSentAt,
-                createdAt: c.createdAt,
-                updatedAt: c.updatedAt,
-              );
-            }
-          }
+      final isOfflineSnapshot = snap.metadata.isFromCache;
+
+      for (final entry in serverMap.entries) {
+        final c = entry.value;
+        final docRaw = serverDocRaws[c.id];
+        final appliedIds = (docRaw?['applied_tx_ids'] as List<dynamic>? ?? [])
+            .map((e) => e.toString())
+            .toSet();
+        final lastTxId = docRaw?['last_transaction_id']?.toString();
+        if (lastTxId != null && lastTxId.isNotEmpty) {
+          appliedIds.add(lastTxId);
+        }
+
+        final unappliedPending = pendingTxs.where((tx) {
+          if (tx['customer_id'] != c.id) return false;
+          final txId = tx['id']?.toString() ?? '';
+          if (isOfflineSnapshot) return true;
+          return !appliedIds.contains(txId);
+        });
+
+        double delta = 0.0;
+        for (final tx in unappliedPending) {
+          final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+          delta += (tx['type'] == 'debt') ? amt : -amt;
+        }
+
+        if (delta != 0.0) {
+          serverMap[c.id] = LedgerCustomer(
+            id: c.id,
+            merchantId: c.merchantId,
+            name: c.name,
+            phone: c.phone,
+            currentBalance: sanitizeMoney(c.currentBalance + delta),
+            creditLimit: c.creditLimit,
+            salaryDay: c.salaryDay,
+            lastReminderSentAt: c.lastReminderSentAt,
+            createdAt: c.createdAt,
+            updatedAt: c.updatedAt,
+          );
         }
       }
 
-      unawaited(_cacheCustomersLocally(merchantId, serverList));
-      return serverList;
+      final combinedList = serverMap.values.toList()
+        ..sort((a, b) => b.currentBalance.compareTo(a.currentBalance));
+
+      unawaited(_cacheCustomersLocally(cleanMerchantId, combinedList));
+      return combinedList;
     });
   }
 
@@ -43830,12 +43908,24 @@ class LedgerService {
       }
       return;
     }
-
     final hasInternet = await ConnectivityHelper.hasActiveInternet();
-    if (!hasInternet) {
-      final targetAmount = knownAmount ?? 0.0;
-      final isDebtTarget = knownIsDebt ?? true;
+    final targetAmount = knownAmount ?? 0.0;
+    final isDebtTarget = knownIsDebt ?? true;
 
+    // 🔒 تدوين نية الإبطال في WAL فوراً سواء كان الهاتف متصلاً أو أوفلاين
+    await WalService.instance.writeIntent(
+      transactionId: cleanEntryId,
+      type: WalOperationType.ledgerTransaction,
+      payload: {
+        'action': 'void',
+        'merchant_id': cleanMerchantId,
+        'customer_id': cleanCustomerId,
+        'amount': targetAmount,
+        'is_debt': isDebtTarget,
+      },
+    );
+
+    if (!hasInternet) {
       await AppStorage.savePendingLedgerTx({
         'id': 'void_$cleanEntryId',
         'merchant_id': cleanMerchantId,
@@ -43867,17 +43957,6 @@ class LedgerService {
       }
       return;
     }
-
-    await WalService.instance.writeIntent(
-      transactionId: cleanEntryId,
-      type: WalOperationType.ledgerTransaction,
-      payload: {
-        'action': 'void',
-        'merchant_id': cleanMerchantId,
-        'customer_id': cleanCustomerId,
-      },
-    );
-
     try {
       final callable = _functions.httpsCallable(
         'voidLedgerTransaction',
@@ -44292,9 +44371,13 @@ class LedgerService {
     final List<List<String>> tableRows = [];
 
     if (openingBalance.abs() > 0.01) {
+      final oldestEntryDate = chronologicalEntries.isNotEmpty
+          ? '${chronologicalEntries.first.createdAt.year}/${chronologicalEntries.first.createdAt.month.toString().padLeft(2, '0')}/${chronologicalEntries.first.createdAt.day.toString().padLeft(2, '0')}'
+          : dateStr;
+
       tableRows.add([
         '—',
-        '$dateStr\n$timeStr',
+        'ما قبل\n$oldestEntryDate',
         'رصيد سابق',
         'رصيد مرحل سابق للحركات المعروضة بالكشف',
         '—',

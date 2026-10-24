@@ -368,18 +368,53 @@ class LedgerService {
       return;
     }
 
-    final callable = _functions.httpsCallable(
-      'addLedgerCustomer',
-      options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
-    );
+    try {
+      final callable = _functions.httpsCallable(
+        'addLedgerCustomer',
+        options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
+      );
 
-    await callable.call({
-      'customerId': clientGeneratedId,
-      'name': cleanName,
-      'phone': phone.trim(),
-      'creditLimit': creditLimit,
-      'salaryDay': salaryDay,
-    });
+      await callable.call({
+        'customerId': clientGeneratedId,
+        'name': cleanName,
+        'phone': phone.trim(),
+        'creditLimit': creditLimit,
+        'salaryDay': salaryDay,
+      });
+    } catch (e) {
+      // 🛡️ تأمين أوفلاين فوري: حفظ الزبون محلياً وفي طابور المزامنة في حال تعثر الشبكة اللحظي
+      final now = DateTime.now();
+      final customer = LedgerCustomer(
+        id: clientGeneratedId,
+        merchantId: merchantId,
+        name: cleanName,
+        phone: phone.trim(),
+        currentBalance: 0.0,
+        creditLimit: sanitizeMoney(creditLimit),
+        salaryDay: salaryDay,
+        createdAt: now,
+        updatedAt: now,
+      );
+      final cached = await getCachedCustomers(merchantId);
+      final existsIdx = cached.indexWhere((c) => c.id == clientGeneratedId);
+      if (existsIdx != -1) {
+        cached[existsIdx] = customer;
+      } else {
+        cached.insert(0, customer);
+      }
+      await _cacheCustomersLocally(merchantId, cached);
+
+      await AppStorage.savePendingLedgerTx({
+        'id': 'cust_$clientGeneratedId',
+        'merchant_id': merchantId,
+        'customer_id': clientGeneratedId,
+        'type': 'add_customer',
+        'name': cleanName,
+        'phone': phone.trim(),
+        'credit_limit': creditLimit,
+        'salary_day': salaryDay,
+      });
+    }
   }
 
   // ─── تسجيل حركة مالية (دين أو سداد) عبر السيرفر ───
@@ -644,8 +679,38 @@ class LedgerService {
 
       await WalService.instance.markCommitted(cleanEntryId);
     } catch (e) {
-      await WalService.instance.markAborted(cleanEntryId);
-      rethrow;
+      // 🛡️ حفظ طلب الشطب في طابور الأوفلاين عند تعثر الاتصال بالسيرفر
+      await AppStorage.savePendingLedgerTx({
+        'id': 'void_$cleanEntryId',
+        'merchant_id': cleanMerchantId,
+        'customer_id': cleanCustomerId,
+        'type': 'void_request',
+        'target_entry_id': cleanEntryId,
+        'amount': targetAmount,
+        'is_debt': isDebtTarget,
+      });
+
+      final cached = await getCachedCustomers(cleanMerchantId);
+      final cIdx = cached.indexWhere((c) => c.id == cleanCustomerId);
+      if (cIdx != -1) {
+        final old = cached[cIdx];
+        final reverseDelta = isDebtTarget ? -targetAmount : targetAmount;
+        cached[cIdx] = LedgerCustomer(
+          id: old.id,
+          merchantId: old.merchantId,
+          name: old.name,
+          phone: old.phone,
+          currentBalance: sanitizeMoney(old.currentBalance + reverseDelta),
+          creditLimit: old.creditLimit,
+          salaryDay: old.salaryDay,
+          lastReminderSentAt: old.lastReminderSentAt,
+          createdAt: old.createdAt,
+          updatedAt: DateTime.now(),
+        );
+        await _cacheCustomersLocally(cleanMerchantId, cached);
+      }
+      throw TimeoutException(
+          'تعثر الاتصال بالسيرفر، تم حفظ طلب الشطب في طابور الأوفلاين');
     }
   }
 
@@ -789,21 +854,18 @@ class LedgerService {
     if (cleanCustomerId.isEmpty || currentMerchantId.trim().isEmpty) {
       return const Stream.empty();
     }
-
-    // ✅ الاستعلام يتضمن شرط التاجر والعمليات غير المشطوبة لضمان حماية الأمان واستغلال كامل حد الـ limit
+// 🛡️ استعلام مؤمن وفوري بدون اشتراط فهارس مركبة معقدة
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
-        .where('merchant_id', isEqualTo: currentMerchantId.trim())
         .where('customer_id', isEqualTo: cleanCustomerId)
         .where('is_voided', isEqualTo: false)
-        .orderBy('created_at', descending: true)
-        .limit(limit);
+        .limit(limit * 2);
 
     return query.snapshots(includeMetadataChanges: true).map((snap) {
       final list = snap.docs
+          .where((d) => d.data()['merchant_id'] == currentMerchantId.trim())
           .map((d) => LedgerEntry.fromMap({'id': d.id, ...d.data()}))
           .toList();
-
       final pendingQueue = AppStorage.getPendingLedgerTxs(currentMerchantId)
           .where((t) => t['customer_id'] == cleanCustomerId);
 
@@ -978,12 +1040,18 @@ class LedgerService {
       regularFont = await PdfGoogleFonts.cairoRegular();
       boldFont = await PdfGoogleFonts.cairoBold();
     } catch (_) {
-      regularFont = pw.Font.helvetica();
-      boldFont = pw.Font.helveticaBold();
+      try {
+        regularFont = await PdfGoogleFonts.amiriRegular();
+        boldFont = await PdfGoogleFonts.amiriBold();
+      } catch (e) {
+        regularFont = pw.Font.courier();
+        boldFont = pw.Font.courierBold();
+      }
     }
+
     final pdf = pw.Document();
     final now = DateTime.now();
-    // ── دوال مساعدة لحساب اليوم والوقت بنظام 12 ساعة مع صباحاً/مساءً ──
+
     String getArabicDayName(DateTime dt) {
       switch (dt.weekday) {
         case DateTime.saturday:
@@ -1005,13 +1073,12 @@ class LedgerService {
       }
     }
 
-    String formatTime12H(DateTime dt, {bool short = false}) {
+    String formatTime12H(DateTime dt) {
       final hour24 = dt.hour;
       final minute = dt.minute.toString().padLeft(2, '0');
       var hour12 = hour24 % 12;
-      if (hour12 == 0) hour12 = 12; // بعد 12 يأتي 1 مباشرة
-      final period =
-          hour24 >= 12 ? (short ? 'م' : 'مساءً') : (short ? 'ص' : 'صباحاً');
+      if (hour12 == 0) hour12 = 12;
+      final period = hour24 >= 12 ? 'م' : 'ص';
       return '$hour12:$minute $period';
     }
 
@@ -1020,13 +1087,10 @@ class LedgerService {
         '${now.year}/${now.month.toString().padLeft(2, '0')}/${now.day.toString().padLeft(2, '0')}';
     final timeStr = formatTime12H(now);
 
-    final chronologicalEntries = List<LedgerEntry>.from(entries)
-      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
-
+    // ── 1. حساب إجماليات الفترة ──
     double periodTotalDebt = 0.0;
     double periodTotalPayment = 0.0;
-
-    for (final e in chronologicalEntries) {
+    for (final e in entries) {
       if (e.isDebt) {
         periodTotalDebt += e.amount;
       } else {
@@ -1034,419 +1098,401 @@ class LedgerService {
       }
     }
 
-    // حساب الرصيد المرحل بشكل آمن: إذا كان الكشف يغطي كافة الحركات نبدأ من الصفر، وإلا نحسبه بالتراجع
-    // ✅ حساب تدقيقي مطلق ومحمي: جلب الرصيد الافتتاحي الحقيقي من السيرفر أو تصفيره إذا غطى الكشف كامل السجل
-    final double periodNetMovement = periodTotalDebt - periodTotalPayment;
-    // معادلة محاسبية مطلقة: الرصيد السابق = الرصيد الحالي - صافي حركة الفترة المعروضة
-    final double openingBalance =
-        sanitizeMoney(customer.currentBalance - periodNetMovement);
+    // ── 2. ترتيب الحركات (الأحدث أولاً لكي تظهر حركة اليوم مباشرة في أول الجدول) ──
+    final sortedEntries = List<LedgerEntry>.from(entries)
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
-    double progressiveBalance = openingBalance;
-    final List<List<String>> tableRows = [];
+    // حساب الرصيد التنازلي التراكمي بدقة مطلقة
+    double currentRunningBalance = customer.currentBalance;
+    final List<List<dynamic>> tableRows = [];
 
-    if (openingBalance.abs() > 0.01) {
-      final oldestEntryDate = chronologicalEntries.isNotEmpty
-          ? '${chronologicalEntries.first.createdAt.year}/${chronologicalEntries.first.createdAt.month.toString().padLeft(2, '0')}/${chronologicalEntries.first.createdAt.day.toString().padLeft(2, '0')}'
-          : dateStr;
-
-      tableRows.add([
-        '—',
-        'ما قبل\n$oldestEntryDate',
-        'رصيد سابق',
-        'رصيد مرحل سابق للحركات المعروضة بالكشف',
-        '—',
-        '${openingBalance.toStringAsFixed(0)} ريال',
-      ]);
-    }
-    for (int i = 0; i < chronologicalEntries.length; i++) {
-      final e = chronologicalEntries[i];
-      if (e.isDebt) {
-        progressiveBalance += e.amount;
-      } else {
-        progressiveBalance -= e.amount;
-      }
+    for (int i = 0; i < sortedEntries.length; i++) {
+      final e = sortedEntries[i];
       final eDate =
           '${e.createdAt.year}/${e.createdAt.month.toString().padLeft(2, '0')}/${e.createdAt.day.toString().padLeft(2, '0')}';
-      final eTime = formatTime12H(e.createdAt, short: false);
+      final eTime = formatTime12H(e.createdAt);
 
-      // ── حل التكرار الذكي للبيان والأصناف ──
-      String details = '';
-      if (e.items.isNotEmpty) {
-        details = e.items.map((it) {
-          final name =
-              (it['name'] ?? it['product_name'] ?? 'صنف').toString().trim();
-          final q = it['quantity'] ?? 1;
-          final unit = (it['unit_label'] ?? '').toString().trim();
-          final unitText = unit.isNotEmpty ? ' $unit' : '';
-          return '$name ($q$unitText)';
-        }).join(' ، ');
-      } else if (e.notes != null && e.notes!.trim().isNotEmpty) {
-        details = e.notes!.trim();
+      final balanceAfterThisTx = currentRunningBalance;
+      // الرصيد للحركة التي قبلها زمنياً
+      if (e.isDebt) {
+        currentRunningBalance -= e.amount;
       } else {
-        details = e.isDebt ? 'مشتريات بالآجل' : 'سداد دفعة نقدية';
+        currentRunningBalance += e.amount;
       }
 
-      // ── استخدام كلمة "ريال" والوقت بنظام 12 ساعة مع (صباحاً/مساءً) ──
-      tableRows.add([
-        '${i + 1}',
-        '$eDate\n$eTime',
-        e.isDebt ? 'دين (+)' : 'سداد (-)',
-        details,
-        '${e.amount.toStringAsFixed(0)} ريال',
-        '${progressiveBalance.toStringAsFixed(0)} ريال',
-      ]);
+      // ── حل الملاحظة 2: إذا كانت الفاتورة من الكاشير وفيها عدة أصناف ──
+      if (e.items.isNotEmpty && e.items.length > 1) {
+        // صف رئيسي لإجمالي الفاتورة
+        tableRows.add([
+          '${i + 1}',
+          '$eDate\n$eTime',
+          'فاتورة كاشير (+)',
+          'فاتورة مبيعات مشتريات بالدين (${e.items.length} أصناف)',
+          '${e.amount.toStringAsFixed(0)} ريال',
+          '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
+        ]);
+
+        // صف مستقل لكل منتج داخل نفس الفاتورة
+        for (final item in e.items) {
+          final pName =
+              (item['name'] ?? item['product_name'] ?? 'صنف').toString().trim();
+          final q = item['quantity'] ?? 1;
+          final u = (item['unit_label'] ?? 'حبة').toString().trim();
+          final uPrice = (item['unit_price'] as num?)?.toDouble() ?? 0.0;
+          final subtotal =
+              (item['subtotal'] as num?)?.toDouble() ?? (q * uPrice);
+
+          tableRows.add([
+            '—',
+            '',
+            '↳ صنف',
+            '$pName  [عدد: $q $u × ${uPrice.toStringAsFixed(0)} ريال]',
+            '${subtotal.toStringAsFixed(0)} ريال',
+            '',
+          ]);
+        }
+      } else {
+        // حركة عادية (صنف واحد أو سداد نقدي أو دين مباشر)
+        String details = '';
+        if (e.items.isNotEmpty) {
+          final it = e.items.first;
+          final pName =
+              (it['name'] ?? it['product_name'] ?? 'صنف').toString().trim();
+          final q = it['quantity'] ?? 1;
+          final u = (it['unit_label'] ?? '').toString().trim();
+          details = '$pName ($q $u)';
+        } else if (e.notes != null && e.notes!.trim().isNotEmpty) {
+          details = e.notes!.trim();
+        } else {
+          details = e.isDebt ? 'مشتريات بالآجل' : 'سداد دفعة نقدية';
+        }
+
+        tableRows.add([
+          '${i + 1}',
+          '$eDate\n$eTime',
+          e.isDebt ? 'دين (+)' : 'سداد (-)',
+          details,
+          '${e.amount.toStringAsFixed(0)} ريال',
+          '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
+        ]);
+      }
     }
 
     final qrPayload =
-        'SALA_APP|STORE:$storeName|CUST:${customer.name}|BAL:${customer.currentBalance.toStringAsFixed(0)}|DATE:$dateStr|$dayName|$timeStr';
+        'SALA|STORE:$storeName|CUST:${customer.name}|BAL:${customer.currentBalance.toStringAsFixed(0)}|DATE:$dateStr';
 
+    // ── 3. بناء صفحات PDF مع تجزئة الودجتس لمنع قفز الجدول (حل الملاحظة 3) ──
     pdf.addPage(
       pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
-        margin: const pw.EdgeInsets.all(24),
+        margin: const pw.EdgeInsets.symmetric(horizontal: 20, vertical: 16),
         theme: pw.ThemeData.withFont(base: regularFont, bold: boldFont),
+        header: (context) {
+          if (context.pageNumber == 1) return pw.SizedBox.shrink();
+          return pw.Directionality(
+            textDirection: pw.TextDirection.rtl,
+            child: pw.Container(
+              margin: const pw.EdgeInsets.only(bottom: 8),
+              padding:
+                  const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: pw.BoxDecoration(
+                color: PdfColor.fromHex('#F5F5F5'),
+                borderRadius: pw.BorderRadius.circular(4),
+              ),
+              child: pw.Row(
+                mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                children: [
+                  pw.Text('كشف حساب الزبون: ${customer.name}',
+                      style: pw.TextStyle(font: boldFont, fontSize: 8.5)),
+                  pw.Text(
+                      'تابع الحركات — صفحة ${context.pageNumber} من ${context.pagesCount}',
+                      style: pw.TextStyle(font: regularFont, fontSize: 8)),
+                ],
+              ),
+            ),
+          );
+        },
         build: (context) => [
+          // ── ترويسة الصفحة الأولى المدمجة ──
           pw.Directionality(
             textDirection: pw.TextDirection.rtl,
-            child: pw.Column(
-              crossAxisAlignment: pw.CrossAxisAlignment.stretch,
-              children: [
-                // ── ترويسة أنيقة خالية من أي تشابك مع إبراز اسم تطبيق سلة ──
-                pw.Container(
-                  padding: const pw.EdgeInsets.symmetric(
-                      horizontal: 16, vertical: 12),
-                  decoration: pw.BoxDecoration(
-                    color: PdfColor.fromHex('#1B8E3D'),
-                    borderRadius: pw.BorderRadius.circular(10),
-                  ),
-                  child: pw.Row(
-                    crossAxisAlignment: pw.CrossAxisAlignment.center,
-                    mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+            child: pw.Container(
+              padding:
+                  const pw.EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: pw.BoxDecoration(
+                color: PdfColor.fromHex('#1B8E3D'),
+                borderRadius: pw.BorderRadius.circular(8),
+              ),
+              child: pw.Row(
+                mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                crossAxisAlignment: pw.CrossAxisAlignment.center,
+                children: [
+                  pw.Column(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
                     children: [
-                      // جهة اليمين: شعار تطبيق سلة واسم المتجر
-                      pw.Expanded(
-                        child: pw.Column(
-                          crossAxisAlignment: pw.CrossAxisAlignment.start,
-                          children: [
-                            pw.Row(
-                              children: [
-                                pw.Container(
-                                  padding: const pw.EdgeInsets.symmetric(
-                                      horizontal: 8, vertical: 3),
-                                  decoration: pw.BoxDecoration(
-                                    color: PdfColors.white,
-                                    borderRadius: pw.BorderRadius.circular(6),
-                                  ),
-                                  child: pw.Text(
-                                    'تطبيق سَـلَّـة',
-                                    style: pw.TextStyle(
-                                      font: boldFont,
-                                      fontSize: 12,
-                                      color: PdfColor.fromHex('#1B8E3D'),
-                                    ),
-                                  ),
-                                ),
-                                pw.SizedBox(width: 8),
-                                pw.Text(
-                                  'كشف حساب مالي معتمد',
-                                  style: pw.TextStyle(
-                                    font: boldFont,
-                                    fontSize: 13,
-                                    color: PdfColors.white,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            pw.SizedBox(height: 6),
-                            pw.Text(
-                              'المتجر / البائع: $storeName',
-                              style: pw.TextStyle(
-                                font: boldFont,
-                                fontSize: 13,
-                                color: PdfColor.fromHex('#E8F5ED'),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      pw.SizedBox(width: 12),
-                      // جهة اليسار: اليوم والتاريخ والوقت بنظام 12 ساعة
-                      pw.Container(
-                        padding: const pw.EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 6),
-                        decoration: pw.BoxDecoration(
-                          color: PdfColor.fromHex('#146B2E'),
-                          borderRadius: pw.BorderRadius.circular(8),
-                          border: pw.Border.all(
-                              color: PdfColor.fromHex('#2DB85B'), width: 0.8),
-                        ),
-                        child: pw.Column(
-                          crossAxisAlignment: pw.CrossAxisAlignment.end,
-                          children: [
-                            pw.Text(
-                              'اليوم: $dayName',
-                              style: pw.TextStyle(
-                                font: boldFont,
-                                fontSize: 9.5,
-                                color: PdfColors.white,
-                              ),
-                            ),
-                            pw.SizedBox(height: 2),
-                            pw.Text(
-                              'التاريخ: $dateStr',
-                              style: pw.TextStyle(
-                                font: regularFont,
-                                fontSize: 9,
-                                color: PdfColor.fromHex('#E8F5ED'),
-                              ),
-                            ),
-                            pw.SizedBox(height: 2),
-                            pw.Text(
-                              'الوقت: $timeStr',
-                              style: pw.TextStyle(
-                                font: regularFont,
-                                fontSize: 9,
-                                color: PdfColor.fromHex('#E8F5ED'),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                pw.SizedBox(height: 14),
-                pw.Container(
-                  padding: const pw.EdgeInsets.all(12),
-                  decoration: pw.BoxDecoration(
-                    color: PdfColor.fromHex('#F8F9FA'),
-                    borderRadius: pw.BorderRadius.circular(8),
-                    border: pw.Border.all(color: PdfColor.fromHex('#E0E0E0')),
-                  ),
-                  child: pw.Row(
-                    mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-                    children: [
-                      pw.Column(
-                        crossAxisAlignment: pw.CrossAxisAlignment.start,
+                      pw.Row(
                         children: [
-                          pw.Text(
-                            'الزبون: ${customer.name}',
-                            style: pw.TextStyle(
-                              font: boldFont,
-                              fontSize: 13,
-                              color: PdfColor.fromHex('#1A1A2E'),
+                          pw.Container(
+                            padding: const pw.EdgeInsets.symmetric(
+                                horizontal: 6, vertical: 2),
+                            decoration: pw.BoxDecoration(
+                              color: PdfColors.white,
+                              borderRadius: pw.BorderRadius.circular(4),
                             ),
+                            child: pw.Text('تطبيق سَـلَّـة',
+                                style: pw.TextStyle(
+                                    font: boldFont,
+                                    fontSize: 10,
+                                    color: PdfColor.fromHex('#1B8E3D'))),
                           ),
-                          pw.SizedBox(height: 3),
-                          pw.Text(
-                            'رقم الهاتف: ${customer.phone.isNotEmpty ? customer.phone : "غير مسجل"}',
-                            style: pw.TextStyle(
-                                font: regularFont,
-                                fontSize: 10,
-                                color: PdfColors.grey700),
-                          ),
-                          if (customer.creditLimit > 0)
-                            pw.Text(
-                              'سقف الدين المعتمد: ${customer.creditLimit.toStringAsFixed(0)} ريال',
+                          pw.SizedBox(width: 8),
+                          pw.Text('كشف حساب مالي معتمد',
                               style: pw.TextStyle(
-                                  font: regularFont,
-                                  fontSize: 10,
-                                  color: PdfColors.grey700),
-                            ),
+                                  font: boldFont,
+                                  fontSize: 12,
+                                  color: PdfColors.white)),
                         ],
                       ),
-                      pw.BarcodeWidget(
-                        barcode: pw.Barcode.qrCode(),
-                        data: qrPayload,
-                        width: 52,
-                        height: 52,
+                      pw.SizedBox(height: 2),
+                      pw.Text('المتجر / البائع: $storeName',
+                          style: pw.TextStyle(
+                              font: boldFont,
+                              fontSize: 11,
+                              color: PdfColor.fromHex('#E8F5ED'))),
+                    ],
+                  ),
+                  pw.Container(
+                    padding: const pw.EdgeInsets.symmetric(
+                        horizontal: 8, vertical: 4),
+                    decoration: pw.BoxDecoration(
+                      color: PdfColor.fromHex('#146B2E'),
+                      borderRadius: pw.BorderRadius.circular(6),
+                    ),
+                    child: pw.Text('$dayName $dateStr - $timeStr',
+                        style: pw.TextStyle(
+                            font: boldFont,
+                            fontSize: 8.5,
+                            color: PdfColors.white)),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          pw.SizedBox(height: 6),
+
+          // ── بيانات العميل والباركود في شريط مدمج ──
+          pw.Directionality(
+            textDirection: pw.TextDirection.rtl,
+            child: pw.Container(
+              padding:
+                  const pw.EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: pw.BoxDecoration(
+                color: PdfColor.fromHex('#F8F9FA'),
+                borderRadius: pw.BorderRadius.circular(6),
+                border: pw.Border.all(color: PdfColor.fromHex('#E5E7EB')),
+              ),
+              child: pw.Row(
+                mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                children: [
+                  pw.Column(
+                    crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    children: [
+                      pw.Text('الزبون: ${customer.name}',
+                          style: pw.TextStyle(
+                              font: boldFont,
+                              fontSize: 12,
+                              color: PdfColor.fromHex('#111827'))),
+                      pw.Row(
+                        children: [
+                          pw.Text(
+                              'الهاتف: ${customer.phone.isNotEmpty ? customer.phone : "غير مسجل"}',
+                              style: pw.TextStyle(
+                                  font: regularFont,
+                                  fontSize: 9,
+                                  color: PdfColors.grey700)),
+                          if (customer.creditLimit > 0) ...[
+                            pw.SizedBox(width: 12),
+                            pw.Text(
+                                'سقف الدين: ${customer.creditLimit.toStringAsFixed(0)} ريال',
+                                style: pw.TextStyle(
+                                    font: boldFont,
+                                    fontSize: 9,
+                                    color: PdfColor.fromHex('#B91C1C'))),
+                          ],
+                        ],
                       ),
                     ],
                   ),
-                ),
-                pw.SizedBox(height: 12),
-                pw.Row(
-                  children: [
-                    pw.Expanded(
-                      child: pw.Container(
-                        padding: const pw.EdgeInsets.all(10),
-                        decoration: pw.BoxDecoration(
-                          color: PdfColor.fromHex('#FFF5F5'),
-                          borderRadius: pw.BorderRadius.circular(8),
-                          border:
-                              pw.Border.all(color: PdfColor.fromHex('#FFCDD2')),
-                        ),
-                        child: pw.Column(
-                          crossAxisAlignment: pw.CrossAxisAlignment.start,
-                          children: [
-                            pw.Text('إجمالي المشتريات (ديون)',
-                                style: pw.TextStyle(
-                                    font: regularFont,
-                                    fontSize: 9,
-                                    color: PdfColors.red900)),
-                            pw.SizedBox(height: 2),
-                            pw.Text(
-                              '${periodTotalDebt.toStringAsFixed(0)} ريال',
-                              style: pw.TextStyle(
-                                  font: boldFont,
-                                  fontSize: 13,
-                                  color: PdfColors.red800),
-                            ),
-                          ],
-                        ),
-                      ),
+                  pw.BarcodeWidget(
+                    barcode: pw.Barcode.qrCode(),
+                    data: qrPayload,
+                    width: 38,
+                    height: 38,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          pw.SizedBox(height: 6),
+
+          // ── الكروت الثلاثة بحجم اقتصادي يترك أكثر من 600pt للجدول في الصفحة الأولى ──
+          pw.Directionality(
+            textDirection: pw.TextDirection.rtl,
+            child: pw.Row(
+              children: [
+                pw.Expanded(
+                  child: pw.Container(
+                    padding: const pw.EdgeInsets.symmetric(
+                        vertical: 6, horizontal: 8),
+                    decoration: pw.BoxDecoration(
+                      color: PdfColor.fromHex('#FFF5F5'),
+                      borderRadius: pw.BorderRadius.circular(6),
+                      border: pw.Border.all(color: PdfColor.fromHex('#FECACA')),
                     ),
-                    pw.SizedBox(width: 8),
-                    pw.Expanded(
-                      child: pw.Container(
-                        padding: const pw.EdgeInsets.all(10),
-                        decoration: pw.BoxDecoration(
-                          color: PdfColor.fromHex('#F0FDF4'),
-                          borderRadius: pw.BorderRadius.circular(8),
-                          border:
-                              pw.Border.all(color: PdfColor.fromHex('#BBF7D0')),
-                        ),
-                        child: pw.Column(
-                          crossAxisAlignment: pw.CrossAxisAlignment.start,
-                          children: [
-                            pw.Text('إجمالي المدفوعات (سداد)',
-                                style: pw.TextStyle(
-                                    font: regularFont,
-                                    fontSize: 9,
-                                    color: PdfColors.green900)),
-                            pw.SizedBox(height: 2),
-                            pw.Text(
-                              '${periodTotalPayment.toStringAsFixed(0)} ريال',
-                              style: pw.TextStyle(
-                                  font: boldFont,
-                                  fontSize: 13,
-                                  color: PdfColors.green800),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    pw.SizedBox(width: 8),
-                    pw.Expanded(
-                      child: pw.Container(
-                        padding: const pw.EdgeInsets.all(10),
-                        decoration: pw.BoxDecoration(
-                          color: customer.currentBalance > 0
-                              ? PdfColor.fromHex('#FEF2F2')
-                              : PdfColor.fromHex('#F0FDF4'),
-                          borderRadius: pw.BorderRadius.circular(8),
-                          border: pw.Border.all(
-                            color: customer.currentBalance > 0
-                                ? PdfColors.red
-                                : PdfColors.green,
-                            width: 1.5,
-                          ),
-                        ),
-                        child: pw.Column(
-                          crossAxisAlignment: pw.CrossAxisAlignment.start,
-                          children: [
-                            pw.Text(
-                              customer.currentBalance >= 0
-                                  ? 'الرصيد المتبقي (مطلوب)'
-                                  : 'رصيد دائن (له بذمتكم)',
-                              style: pw.TextStyle(
-                                  font: boldFont,
-                                  fontSize: 9,
-                                  color: customer.currentBalance > 0
-                                      ? PdfColors.red900
-                                      : PdfColors.green900),
-                            ),
-                            pw.SizedBox(height: 2),
-                            pw.Text(
-                              '${customer.currentBalance.abs().toStringAsFixed(0)} ريال',
-                              style: pw.TextStyle(
-                                  font: boldFont,
-                                  fontSize: 14,
-                                  color: customer.currentBalance > 0
-                                      ? PdfColors.red900
-                                      : PdfColors.green900),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                pw.SizedBox(height: 14),
-                pw.TableHelper.fromTextArray(
-                  headers: [
-                    'م',
-                    'التاريخ والوقت',
-                    'النوع',
-                    'البيان والأصناف',
-                    'المبلغ',
-                    'الرصيد بعد الحركة',
-                  ],
-                  data: tableRows,
-                  headerStyle: pw.TextStyle(
-                    font: boldFont,
-                    fontSize: 9.5,
-                    color: PdfColors.white,
-                  ),
-                  headerDecoration: pw.BoxDecoration(
-                    color: PdfColor.fromHex('#1B8E3D'),
-                  ),
-                  cellStyle: pw.TextStyle(
-                    font: regularFont,
-                    fontSize: 8.5,
-                  ),
-                  cellAlignment: pw.Alignment.center,
-                  cellAlignments: {
-                    0: pw.Alignment.center,
-                    1: pw.Alignment.center,
-                    2: pw.Alignment.center,
-                    3: pw.Alignment.centerRight,
-                    4: pw.Alignment.center,
-                    5: pw.Alignment.center,
-                  },
-                  headerHeight: 24,
-                  cellPadding:
-                      const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 5),
-                  oddRowDecoration: pw.BoxDecoration(
-                    color: PdfColor.fromHex('#FBFBFB'),
-                  ),
-                ),
-                pw.SizedBox(height: 20),
-                pw.Row(
-                  mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-                  children: [
-                    pw.Column(
-                      crossAxisAlignment: pw.CrossAxisAlignment.start,
+                    child: pw.Column(
                       children: [
-                        pw.Text(
-                            'توقيع وختم المحل / الإدارة: .............................',
-                            style:
-                                pw.TextStyle(font: regularFont, fontSize: 9)),
-                        pw.SizedBox(height: 4),
-                        pw.Text('وثيقة مالية صادرة رقمياً ومعتمدة محاسبياً',
+                        pw.Text('إجمالي المشتريات (ديون)',
                             style: pw.TextStyle(
                                 font: regularFont,
-                                fontSize: 8,
-                                color: PdfColors.grey600)),
+                                fontSize: 8.5,
+                                color: PdfColors.red900)),
+                        pw.Text('${periodTotalDebt.toStringAsFixed(0)} ريال',
+                            style: pw.TextStyle(
+                                font: boldFont,
+                                fontSize: 12,
+                                color: PdfColors.red800)),
                       ],
                     ),
-                    pw.Column(
-                      crossAxisAlignment: pw.CrossAxisAlignment.end,
+                  ),
+                ),
+                pw.SizedBox(width: 6),
+                pw.Expanded(
+                  child: pw.Container(
+                    padding: const pw.EdgeInsets.symmetric(
+                        vertical: 6, horizontal: 8),
+                    decoration: pw.BoxDecoration(
+                      color: PdfColor.fromHex('#F0FDF4'),
+                      borderRadius: pw.BorderRadius.circular(6),
+                      border: pw.Border.all(color: PdfColor.fromHex('#BBF7D0')),
+                    ),
+                    child: pw.Column(
                       children: [
-                        pw.Text(
-                            'توقيع الزبون بالمطابقة: .............................',
-                            style:
-                                pw.TextStyle(font: regularFont, fontSize: 9)),
-                        pw.SizedBox(height: 4),
-                        pw.Text('صفحة كشف حساب معتمدة',
+                        pw.Text('إجمالي المدفوعات (سداد)',
                             style: pw.TextStyle(
                                 font: regularFont,
-                                fontSize: 8,
-                                color: PdfColors.grey600)),
+                                fontSize: 8.5,
+                                color: PdfColors.green900)),
+                        pw.Text('${periodTotalPayment.toStringAsFixed(0)} ريال',
+                            style: pw.TextStyle(
+                                font: boldFont,
+                                fontSize: 12,
+                                color: PdfColors.green800)),
                       ],
                     ),
-                  ],
+                  ),
                 ),
+                pw.SizedBox(width: 6),
+                pw.Expanded(
+                  child: pw.Container(
+                    padding: const pw.EdgeInsets.symmetric(
+                        vertical: 6, horizontal: 8),
+                    decoration: pw.BoxDecoration(
+                      color: customer.currentBalance > 0
+                          ? PdfColor.fromHex('#FEF2F2')
+                          : PdfColor.fromHex('#F0FDF4'),
+                      borderRadius: pw.BorderRadius.circular(6),
+                      border: pw.Border.all(
+                        color: customer.currentBalance > 0
+                            ? PdfColors.red
+                            : PdfColors.green,
+                        width: 1.2,
+                      ),
+                    ),
+                    child: pw.Column(
+                      children: [
+                        pw.Text(
+                          customer.currentBalance >= 0
+                              ? 'الرصيد المتبقي (مطلوب)'
+                              : 'رصيد دائن (له)',
+                          style: pw.TextStyle(
+                              font: boldFont,
+                              fontSize: 8.5,
+                              color: customer.currentBalance > 0
+                                  ? PdfColors.red900
+                                  : PdfColors.green900),
+                        ),
+                        pw.Text(
+                          '${customer.currentBalance.abs().toStringAsFixed(0)} ريال',
+                          style: pw.TextStyle(
+                              font: boldFont,
+                              fontSize: 13,
+                              color: customer.currentBalance > 0
+                                  ? PdfColors.red900
+                                  : PdfColors.green900),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          pw.SizedBox(height: 8),
+
+          // ── الجدول كعنصر مباشر حر (يبدأ فوراً بالصفحة الأولى وينقسم بين الصفحات تلقائياً) ──
+          pw.Directionality(
+            textDirection: pw.TextDirection.rtl,
+            child: pw.TableHelper.fromTextArray(
+              headers: [
+                'م',
+                'التاريخ والوقت',
+                'النوع',
+                'البيان والأصناف',
+                'المبلغ',
+                'الرصيد بعد الحركة',
+              ],
+              data: tableRows,
+              headerStyle: pw.TextStyle(
+                  font: boldFont, fontSize: 8.5, color: PdfColors.white),
+              headerDecoration:
+                  pw.BoxDecoration(color: PdfColor.fromHex('#1B8E3D')),
+              cellStyle: pw.TextStyle(font: regularFont, fontSize: 8),
+              cellAlignment: pw.Alignment.center,
+              cellAlignments: {
+                0: pw.Alignment.center,
+                1: pw.Alignment.center,
+                2: pw.Alignment.center,
+                3: pw.Alignment.centerRight,
+                4: pw.Alignment.center,
+                5: pw.Alignment.center,
+              },
+              headerHeight: 22,
+              cellPadding:
+                  const pw.EdgeInsets.symmetric(horizontal: 5, vertical: 3.5),
+              rowDecoration: pw.BoxDecoration(color: PdfColors.white),
+              oddRowDecoration:
+                  pw.BoxDecoration(color: PdfColor.fromHex('#FAFAFA')),
+            ),
+          ),
+          pw.SizedBox(height: 14),
+
+          // ── تذييل التوقيع والاعتماد ──
+          pw.Directionality(
+            textDirection: pw.TextDirection.rtl,
+            child: pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Text('ختم وتوقيع المحل: ...............................',
+                    style: pw.TextStyle(
+                        font: regularFont,
+                        fontSize: 8.5,
+                        color: PdfColors.grey700)),
+                pw.Text(
+                    'توقيع الزبون بالمطابقة: ...............................',
+                    style: pw.TextStyle(
+                        font: regularFont,
+                        fontSize: 8.5,
+                        color: PdfColors.grey700)),
               ],
             ),
           ),

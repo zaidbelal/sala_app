@@ -239,13 +239,14 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            // 🚀 استماع ذكي ومطابقة حتمية تمنع مضاعفة الرصيد المحاسبي إطلاقاً
+            // 🚀 استماع ذكي ومطابقة حتمية تحسب الرصيد المعروض نقياً بدون تعديل الحالة في build()
             StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
               stream: FirebaseFirestore.instance
                   .collection('merchant_customers')
                   .doc(_customer.id)
                   .snapshots(),
               builder: (context, custSnap) {
+                var displayedCustomer = _customer;
                 if (custSnap.hasData &&
                     custSnap.data!.exists &&
                     custSnap.data!.data() != null) {
@@ -275,7 +276,6 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       continue;
                     final txId = tx['id']?.toString() ?? '';
 
-                    // حماية قطعية: إذا استلم السيرفر القيد، نتجاوز إضافته لمنع ازدواجية الرصيد
                     if (!isOfflineCache && serverAppliedIds.contains(txId))
                       continue;
                     if (_locallyDismissedEntryIds.contains(txId)) continue;
@@ -284,7 +284,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
                     pendingDelta += isDebt ? amt : -amt;
                   }
-                  // تطبيق خصم طلبات الشطب المعلقة محلياً واحتساب المبالغ المشطوبة بدقة
+
                   final voidRequests =
                       pendingTxs.where((t) => t['type'] == 'void_request');
                   double voidDelta = 0.0;
@@ -293,11 +293,10 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     final isDebtVoid = v['is_debt'] != false;
                     voidDelta += isDebtVoid ? -voidAmt : voidAmt;
                   }
-// 🔒 قراءة حالة الكاش بأمان مباشر من metadata الخاصة بـ snapshot
-                  // 🛡️ مطابقة ذكية: احتساب فوارق الطابور فقط للحركات التي لم تُقيد في السيرفر بعد
+
                   final double localAdjustments = (pendingDelta + voidDelta);
 
-                  _customer = LedgerCustomer(
+                  displayedCustomer = LedgerCustomer(
                     id: serverCustomer.id,
                     merchantId: serverCustomer.merchantId,
                     name: serverCustomer.name,
@@ -311,8 +310,8 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     updatedAt: serverCustomer.updatedAt,
                   );
                 }
-                final isOverLimit = _customer.isOverLimit;
-                final isNegative = _customer.currentBalance < 0;
+                final isOverLimit = displayedCustomer.isOverLimit;
+                final isNegative = displayedCustomer.currentBalance < 0;
                 return Container(
                   margin: const EdgeInsets.all(16),
                   padding: const EdgeInsets.all(20),
@@ -830,8 +829,10 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
 
     final merchantId = AppStorage.userId ?? '';
     // ✅ تثبيت المعرف الحتمي لمنع توليد حركات مزدوجة عند النقر المتكرر أو فقدان الحزم الشبكية
+    final safeMId =
+        merchantId.length > 5 ? merchantId.substring(0, 5) : merchantId;
     _assignedTransactionId ??=
-        'tx_${merchantId.length > 5 ? merchantId.substring(0, 5) : merchantId}_${widget.customer.id}_${DateTime.now().millisecondsSinceEpoch}_${(amt * 100).toInt()}';
+        'tx_${safeMId}_${widget.customer.id}_${DateTime.now().microsecondsSinceEpoch}_${(amt * 100).toInt()}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}';
     final entryId = _assignedTransactionId!;
 
     if (widget.isDebt && widget.customer.creditLimit > 0) {
