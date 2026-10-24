@@ -21,7 +21,6 @@ dependencies:
   firebase_storage: ^12.4.0
   cloud_functions: ^5.2.0
   firebase_messaging: ^15.1.0
-  firebase_app_check: ^0.3.2+10
   firebase_crashlytics: ^4.3.10
 
   # ════════════════════════════════════════
