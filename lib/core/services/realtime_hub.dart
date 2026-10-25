@@ -382,22 +382,23 @@ class RealtimeHub {
   Future<void> _stopUserChannels() async {
     _notificationsSub?.cancel();
     _notificationsSub = null;
-    _categoriesSub?.cancel();
-    _categoriesSub = null;
-    _brandsSub?.cancel();
-    _brandsSub = null;
 
+    // 🔒 حماية الكتالوج العام: الحفاظ على قنوات الأصناف والشركات حية للتصفح العام، أو إعادة تشغيلها فوراً
     final subscriptions = List<StreamSubscription>.from(_userSubs);
     _userSubs.clear();
 
     await Future.wait(
       subscriptions.map((subscription) => subscription.cancel()),
     );
+
     _container?.read(merchantOrdersProvider.notifier).clear();
     _container?.read(realtimeNotifsProvider.notifier).clear();
     _container?.read(realtimeAllOrdersProvider.notifier).clear();
     _container?.read(realtimeConfirmedOrdersProvider.notifier).clear();
     _container?.read(realtimeMyShippedOrdersProvider.notifier).clear();
+
+    if (_categoriesSub == null) _watchCategories();
+    if (_brandsSub == null) _watchBrands();
   }
 
   // ── مراقبة طلبات التاجر ──────────────────────────────────

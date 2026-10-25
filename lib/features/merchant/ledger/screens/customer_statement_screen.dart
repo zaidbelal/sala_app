@@ -367,16 +367,19 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   // 🔒 حل التعارض المالي: إذا كانت لقطة السيرفر حية وخالية من الكاش (Live Server)، نعتمد رصيد السيرفر مباشرة
                   final isLiveFromServer = !custSnap.data!.metadata.isFromCache;
                   double localAdjustments = 0.0;
-
                   if (!isLiveFromServer) {
+                    // 🔒 تصحيح رياضي حتمي: احتساب المعاملات غير المنعكسة في السيرفر فقط دون إعادة خصم المشطوب محلياً
                     final pendingTxs =
                         AppStorage.getPendingLedgerTxs(_customer.merchantId)
                             .where((t) => t['customer_id'] == _customer.id);
                     double pendingDelta = 0.0;
                     for (final tx in pendingTxs) {
                       final txType = tx['type']?.toString();
-                      if (txType == 'add_customer' || txType == 'void_request')
+                      if (txType == 'add_customer' ||
+                          txType == 'void_request' ||
+                          txType == 'delete_customer') {
                         continue;
+                      }
                       final txId = tx['id']?.toString() ?? '';
 
                       if (serverAppliedIds.contains(txId)) continue;
@@ -387,18 +390,9 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       pendingDelta += isDebt ? amt : -amt;
                     }
 
-                    final voidRequests =
-                        pendingTxs.where((t) => t['type'] == 'void_request');
-                    double voidDelta = 0.0;
-                    for (final v in voidRequests) {
-                      final voidAmt = (v['amount'] as num?)?.toDouble() ?? 0.0;
-                      final isDebtVoid = v['is_debt'] != false;
-                      voidDelta += isDebtVoid ? -voidAmt : voidAmt;
-                    }
-
-                    localAdjustments = (pendingDelta + voidDelta);
+                    // لا نعيد تطبيق voidDelta لأن الكاش المحلي serverCustomer تم تحديثه مسبقاً في voidTransaction
+                    localAdjustments = pendingDelta;
                   }
-
                   displayedCustomer = LedgerCustomer(
                     id: serverCustomer.id,
                     merchantId: serverCustomer.merchantId,
@@ -1052,6 +1046,8 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
         transactionId: entryId,
       );
 
+      _assignedTransactionId =
+          null; // 🔒 لا يُصفّر المعرف إلا بعد نجاح الإرسال أو اعتماده في الطابور
       if (!mounted) return;
       Navigator.pop(context, updatedCustomer);
       if (updatedCustomer.phone.trim().isNotEmpty) {
@@ -1094,8 +1090,7 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
         );
       }
     } catch (e) {
-      // ✅ عند انقطاع الاتصال نكتفي بالـ optimistic update دون تكرار الحساب
-      _assignedTransactionId = null;
+      // 🔒 الحفاظ على _assignedTransactionId في حالة إعادة المحاولة، لمنع توليد قيد مالي مكرر
       if (!mounted) return;
       Navigator.pop(context, updatedCustomer);
       ScaffoldMessenger.of(context).showSnackBar(

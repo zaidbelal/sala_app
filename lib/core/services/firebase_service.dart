@@ -1,10 +1,13 @@
 import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
-import 'local_storage.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:sala/features/merchant/cart/providers/cart_provider.dart';
+import 'local_storage.dart';
 import 'realtime_hub.dart';
 import 'notification_service.dart';
+import 'app_cache.dart';
 
 // ══ العملاء المركزيون ══
 final db = FirebaseFirestore.instance;
@@ -114,8 +117,8 @@ class FirebaseService {
     }
   }
 
-// ══ تسجيل الخروج الشامل والآمن ══
-  static Future<void> signOut() async {
+// ══ تسجيل الخروج الشامل والآمن الموحد ══
+  static Future<void> signOut({ProviderContainer? container}) async {
     clearCache();
     final uid = AppStorage.userId;
     try {
@@ -132,6 +135,20 @@ class FirebaseService {
       await FirebaseAuth.instance.signOut();
     } catch (_) {}
     await AppStorage.clearUserData();
+    await AppCache.instance.clearAll();
+
+    // 🔒 تطهير شامل لحاويات الواجهة لضمان عدم بقاء أي سلة أو بحث للجلسة التالية
+    final targetContainer = container ?? RealtimeHub().container;
+    if (targetContainer != null) {
+      try {
+        targetContainer.invalidate(cartProvider);
+        targetContainer.invalidate(realtimeNotifsProvider);
+        targetContainer.invalidate(merchantOrdersProvider);
+        targetContainer.invalidate(realtimeConfirmedOrdersProvider);
+        targetContainer.invalidate(realtimeMyShippedOrdersProvider);
+        targetContainer.invalidate(realtimeAllOrdersProvider);
+      } catch (_) {}
+    }
   }
 }
 

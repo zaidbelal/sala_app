@@ -17,6 +17,7 @@ import 'package:sala/features/auth/login/services/auth_service.dart';
 import '../../../../core/services/connectivity_service.dart';
 import 'dart:async';
 import 'package:sala/core/services/wal_service.dart';
+import 'package:sala/core/services/app_cache.dart';
 
 class CheckoutScreen extends ConsumerStatefulWidget {
   final String merchantId;
@@ -468,8 +469,32 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
 
     bool isOffline = !(await ConnectivityHelper.hasActiveInternet());
     if (isOffline) {
+      // 🛡️ فحص حتمي محلي بالكاش قبل الحفظ أوفلاين لمنع تسلل سلع محذوفة
+      final cachedProducts = AppCache.instance.getProducts() ?? [];
+      final activeProductIds = cachedProducts
+          .where((p) => p['is_deleted'] != true && p['is_active'] != false)
+          .map((p) => p['id']?.toString())
+          .toSet();
+
+      final invalidItems = itemsList
+          .where(
+            (it) => !activeProductIds.contains(it['product_id']?.toString()),
+          )
+          .toList();
+
+      if (invalidItems.isNotEmpty) {
+        safeDismissLoading();
+        for (final badIt in invalidItems) {
+          ref
+              .read(cartProvider.notifier)
+              .removeItem(badIt['product_id'].toString());
+        }
+        _showError(
+            'تم استبعاد أصناف غير متوفرة في الكتالوج المحلي، يرجى إعادة مراجعة الطلب');
+        return;
+      }
+
       try {
-        // 🔒 تدوين نية المعاملة أولاً في سجل WAL المقاوم للانهيارات قبل طابور SharedPreferences
         await WalService.instance.writeIntent(
           transactionId: generatedOrderId,
           type: WalOperationType.placeOrder,
@@ -511,7 +536,6 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       }
       return;
     }
-
     try {
       final order = await OrdersService.placeOrder(
         merchantId: merchantId,
@@ -595,49 +619,52 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       HapticFeedback.vibrate();
       _orderIdempotencyKey = null;
       final err = e.toString();
-
-      // استخراج معرف المنتج أو الوحدة المتضررة وإعلام التاجر بلباقة
+// 🚀 استخراج جماعي شامل لجميع الأصناف والوحدات التالفة دفعة واحدة (allMatches)
       if (err.contains('PRODUCT_UNAVAILABLE_[') ||
           err.contains('OUT_OF_STOCK_[')) {
         final RegExp exp =
             RegExp(r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[(.*?)\]');
-        final match = exp.firstMatch(err);
-        if (match != null && match.groupCount >= 1) {
-          final rawTarget = match.group(1)!;
+        final matches = exp.allMatches(err);
+        if (matches.isNotEmpty) {
           final cartNotifier = ref.read(cartProvider.notifier);
+          final keysToRemove = <String>{};
 
-          if (rawTarget.contains(':')) {
-            final parts = rawTarget.split(':');
-            final badProdId = parts[0].trim();
-            final badUnit = parts[1].trim();
-            final keysToRemove = cart.entries
-                .where((e) =>
-                    e.value.product.id == badProdId &&
-                    e.value.unitLabel.trim() == badUnit)
-                .map((e) => e.key)
-                .toList();
-            for (final k in keysToRemove) {
-              cartNotifier.removeItem(k);
-            }
-          } else {
-            final targetId = rawTarget.trim();
-            final keysToRemove = cart.entries
-                .where((e) => e.value.product.id == targetId)
-                .map((e) => e.key)
-                .toList();
-            for (final k in keysToRemove) {
-              cartNotifier.removeItem(k);
+          for (final m in matches) {
+            final rawTarget = m.group(1);
+            if (rawTarget == null) continue;
+
+            if (rawTarget.contains(':')) {
+              final parts = rawTarget.split(':');
+              final badProdId = parts[0].trim();
+              final badUnit = parts[1].trim();
+              for (final e in cart.entries) {
+                if (e.value.product.id == badProdId &&
+                    e.value.unitLabel.trim() == badUnit) {
+                  keysToRemove.add(e.key);
+                }
+              }
+            } else {
+              final targetId = rawTarget.trim();
+              for (final e in cart.entries) {
+                if (e.value.product.id == targetId) {
+                  keysToRemove.add(e.key);
+                }
+              }
             }
           }
+
+          for (final k in keysToRemove) {
+            cartNotifier.removeItem(k);
+          }
+
           _showError(
-              'نعتذر، أحد الأصناف المطلوبة لم يعد متوفراً في المستودع حالياً. تم تحديث سلتك.');
+              'نعتذر، تم استبعاد (${keysToRemove.length}) من الأصناف غير المتوفرة حالياً في المستودع من سلتك.');
           Future.delayed(const Duration(milliseconds: 1400), () {
             if (mounted) Navigator.of(context).pop();
           });
           return;
         }
       }
-
       final lowerErr = err.toLowerCase();
       final friendlyMessage = (lowerErr.contains('network') ||
               lowerErr.contains('timeout') ||

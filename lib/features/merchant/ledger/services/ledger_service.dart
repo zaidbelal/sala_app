@@ -318,12 +318,13 @@ class LedgerService {
             .toList();
       }
     } catch (_) {
-      // 🛡️ تراجع آمن: الفلترة بالذاكرة عند عدم توفر فهرس مركب بالسيرفر
+      // 🛡️ بحث سحابي موسع يستوعب آلاف الزبائن مع دعم التصفح الذكي
       try {
         final fallbackSnap = await _db
             .collection('merchant_customers')
             .where('merchant_id', isEqualTo: cleanMerchantId)
-            .limit(100)
+            .where('is_deleted', isEqualTo: false)
+            .limit(500) // رفع السقف لتغطية واسعة للزبائن
             .get(const GetOptions(source: Source.serverAndCache));
 
         return fallbackSnap.docs

@@ -1631,8 +1631,7 @@ exports.adminUpdateOrderStatus = onCall(
 // ══════════════════════════════════════════════════════════════
 // 📒 دوال دفتر ديون الزبائن المحاسبية المؤمّنة (Ledger Engine)
 // ══════════════════════════════════════════════════════════════
-
-// 1. إضافة زبون جديد في الدفتر بسلطة السيرفر
+// 1. إضافة زبون جديد في الدفتر بسلطة السيرفر مع فحص عدم التكرار
 exports.addLedgerCustomer = onCall(
   { region: "us-central1", cors: true },
   async (request) => {
@@ -1648,25 +1647,37 @@ exports.addLedgerCustomer = onCall(
       throw new HttpsError("invalid-argument", "اسم الزبون مطلوب");
     }
 
-    // التحقق من صلاحية ونشاط التاجر
     const merchantProfile = await db.collection("profiles").doc(merchantId).get();
     if (!merchantProfile.exists || merchantProfile.data()?.is_banned === true) {
       throw new HttpsError("permission-denied", "الحساب محظور أو غير مصرح له");
     }
 
-    // توحيد الأرقام المشرقية
     const arabicDigits = { "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4", "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9" };
     let cleanPhone = String(phone || "").trim();
     for (const [ar, en] of Object.entries(arabicDigits)) {
       cleanPhone = cleanPhone.replaceAll(ar, en);
     }
 
-    const safeCreditLimit = Math.max(0, Math.round((Number(creditLimit) || 0) * 100) / 100);
+    const safeCreditLimit = Math.max(0, Math.round(Number(creditLimit) || 0));
     const parsedSalaryDay = salaryDay != null ? Math.min(31, Math.max(1, parseInt(salaryDay, 10))) : null;
-const docRef = customerId ? db.collection("merchant_customers").doc(String(customerId).trim()) : db.collection("merchant_customers").doc();
+    const docRef = customerId ? db.collection("merchant_customers").doc(String(customerId).trim()) : db.collection("merchant_customers").doc();
 
     return await db.runTransaction(async (tx) => {
       const existingSnap = await tx.get(docRef);
+
+      // 🛡️ منع التكرار: التأكد من عدم وجود زبون مسبق بنفس الاسم أو الهاتف للتاجر نفسه
+      if (!existingSnap.exists && cleanPhone) {
+        const dupCheck = await db.collection("merchant_customers")
+          .where("merchant_id", "==", merchantId)
+          .where("phone", "==", cleanPhone)
+          .where("is_deleted", "==", false)
+          .limit(1)
+          .get();
+        if (!dupCheck.empty && dupCheck.docs[0].id !== docRef.id) {
+          throw new HttpsError("already-exists", "يوجد زبون مسجل مسبقاً بنفس رقم الهاتف");
+        }
+      }
+
       const customerData = {
         id: docRef.id,
         merchant_id: merchantId,
@@ -1674,10 +1685,10 @@ const docRef = customerId ? db.collection("merchant_customers").doc(String(custo
         phone: cleanPhone,
         credit_limit: safeCreditLimit,
         salary_day: isNaN(parsedSalaryDay) ? null : parsedSalaryDay,
+        is_deleted: false,
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
 
-     customerData.is_deleted = false;
       if (!existingSnap.exists) {
         customerData.current_balance = 0.0;
         customerData.created_at = admin.firestore.FieldValue.serverTimestamp();
@@ -1686,7 +1697,7 @@ const docRef = customerId ? db.collection("merchant_customers").doc(String(custo
         tx.set(docRef, customerData, { merge: true });
       }
 
-     return {
+      return {
         success: true,
         customer: {
           ...customerData,
@@ -1852,18 +1863,15 @@ const result = await db.runTransaction(async (tx) => {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
-    // 🔒 استخدام Set موحدة تجمع المعاملات النشطة وتمنع تضخم المصفوفة أو ضياع القيود
-      const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
-      const appliedSet = new Set(existingApplied);
-      appliedSet.add(entryId);
-      // الاقتصار على أحدث 1500 حركة إذا كبرت جداً مع الاحتفاظ بكل المعاملات في مجموعة القيود المستقلة
-      const updatedApplied = Array.from(appliedSet).slice(-1500);
+   // 🔒 حل جذري غير محدود السعة: الاعتماد على رقم إصدار ترادفي (sequence_version) ومعرف آخر حركة
+      // مما يلغي مصفوفة الـ 1500 نهائياً ويسمح بملايين المعاملات للزبون الواحد دون زيادة حجم الوثيقة
+      const currentVersion = Number(customerData.ledger_version) || 0;
 
       tx.set(entryRef, entryData);
       tx.update(customerRef, {
         current_balance: newBalance,
         last_transaction_id: entryId,
-        applied_tx_ids: updatedApplied,
+        ledger_version: currentVersion + 1,
         last_applied_timestamp: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -2060,10 +2068,11 @@ exports.reconcileLedgerBalance = onCall(
     let lastDoc = null;
     let keepPaging = true;
     const CHUNK_SIZE = 500;
-
+// 🔒 استعلام تدقيق حتمي مرتب حتمياً بمعرف الوثيقة (__name__) لضمان عدم القفز أو التكرار إطلاقاً
     while (keepPaging) {
       let q = db.collection("merchant_ledger_entries")
         .where("customer_id", "==", cleanCustomerId)
+        .orderBy(admin.firestore.FieldPath.documentId())
         .limit(CHUNK_SIZE);
 
       if (lastDoc) {
@@ -2089,7 +2098,6 @@ exports.reconcileLedgerBalance = onCall(
       lastDoc = chunkSnap.docs[chunkSnap.docs.length - 1];
       keepPaging = chunkSnap.docs.length === CHUNK_SIZE;
     }
-
     const calculatedAuthoritativeBalance = calculatedTotalCents / 100;
     // 🔒 الخطوة 3: المعاملة الذرية المحمية بنمط قفل النسخة (Optimistic Version Lock)
     return await db.runTransaction(async (tx) => {

@@ -827,15 +827,17 @@ void main() async {
     debugPrint('❌ AppStorage Error: $e');
   }
 
-  // 5. تهيئة الكاش وسجل العمليات
+// 5. تهيئة الكاش وسجل العمليات ومطابقة السلة قبل بدء الـ ProviderContainer
   try {
     await AppCache.instance.init();
     await WalService.instance.init();
-    unawaited(WalService.instance.reconcilePendingEntries());
+    await WalService.instance.reconcilePendingEntries().timeout(
+          const Duration(milliseconds: 1200),
+          onTimeout: () => null,
+        );
   } catch (e) {
-    debugPrint('❌ Cache Error: $e');
+    debugPrint('❌ Cache/WAL Initialization Warning: $e');
   }
-
   if (isFirebaseReady) {
     FirebaseService.initialize();
     unawaited(DeltaSyncService.instance.syncProductsDelta());
@@ -3697,10 +3699,13 @@ class DeltaSyncService {
 import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
-import 'local_storage.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:sala/features/merchant/cart/providers/cart_provider.dart';
+import 'local_storage.dart';
 import 'realtime_hub.dart';
 import 'notification_service.dart';
+import 'app_cache.dart';
 
 // ══ العملاء المركزيون ══
 final db = FirebaseFirestore.instance;
@@ -3810,8 +3815,8 @@ class FirebaseService {
     }
   }
 
-// ══ تسجيل الخروج الشامل والآمن ══
-  static Future<void> signOut() async {
+// ══ تسجيل الخروج الشامل والآمن الموحد ══
+  static Future<void> signOut({ProviderContainer? container}) async {
     clearCache();
     final uid = AppStorage.userId;
     try {
@@ -3828,6 +3833,20 @@ class FirebaseService {
       await FirebaseAuth.instance.signOut();
     } catch (_) {}
     await AppStorage.clearUserData();
+    await AppCache.instance.clearAll();
+
+    // 🔒 تطهير شامل لحاويات الواجهة لضمان عدم بقاء أي سلة أو بحث للجلسة التالية
+    final targetContainer = container ?? RealtimeHub().container;
+    if (targetContainer != null) {
+      try {
+        targetContainer.invalidate(cartProvider);
+        targetContainer.invalidate(realtimeNotifsProvider);
+        targetContainer.invalidate(merchantOrdersProvider);
+        targetContainer.invalidate(realtimeConfirmedOrdersProvider);
+        targetContainer.invalidate(realtimeMyShippedOrdersProvider);
+        targetContainer.invalidate(realtimeAllOrdersProvider);
+      } catch (_) {}
+    }
   }
 }
 
@@ -4320,15 +4339,7 @@ class AppStorage {
     if (targetUid == null || targetUid.isEmpty) return [];
     final key = _userPendingOrderKey(targetUid);
     var raw = _db.getString(key);
-    // حماية القراءة في حال تزامنها مع استبدال الملف الذري على القرص
-    if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
-      try {
-        final file = File('$_appDocsPath/${key}_backup.json');
-        if (file.existsSync()) {
-          raw = file.readAsStringSync();
-        }
-      } catch (_) {}
-    }
+    // 🔒 قراءة نظيفة موحدة: فحص الملف الاحتياطي الدائم ثم الملفات المؤقتة الأحدث عند وجود تعطل
     if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
       try {
         final file = File('$_appDocsPath/${key}_backup.json');
@@ -4336,21 +4347,24 @@ class AppStorage {
           raw = file.readAsStringSync();
         } else {
           final dir = Directory(_appDocsPath!);
-          final candidates = dir
-              .listSync()
-              .whereType<File>()
-              .where(
-                (f) =>
-                    f.path.contains('${key}_tmp_') && f.path.endsWith('.json'),
-              )
-              .toList();
-          if (candidates.isNotEmpty) {
-            candidates.sort(
-                (a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
-            raw = candidates.first.readAsStringSync();
-            try {
-              candidates.first.copySync(file.path);
-            } catch (_) {}
+          if (dir.existsSync()) {
+            final candidates = dir
+                .listSync()
+                .whereType<File>()
+                .where(
+                  (f) =>
+                      f.path.contains('${key}_tmp_') &&
+                      f.path.endsWith('.json'),
+                )
+                .toList();
+            if (candidates.isNotEmpty) {
+              candidates.sort((a, b) =>
+                  b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+              raw = candidates.first.readAsStringSync();
+              try {
+                candidates.first.copySync(file.path);
+              } catch (_) {}
+            }
           }
         }
       } catch (_) {}
@@ -4525,8 +4539,24 @@ class AppStorage {
 
       if (queue.isEmpty) {
         await _db.remove(key);
+        if (!kIsWeb && _appDocsPath != null) {
+          try {
+            final backupFile = File('$_appDocsPath/${key}_backup.json');
+            if (await backupFile.exists()) await backupFile.delete();
+          } catch (_) {}
+        }
       } else {
-        await _db.setString(key, jsonEncode(queue));
+        final json = jsonEncode(queue);
+        await _db.setString(key, json);
+        if (!kIsWeb && _appDocsPath != null) {
+          try {
+            final backupFile = File('$_appDocsPath/${key}_backup.json');
+            final nonce = DateTime.now().microsecondsSinceEpoch;
+            final tmpFile = File('$_appDocsPath/${key}_backup_$nonce.tmp');
+            await tmpFile.writeAsString(json, flush: true);
+            await tmpFile.rename(backupFile.path);
+          } catch (_) {}
+        }
       }
     } finally {
       completer.complete();
@@ -5552,6 +5582,10 @@ class RealtimeHub {
             container.invalidate(cartProvider);
             container.invalidate(realtimeNotifsProvider);
             container.invalidate(merchantOrdersProvider);
+            container.invalidate(realtimeConfirmedOrdersProvider);
+            container.invalidate(realtimeMyShippedOrdersProvider);
+            container.invalidate(realtimeAllOrdersProvider);
+            container.invalidate(driverNewOrderCallbackProvider);
           } catch (_) {}
         }
         try {
@@ -5646,22 +5680,23 @@ class RealtimeHub {
   Future<void> _stopUserChannels() async {
     _notificationsSub?.cancel();
     _notificationsSub = null;
-    _categoriesSub?.cancel();
-    _categoriesSub = null;
-    _brandsSub?.cancel();
-    _brandsSub = null;
 
+    // 🔒 حماية الكتالوج العام: الحفاظ على قنوات الأصناف والشركات حية للتصفح العام، أو إعادة تشغيلها فوراً
     final subscriptions = List<StreamSubscription>.from(_userSubs);
     _userSubs.clear();
 
     await Future.wait(
       subscriptions.map((subscription) => subscription.cancel()),
     );
+
     _container?.read(merchantOrdersProvider.notifier).clear();
     _container?.read(realtimeNotifsProvider.notifier).clear();
     _container?.read(realtimeAllOrdersProvider.notifier).clear();
     _container?.read(realtimeConfirmedOrdersProvider.notifier).clear();
     _container?.read(realtimeMyShippedOrdersProvider.notifier).clear();
+
+    if (_categoriesSub == null) _watchCategories();
+    if (_brandsSub == null) _watchBrands();
   }
 
   // ── مراقبة طلبات التاجر ──────────────────────────────────
@@ -30376,6 +30411,7 @@ class CartItem {
         'brandId': product.brandId,
         'size_ml': product.sizeMl,
         'items_per_carton': product.itemsPerCarton,
+        'units': product.units.map((u) => u.toMap()).toList(),
       },
       'quantity': quantity,
       'snapshot_at': DateTime.now().millisecondsSinceEpoch,
@@ -30388,6 +30424,9 @@ class CartItem {
     final unitMap = j['selectedUnit'] as Map<String, dynamic>?;
     final img = (p['image_url'] ?? p['imageUrl']) as String?;
 
+    final parsedUnit = unitMap != null ? ProductUnit.fromMap(unitMap) : null;
+    final rawUnits = p['units'] as List<dynamic>?;
+
     return CartItem(
       product: ProductModel.fromMap({
         'id': p['id'],
@@ -30397,13 +30436,14 @@ class CartItem {
         'brand_id': p['brandId'] ?? p['brand_id'] ?? '',
         'size_ml': p['size_ml'],
         'items_per_carton': p['items_per_carton'],
+        'units': rawUnits ?? (parsedUnit != null ? [parsedUnit.toMap()] : []),
         'category_id': '',
         'cost_price': 0,
         'stock': 0,
         'is_active': true,
       }),
       quantity: (j['quantity'] as num?)?.toInt() ?? 1,
-      selectedUnit: unitMap != null ? ProductUnit.fromMap(unitMap) : null,
+      selectedUnit: parsedUnit,
     );
   }
 }
@@ -30522,8 +30562,17 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
   void dispose() {
     flushEpoch++;
     _saveDebounce?.cancel();
-    if (state.isNotEmpty) {
-      unawaited(forceSave());
+    if (state.isNotEmpty && !kIsWeb) {
+      // 🔒 كتابة تزامنية فورية متزامنة تضمن ثبات البيانات قبل تحرير الموفر والعملية
+      try {
+        final uid = AppStorage.userId ?? 'guest';
+        if (AppStorage.isLoggedIn && AppStorage.userId != null) {
+          final dir = Directory.systemTemp; // fallback سريع إن تعذر الـ async
+          final dataMap = state.map((k, v) => MapEntry(k, v.toJson()));
+          final jsonString = jsonEncode(dataMap);
+          AppStorage.setString('sala_cart_backup_$uid', jsonString);
+        }
+      } catch (_) {}
     }
     super.dispose();
   }
@@ -31153,6 +31202,7 @@ import 'package:sala/features/auth/login/services/auth_service.dart';
 import '../../../../core/services/connectivity_service.dart';
 import 'dart:async';
 import 'package:sala/core/services/wal_service.dart';
+import 'package:sala/core/services/app_cache.dart';
 
 class CheckoutScreen extends ConsumerStatefulWidget {
   final String merchantId;
@@ -31604,8 +31654,32 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
 
     bool isOffline = !(await ConnectivityHelper.hasActiveInternet());
     if (isOffline) {
+      // 🛡️ فحص حتمي محلي بالكاش قبل الحفظ أوفلاين لمنع تسلل سلع محذوفة
+      final cachedProducts = AppCache.instance.getProducts() ?? [];
+      final activeProductIds = cachedProducts
+          .where((p) => p['is_deleted'] != true && p['is_active'] != false)
+          .map((p) => p['id']?.toString())
+          .toSet();
+
+      final invalidItems = itemsList
+          .where(
+            (it) => !activeProductIds.contains(it['product_id']?.toString()),
+          )
+          .toList();
+
+      if (invalidItems.isNotEmpty) {
+        safeDismissLoading();
+        for (final badIt in invalidItems) {
+          ref
+              .read(cartProvider.notifier)
+              .removeItem(badIt['product_id'].toString());
+        }
+        _showError(
+            'تم استبعاد أصناف غير متوفرة في الكتالوج المحلي، يرجى إعادة مراجعة الطلب');
+        return;
+      }
+
       try {
-        // 🔒 تدوين نية المعاملة أولاً في سجل WAL المقاوم للانهيارات قبل طابور SharedPreferences
         await WalService.instance.writeIntent(
           transactionId: generatedOrderId,
           type: WalOperationType.placeOrder,
@@ -31647,7 +31721,6 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       }
       return;
     }
-
     try {
       final order = await OrdersService.placeOrder(
         merchantId: merchantId,
@@ -31731,49 +31804,52 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       HapticFeedback.vibrate();
       _orderIdempotencyKey = null;
       final err = e.toString();
-
-      // استخراج معرف المنتج أو الوحدة المتضررة وإعلام التاجر بلباقة
+// 🚀 استخراج جماعي شامل لجميع الأصناف والوحدات التالفة دفعة واحدة (allMatches)
       if (err.contains('PRODUCT_UNAVAILABLE_[') ||
           err.contains('OUT_OF_STOCK_[')) {
         final RegExp exp =
             RegExp(r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[(.*?)\]');
-        final match = exp.firstMatch(err);
-        if (match != null && match.groupCount >= 1) {
-          final rawTarget = match.group(1)!;
+        final matches = exp.allMatches(err);
+        if (matches.isNotEmpty) {
           final cartNotifier = ref.read(cartProvider.notifier);
+          final keysToRemove = <String>{};
 
-          if (rawTarget.contains(':')) {
-            final parts = rawTarget.split(':');
-            final badProdId = parts[0].trim();
-            final badUnit = parts[1].trim();
-            final keysToRemove = cart.entries
-                .where((e) =>
-                    e.value.product.id == badProdId &&
-                    e.value.unitLabel.trim() == badUnit)
-                .map((e) => e.key)
-                .toList();
-            for (final k in keysToRemove) {
-              cartNotifier.removeItem(k);
-            }
-          } else {
-            final targetId = rawTarget.trim();
-            final keysToRemove = cart.entries
-                .where((e) => e.value.product.id == targetId)
-                .map((e) => e.key)
-                .toList();
-            for (final k in keysToRemove) {
-              cartNotifier.removeItem(k);
+          for (final m in matches) {
+            final rawTarget = m.group(1);
+            if (rawTarget == null) continue;
+
+            if (rawTarget.contains(':')) {
+              final parts = rawTarget.split(':');
+              final badProdId = parts[0].trim();
+              final badUnit = parts[1].trim();
+              for (final e in cart.entries) {
+                if (e.value.product.id == badProdId &&
+                    e.value.unitLabel.trim() == badUnit) {
+                  keysToRemove.add(e.key);
+                }
+              }
+            } else {
+              final targetId = rawTarget.trim();
+              for (final e in cart.entries) {
+                if (e.value.product.id == targetId) {
+                  keysToRemove.add(e.key);
+                }
+              }
             }
           }
+
+          for (final k in keysToRemove) {
+            cartNotifier.removeItem(k);
+          }
+
           _showError(
-              'نعتذر، أحد الأصناف المطلوبة لم يعد متوفراً في المستودع حالياً. تم تحديث سلتك.');
+              'نعتذر، تم استبعاد (${keysToRemove.length}) من الأصناف غير المتوفرة حالياً في المستودع من سلتك.');
           Future.delayed(const Duration(milliseconds: 1400), () {
             if (mounted) Navigator.of(context).pop();
           });
           return;
         }
       }
-
       final lowerErr = err.toLowerCase();
       final friendlyMessage = (lowerErr.contains('network') ||
               lowerErr.contains('timeout') ||
@@ -40476,12 +40552,21 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
               ),
               onTap: () async {
                 Navigator.pop(sheetCtx);
-                // 🛡️ جلب السجل مع ضمان احتساب الرصيد السابق المرحل لضمان تطابق الأرقام 100%
+                final liveCustDoc = await FirebaseFirestore.instance
+                    .collection('merchant_customers')
+                    .doc(_customer.id)
+                    .get(const GetOptions(source: Source.serverAndCache));
+                final authoritativeCustomer =
+                    (liveCustDoc.exists && liveCustDoc.data() != null)
+                        ? LedgerCustomer.fromMap(
+                            {'id': liveCustDoc.id, ...liveCustDoc.data()!})
+                        : _customer;
+
                 final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(_customer.id, limit: 1000)
+                    .watchCustomerEntries(authoritativeCustomer.id, limit: 1000)
                     .first;
                 await LedgerService.instance.shareCustomerStatementPdf(
-                  customer: _customer,
+                  customer: authoritativeCustomer,
                   storeName: widget.storeName,
                   entries: entriesSnap,
                 );
@@ -40512,12 +40597,21 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
               ),
               onTap: () async {
                 Navigator.pop(sheetCtx);
-                // 🔒 حماية الذاكرة: تقييد الكشف بأحدث 500 قيد محاسبي لمنع انهيار تطبيق الهاتف
+                final liveCustDoc = await FirebaseFirestore.instance
+                    .collection('merchant_customers')
+                    .doc(_customer.id)
+                    .get(const GetOptions(source: Source.serverAndCache));
+                final authoritativeCustomer =
+                    (liveCustDoc.exists && liveCustDoc.data() != null)
+                        ? LedgerCustomer.fromMap(
+                            {'id': liveCustDoc.id, ...liveCustDoc.data()!})
+                        : _customer;
+
                 final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(_customer.id, limit: 500)
+                    .watchCustomerEntries(authoritativeCustomer.id, limit: 1000)
                     .first;
                 await LedgerService.instance.printOrPreviewStatementPdf(
-                  customer: _customer,
+                  customer: authoritativeCustomer,
                   storeName: widget.storeName,
                   entries: entriesSnap,
                 );
@@ -40695,16 +40789,19 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   // 🔒 حل التعارض المالي: إذا كانت لقطة السيرفر حية وخالية من الكاش (Live Server)، نعتمد رصيد السيرفر مباشرة
                   final isLiveFromServer = !custSnap.data!.metadata.isFromCache;
                   double localAdjustments = 0.0;
-
                   if (!isLiveFromServer) {
+                    // 🔒 تصحيح رياضي حتمي: احتساب المعاملات غير المنعكسة في السيرفر فقط دون إعادة خصم المشطوب محلياً
                     final pendingTxs =
                         AppStorage.getPendingLedgerTxs(_customer.merchantId)
                             .where((t) => t['customer_id'] == _customer.id);
                     double pendingDelta = 0.0;
                     for (final tx in pendingTxs) {
                       final txType = tx['type']?.toString();
-                      if (txType == 'add_customer' || txType == 'void_request')
+                      if (txType == 'add_customer' ||
+                          txType == 'void_request' ||
+                          txType == 'delete_customer') {
                         continue;
+                      }
                       final txId = tx['id']?.toString() ?? '';
 
                       if (serverAppliedIds.contains(txId)) continue;
@@ -40715,18 +40812,9 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       pendingDelta += isDebt ? amt : -amt;
                     }
 
-                    final voidRequests =
-                        pendingTxs.where((t) => t['type'] == 'void_request');
-                    double voidDelta = 0.0;
-                    for (final v in voidRequests) {
-                      final voidAmt = (v['amount'] as num?)?.toDouble() ?? 0.0;
-                      final isDebtVoid = v['is_debt'] != false;
-                      voidDelta += isDebtVoid ? -voidAmt : voidAmt;
-                    }
-
-                    localAdjustments = (pendingDelta + voidDelta);
+                    // لا نعيد تطبيق voidDelta لأن الكاش المحلي serverCustomer تم تحديثه مسبقاً في voidTransaction
+                    localAdjustments = pendingDelta;
                   }
-
                   displayedCustomer = LedgerCustomer(
                     id: serverCustomer.id,
                     merchantId: serverCustomer.merchantId,
@@ -41380,6 +41468,8 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
         transactionId: entryId,
       );
 
+      _assignedTransactionId =
+          null; // 🔒 لا يُصفّر المعرف إلا بعد نجاح الإرسال أو اعتماده في الطابور
       if (!mounted) return;
       Navigator.pop(context, updatedCustomer);
       if (updatedCustomer.phone.trim().isNotEmpty) {
@@ -41422,8 +41512,7 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
         );
       }
     } catch (e) {
-      // ✅ عند انقطاع الاتصال نكتفي بالـ optimistic update دون تكرار الحساب
-      _assignedTransactionId = null;
+      // 🔒 الحفاظ على _assignedTransactionId في حالة إعادة المحاولة، لمنع توليد قيد مالي مكرر
       if (!mounted) return;
       Navigator.pop(context, updatedCustomer);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -42020,8 +42109,8 @@ class _LedgerTabState extends State<LedgerTab> {
                                           ),
                                           content: Text(
                                             hasDebt
-                                                ? 'تنبيه: الزبون (${c.name}) عليه دين قدره (${c.currentBalance.toStringAsFixed(0)} ر.ي).\n\nهل تريد حذفه وشطب دينه من دفتر الديون؟'
-                                                : 'هل تريد حذف الزبون (${c.name}) من الدفتر؟',
+                                                ? 'تنبيه مالي ⚠️: الزبون (${c.name}) في ذمته دين قدره (${c.currentBalance.toStringAsFixed(0)} ر.ي).\n\nحذفه سيشطب هذا الدين ويسقطه من إجمالي ديون السوق لديك.\n\nهل أنت متأكد من الحذف؟'
+                                                : 'هل تريد حذف الزبون (${c.name}) نهائياً من الدفتر؟',
                                             style: TextStyle(
                                                 fontFamily: 'Cairo',
                                                 fontSize: 13,
@@ -42042,7 +42131,7 @@ class _LedgerTabState extends State<LedgerTab> {
                                                   backgroundColor: Colors.red),
                                               onPressed: () =>
                                                   Navigator.pop(dCtx, true),
-                                              child: const Text('حذف',
+                                              child: const Text('تأكيد الحذف',
                                                   style: TextStyle(
                                                       fontFamily: 'Cairo',
                                                       color: Colors.white,
@@ -42053,13 +42142,36 @@ class _LedgerTabState extends State<LedgerTab> {
                                         ),
                                       );
 
-                                      if (confirmed == true) {
+                                      if (confirmed == true && mounted) {
+                                        setState(() {
+                                          _remoteSearchResults
+                                              .removeWhere((r) => r.id == c.id);
+                                        });
+
                                         await LedgerService.instance
                                             .deleteCustomer(
                                           merchantId: merchantId,
                                           customerId: c.id,
                                           currentBalance: c.currentBalance,
                                         );
+
+                                        if (mounted) {
+                                          ScaffoldMessenger.of(context)
+                                              .showSnackBar(
+                                            SnackBar(
+                                              content: Text(
+                                                  'تم حذف الزبون (${c.name}) بنجاح ✅',
+                                                  style: const TextStyle(
+                                                      fontFamily: 'Cairo')),
+                                              backgroundColor:
+                                                  Colors.red.shade700,
+                                              behavior:
+                                                  SnackBarBehavior.floating,
+                                              duration:
+                                                  const Duration(seconds: 2),
+                                            ),
+                                          );
+                                        }
                                       }
                                     },
                                     onTap: () => Navigator.push(
@@ -43792,6 +43904,9 @@ class LedgerService {
   final _db = FirebaseFirestore.instance;
   final _functions = FirebaseFunctions.instanceFor(region: 'us-central1');
 
+  // 🔒 مصفوفة ذاكرة لحجب الزبائن المحذوفين فورياً في 0ms ومنع ظهورهم نهائياً
+  final Set<String> _locallyDeletedCustomerIds = {};
+
   // ─── مراقبة ملخص ديون التاجر الإجمالية في السوق لحظياً ───
   Stream<Map<String, dynamic>> watchMerchantLedgerSummary(String merchantId) {
     final cleanMerchantId = merchantId.trim();
@@ -43945,31 +44060,46 @@ class LedgerService {
       final serverDocRaws = <String, Map<String, dynamic>>{};
       final deletedCustomerIds = <String>{};
 
+      // 1. التقاط الحركات المحذوفة في طابور الأوفلاين لاستبعادها فوراً
+      final allPending = AppStorage.getPendingLedgerTxs(cleanMerchantId);
+      final pendingDeletes = allPending
+          .where((t) => t['type'] == 'delete_customer')
+          .map((t) => t['customer_id']?.toString() ?? '')
+          .toSet();
+
       for (final d in snap.docs) {
-        if (d.data()['is_deleted'] == true) {
-          deletedCustomerIds.add(d.id);
+        final custId = d.id;
+        // إذا كان محذوفاً في السيرفر أو محلياً بالذاكرة أو في طابور الحذف يتم حذفه فوراً
+        if (d.data()['is_deleted'] == true ||
+            _locallyDeletedCustomerIds.contains(custId) ||
+            pendingDeletes.contains(custId)) {
+          deletedCustomerIds.add(custId);
           continue;
         }
-        serverMap[d.id] = LedgerCustomer.fromMap({'id': d.id, ...d.data()});
-        serverDocRaws[d.id] = d.data();
+        serverMap[custId] = LedgerCustomer.fromMap({'id': custId, ...d.data()});
+        serverDocRaws[custId] = d.data();
       }
 
       // 🛡️ دمج الكاش المحلي مع استبعاد أي زبون محذوف نهائياً لمنع انبعاثه
       final existingLocalCached = await getCachedCustomers(cleanMerchantId);
       for (final cached in existingLocalCached) {
-        if (deletedCustomerIds.contains(cached.id)) continue;
+        if (deletedCustomerIds.contains(cached.id) ||
+            _locallyDeletedCustomerIds.contains(cached.id) ||
+            pendingDeletes.contains(cached.id)) continue;
         if (!serverMap.containsKey(cached.id)) {
           serverMap[cached.id] = cached;
         }
       }
 
-      final allPending = AppStorage.getPendingLedgerTxs(cleanMerchantId);
       final pendingNewCustomers =
           allPending.where((t) => t['type'] == 'add_customer');
 
       for (final p in pendingNewCustomers) {
         final custId = p['customer_id']?.toString() ?? '';
-        if (custId.isNotEmpty && !serverMap.containsKey(custId)) {
+        if (custId.isNotEmpty &&
+            !serverMap.containsKey(custId) &&
+            !_locallyDeletedCustomerIds.contains(custId) &&
+            !pendingDeletes.contains(custId)) {
           serverMap[custId] = LedgerCustomer(
             id: custId,
             merchantId: cleanMerchantId,
@@ -44002,7 +44132,6 @@ class LedgerService {
         final unappliedPending = pendingTxs.where((tx) {
           if (tx['customer_id'] != c.id) return false;
           final txId = tx['id']?.toString() ?? '';
-          // 🔒 مطابقة قطعية: لا تعيد إضافة القيد إذا كان مسجلاً مسبقاً في الوثيقة
           return !appliedIds.contains(txId);
         });
 
@@ -44071,12 +44200,13 @@ class LedgerService {
             .toList();
       }
     } catch (_) {
-      // 🛡️ تراجع آمن: الفلترة بالذاكرة عند عدم توفر فهرس مركب بالسيرفر
+      // 🛡️ بحث سحابي موسع يستوعب آلاف الزبائن مع دعم التصفح الذكي
       try {
         final fallbackSnap = await _db
             .collection('merchant_customers')
             .where('merchant_id', isEqualTo: cleanMerchantId)
-            .limit(100)
+            .where('is_deleted', isEqualTo: false)
+            .limit(500) // رفع السقف لتغطية واسعة للزبائن
             .get(const GetOptions(source: Source.serverAndCache));
 
         return fallbackSnap.docs
@@ -44193,7 +44323,7 @@ class LedgerService {
     }
   }
 
-  // ─── حذف زبون من الدفتر سحابياً ومحلياً مع دعم الأوفلاين ───
+// ─── حذف زبون من الدفتر سحابياً ومحلياً مع ضمان الاختفاء الفوري (0ms) ───
   Future<void> deleteCustomer({
     required String merchantId,
     required String customerId,
@@ -44203,12 +44333,23 @@ class LedgerService {
     final cleanCustomerId = customerId.trim();
     if (cleanCustomerId.isEmpty || cleanMerchantId.isEmpty) return;
 
-    // 1. الحذف الفوري من كاش الهاتف
+    // 1. الإخفاء الفوري اللحظي من شاشة المستخدم وقوائم التطبيق (0ms)
+    _locallyDeletedCustomerIds.add(cleanCustomerId);
+
+    // 2. الحذف الفوري من كاش القرص الصلب بالهاتف
     final cached = await getCachedCustomers(cleanMerchantId);
     cached.removeWhere((c) => c.id == cleanCustomerId);
     await _cacheCustomersLocally(cleanMerchantId, cached);
 
-    // 2. إرسال أمر الحذف للسيرفر أو حفظه أوفلاين
+    // 3. تحديث مباشر وفوري في Firestore لوثيقة الزبون لتختفي من تدفقات البيانات فوراً
+    try {
+      await _db.collection('merchant_customers').doc(cleanCustomerId).update({
+        'is_deleted': true,
+        'updated_at': FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+
+    // 4. استدعاء السيرفر لتسوية ديون السوق أو حفظها في طابور الأوفلاين
     final hasInternet = await ConnectivityHelper.hasActiveInternet();
     if (!hasInternet) {
       await AppStorage.savePendingLedgerTx({

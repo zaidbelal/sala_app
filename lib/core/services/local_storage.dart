@@ -293,15 +293,7 @@ class AppStorage {
     if (targetUid == null || targetUid.isEmpty) return [];
     final key = _userPendingOrderKey(targetUid);
     var raw = _db.getString(key);
-    // حماية القراءة في حال تزامنها مع استبدال الملف الذري على القرص
-    if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
-      try {
-        final file = File('$_appDocsPath/${key}_backup.json');
-        if (file.existsSync()) {
-          raw = file.readAsStringSync();
-        }
-      } catch (_) {}
-    }
+    // 🔒 قراءة نظيفة موحدة: فحص الملف الاحتياطي الدائم ثم الملفات المؤقتة الأحدث عند وجود تعطل
     if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
       try {
         final file = File('$_appDocsPath/${key}_backup.json');
@@ -309,21 +301,24 @@ class AppStorage {
           raw = file.readAsStringSync();
         } else {
           final dir = Directory(_appDocsPath!);
-          final candidates = dir
-              .listSync()
-              .whereType<File>()
-              .where(
-                (f) =>
-                    f.path.contains('${key}_tmp_') && f.path.endsWith('.json'),
-              )
-              .toList();
-          if (candidates.isNotEmpty) {
-            candidates.sort(
-                (a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
-            raw = candidates.first.readAsStringSync();
-            try {
-              candidates.first.copySync(file.path);
-            } catch (_) {}
+          if (dir.existsSync()) {
+            final candidates = dir
+                .listSync()
+                .whereType<File>()
+                .where(
+                  (f) =>
+                      f.path.contains('${key}_tmp_') &&
+                      f.path.endsWith('.json'),
+                )
+                .toList();
+            if (candidates.isNotEmpty) {
+              candidates.sort((a, b) =>
+                  b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+              raw = candidates.first.readAsStringSync();
+              try {
+                candidates.first.copySync(file.path);
+              } catch (_) {}
+            }
           }
         }
       } catch (_) {}
