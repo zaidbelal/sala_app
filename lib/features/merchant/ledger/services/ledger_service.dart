@@ -211,7 +211,6 @@ class LedgerService {
       // 🔒 التحقق المحاسبي: إضافة فوارق الأوفلاين فقط للحركات التي لم يُقيدها السيرفر بعد
       final pendingTxs = allPending
           .where((t) => t['type'] == 'debt' || t['type'] == 'payment');
-      final isOfflineSnapshot = snap.metadata.isFromCache;
 
       for (final entry in serverMap.entries) {
         final c = entry.value;

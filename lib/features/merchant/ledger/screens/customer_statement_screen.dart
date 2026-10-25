@@ -269,8 +269,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   }
 
                   // 🚀 منع احتساب القيود المضاعفة: إذا كانت الوثيقة حديثة وقادمة مباشرة من الخادم لا نطبق أرصدة معلقة متزامنة
-                  final bool isFromCache =
-                      custSnap.data?.metadata.isFromCache ?? true;
+
                   final pendingTxs =
                       AppStorage.getPendingLedgerTxs(_customer.merchantId)
                           .where((t) => t['customer_id'] == _customer.id);
