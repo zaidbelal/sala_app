@@ -119,9 +119,14 @@ class OrdersService {
 
       return OrderModel.fromJson(orderMap);
     } catch (e) {
-      // إذا كان خطأ خادم منطقي يتم إلغاء الـ WAL، عدا ذلك يُترك للطابور أوفلاين
-      if (e.toString().contains('OUT_OF_STOCK') ||
-          e.toString().contains('PRODUCT_UNAVAILABLE')) {
+      final err = e.toString().toLowerCase();
+      final bool isNetworkIssue = err.contains('network') ||
+          err.contains('timeout') ||
+          err.contains('socket') ||
+          err.contains('unavailable') ||
+          err.contains('deadline-exceeded');
+
+      if (!isNetworkIssue) {
         await WalService.instance.markAborted(resolvedOrderId);
       }
       rethrow;

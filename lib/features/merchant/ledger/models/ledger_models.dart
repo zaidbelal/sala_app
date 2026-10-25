@@ -10,6 +10,7 @@ class LedgerCustomer {
   final double creditLimit; // سقف الدين الأقصى المسموح له
   final int? salaryDay; // يوم الراتب الشهري للتذكير (مثال: يوم 28)
   final DateTime? lastReminderSentAt;
+  final DateTime? reconciledAt; // تاريخ آخر مطابقة وتدقيق سحابي
   final DateTime createdAt;
   final DateTime updatedAt;
 
@@ -22,6 +23,7 @@ class LedgerCustomer {
     this.creditLimit = 0.0,
     this.salaryDay,
     this.lastReminderSentAt,
+    this.reconciledAt,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -49,6 +51,8 @@ class LedgerCustomer {
         if (salaryDay != null) 'salary_day': salaryDay,
         if (lastReminderSentAt != null)
           'last_reminder_sent_at': Timestamp.fromDate(lastReminderSentAt!),
+        if (reconciledAt != null)
+          'reconciled_at': Timestamp.fromDate(reconciledAt!),
         'created_at': Timestamp.fromDate(createdAt),
         'updated_at': Timestamp.fromDate(updatedAt),
       };
@@ -76,6 +80,8 @@ class LedgerCustomer {
       lastReminderSentAt: m['last_reminder_sent_at'] != null
           ? parseDate(m['last_reminder_sent_at'])
           : null,
+      reconciledAt:
+          m['reconciled_at'] != null ? parseDate(m['reconciled_at']) : null,
       createdAt: parseDate(m['created_at']),
       updatedAt: parseDate(m['updated_at']),
     );

@@ -52,38 +52,49 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
   }
 
   void _notifyCartModified() {
+    final cartNow = ref.read(cartProvider);
+    final isCartEmpty = cartNow.isEmpty;
+
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
         backgroundColor: ctx.bgCard,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.warning_amber_rounded, color: Colors.orange),
-            SizedBox(width: 8),
-            Text('تنبيه في محتويات السلة',
-                style: TextStyle(
+            Icon(
+                isCartEmpty
+                    ? Icons.remove_shopping_cart_rounded
+                    : Icons.warning_amber_rounded,
+                color: isCartEmpty ? Colors.red : Colors.orange),
+            const SizedBox(width: 8),
+            Text(isCartEmpty ? 'السلة أصبحت فارغة' : 'تنبيه في محتويات السلة',
+                style: const TextStyle(
                     fontFamily: 'Cairo',
                     fontWeight: FontWeight.bold,
                     fontSize: 16)),
           ],
         ),
-        content: const Text(
-          'تم تحديث سلتك واستبعاد بعض الأصناف أو تعديل أسعارها لعدم توفرها في المستودع. يرجى مراجعة إجمالي الطلب قبل المتابعة.',
-          style: TextStyle(fontFamily: 'Cairo', fontSize: 13, height: 1.6),
+        content: Text(
+          isCartEmpty
+              ? 'نعتذر منك، لم تعد الأصناف التي اخترتها متوفرة في المستودع حالياً. يرجى العودة للتسوق واختيار أصناف أخرى.'
+              : 'تم تحديث سلتك واستبعاد بعض الأصناف أو تعديل أسعارها لعدم توفرها في المستودع. يرجى مراجعة إجمالي الطلب قبل المتابعة.',
+          style:
+              const TextStyle(fontFamily: 'Cairo', fontSize: 13, height: 1.6),
         ),
         actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              if (Navigator.of(context).canPop()) {
-                Navigator.of(context).pop();
-              }
-            },
-            child: const Text('العودة للسلة',
-                style: TextStyle(fontFamily: 'Cairo', color: Colors.grey)),
-          ),
+          if (!isCartEmpty)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                if (Navigator.of(context).canPop()) {
+                  Navigator.of(context).pop();
+                }
+              },
+              child: const Text('العودة للسلة',
+                  style: TextStyle(fontFamily: 'Cairo', color: Colors.grey)),
+            ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: AppColors.primary,
@@ -91,9 +102,15 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(10)),
             ),
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('متابعة بالمتوفر',
-                style: TextStyle(
+            onPressed: () {
+              Navigator.pop(ctx);
+              if (isCartEmpty && Navigator.of(context).canPop()) {
+                Navigator.of(context)
+                    .pop(); // إرجاع المستخدم فوراً إذا فرغت السلة
+              }
+            },
+            child: Text(isCartEmpty ? 'العودة للتسوق' : 'متابعة بالمتوفر',
+                style: const TextStyle(
                     fontFamily: 'Cairo', fontWeight: FontWeight.bold)),
           ),
         ],
@@ -227,11 +244,11 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
     if (_isPlacingOrder) return;
     _isPlacingOrder = true;
     try {
-      // 🔒 التحقق المسبق من الأسعار والمخزون؛ إذا تم استبعاد أي صنف تالف/محذوف يتم إيقاف الإرسال لمراجعة التاجر
+      // 🔒 التحقق المسبق: في حال استبعاد صنف محذوف، يتم إعلام التاجر ومتابعة الطلب بالمتوفر دون تعليق
       final cartChanged = await _validateCartBeforeCheckout();
       if (cartChanged) {
         if (mounted) {
-          await showDialog(
+          final proceedWithAvailable = await showDialog<bool>(
             context: context,
             barrierDismissible: false,
             builder: (ctx) => AlertDialog(
@@ -242,28 +259,35 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
                   style: TextStyle(
                       fontFamily: 'Cairo', fontWeight: FontWeight.bold)),
               content: const Text(
-                'تم تحديث بعض الأصناف أو الأسعار في سلتك نظراً لعدم توفرها في المستودع. يرجى مراجعة الإجمالي الجديد قبل إعادة تأكيد الطلب.',
+                'تم استبعاد أصناف غير متوفرة أو تحديث الأسعار. هل تريد المتابعة بالأصناف المتوفرة الآن؟',
                 style: TextStyle(fontFamily: 'Cairo', fontSize: 13),
               ),
               actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('مراجعة السلة',
+                      style:
+                          TextStyle(fontFamily: 'Cairo', color: Colors.grey)),
+                ),
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(
                       backgroundColor: AppColors.primary),
-                  onPressed: () {
-                    Navigator.pop(ctx);
-                    if (Navigator.of(context).canPop()) {
-                      Navigator.of(context).pop();
-                    }
-                  },
-                  child: const Text('العودة لمراجعة السلة',
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: const Text('متابعة بالمتوفر',
                       style:
                           TextStyle(fontFamily: 'Cairo', color: Colors.white)),
                 ),
               ],
             ),
           );
+
+          if (proceedWithAvailable != true) {
+            if (mounted && Navigator.of(context).canPop()) {
+              Navigator.of(context).pop();
+            }
+            return;
+          }
         }
-        return;
       }
       await _placeOrderInternal();
     } catch (_) {
@@ -321,12 +345,14 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           'عذراً، لا يمكن أن يحتوي الطلب الواحد على أكثر من ${AppConfig.maxOrderItems} صنفاً مختلفاً. يرجى تقسيم الطلب.');
       return;
     }
-    // ── 2. التحقق من الحد الأدنى للطلب ──
-    final double minOrderLimit = AppConfig.minOrderValue;
+    // ── 2. التحقق الموحد من الحد الأدنى للطلب مطابقاً لخادم السحابة ──
+    const double serverMinOrder = 4250.0;
+    final double minOrderLimit =
+        AppConfig.minOrderValue > 0 ? AppConfig.minOrderValue : serverMinOrder;
     final total = ref.read(cartTotalProvider);
-    if (total < minOrderLimit) {
+    if (total < minOrderLimit && total < serverMinOrder) {
       _showError(
-          'الحد الأدنى للطلب هو ${minOrderLimit.toStringAsFixed(0)} ر.ي');
+          'الحد الأدنى للطلب هو ${serverMinOrder.toStringAsFixed(0)} ر.ي');
       return;
     }
     // ── 3. فحص طريقة الدفع ──

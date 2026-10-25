@@ -249,12 +249,20 @@ class RealtimeHub {
     }
   }
 
-  void _startUserChannels(String userId, {required String role}) {
-    _watchCategories();
-    _watchBrands();
+  StreamSubscription? _profileSub;
 
-    final profileSub =
+  void _startUserChannels(String userId, {required String role}) {
+    // 🔒 عدم تكرار استدعاء الأصناف والشركات هنا لأنها بدأت وتعمل بالفعل في init()
+
+    _profileSub?.cancel();
+    if (_profileSub != null) {
+      _userSubs.remove(_profileSub);
+      _profileSub = null;
+    }
+    _profileSub =
         _db.collection('profiles').doc(userId).snapshots().listen((doc) async {
+      // 🔒 حماية فورية: إيقاف المعالجة إذا قام المستخدم بتسجيل الخروج بالفعل
+      if (!_initialized || AppStorage.userId != userId) return;
       if (!doc.exists || doc.data() == null) return;
       final data = doc.data()!;
       final isBanned = data['is_banned'] == true;
@@ -348,7 +356,9 @@ class RealtimeHub {
         return;
       }
     }, onError: (_) {});
-    _userSubs.add(profileSub);
+    if (_profileSub != null) {
+      _userSubs.add(_profileSub!);
+    }
     _watchNotifications(userId);
     if (role == 'admin' ||
         role == 'super_admin' ||
@@ -366,13 +376,17 @@ class RealtimeHub {
   Future<void> _stopUserChannels() async {
     _notificationsSub?.cancel();
     _notificationsSub = null;
+    _categoriesSub?.cancel();
+    _categoriesSub = null;
+    _brandsSub?.cancel();
+    _brandsSub = null;
+
     final subscriptions = List<StreamSubscription>.from(_userSubs);
     _userSubs.clear();
 
     await Future.wait(
       subscriptions.map((subscription) => subscription.cancel()),
     );
-
     _container?.read(merchantOrdersProvider.notifier).clear();
     _container?.read(realtimeNotifsProvider.notifier).clear();
     _container?.read(realtimeAllOrdersProvider.notifier).clear();
@@ -691,6 +705,9 @@ class RealtimeHub {
       _connectivitySub?.cancel();
       _connectivitySub = null;
     }
+
+    _profileSub?.cancel();
+    _profileSub = null;
 
     _notificationsSub?.cancel();
     _notificationsSub = null;

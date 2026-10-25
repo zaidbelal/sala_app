@@ -34,11 +34,11 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
     _customer = widget.customer;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final mId = AppStorage.userId ?? '';
-      final lastReconciled = _customer.lastReminderSentAt;
+      final lastReconciled = _customer.reconciledAt;
       final shouldReconcile = lastReconciled == null ||
-          DateTime.now().difference(lastReconciled).inHours > 12;
+          DateTime.now().difference(lastReconciled).inHours > 24;
 
-      // تدقيق الحساب من السيرفر فقط إذا مضت 12 ساعة على الأقل أو عند أول فتح
+      // تدقيق الحساب الحقيقي من السيرفر فقط إذا مضت 24 ساعة على آخر تدقيق فعلي
       if (mId.isNotEmpty && shouldReconcile) {
         LedgerService.instance.reconcileCustomerBalance(
           merchantId: mId,
@@ -48,13 +48,13 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
     });
   }
 
-  void _showAddEntryDialog(bool isDebt) async {
+  void _showAddEntryDialog(bool isDebt, LedgerCustomer currentCustomer) async {
     HapticFeedback.lightImpact();
     final updatedCustomer = await showDialog<LedgerCustomer>(
       context: context,
       barrierDismissible: true,
       builder: (_) => _AddLedgerEntryDialog(
-        customer: _customer,
+        customer: currentCustomer,
         isDebt: isDebt,
       ),
     );
@@ -202,6 +202,84 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
         centerTitle: true,
         actions: [
           IconButton(
+            tooltip: 'حذف الزبون من الدفتر',
+            icon: const Icon(Icons.delete_forever_rounded, color: Colors.red),
+            onPressed: () async {
+              final hasDebt = _customer.currentBalance > 0;
+              final confirmed = await showDialog<bool>(
+                context: context,
+                builder: (dCtx) => AlertDialog(
+                  backgroundColor: dCtx.bgCard,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(20)),
+                  title: Row(
+                    children: [
+                      Icon(Icons.warning_amber_rounded,
+                          color: hasDebt ? Colors.red : Colors.orange),
+                      const SizedBox(width: 8),
+                      Text('تأكيد حذف الزبون',
+                          style: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                              color: dCtx.textPrimary)),
+                    ],
+                  ),
+                  content: Text(
+                    hasDebt
+                        ? 'تنبيه مالي ⚠️: الزبون (${_customer.name}) متبقٍ في ذمته دين قدره (${_customer.currentBalance.toStringAsFixed(0)} ر.ي).\n\nحذف الزبون سيشطب هذا الدين ويسقطه من إجمالي ديون السوق لديك.\n\nهل أنت متأكد من الحذف؟'
+                        : 'هل تريد حذف الزبون (${_customer.name}) نهائياً من دفتر الديون؟',
+                    style: TextStyle(
+                        fontFamily: 'Cairo',
+                        fontSize: 13,
+                        height: 1.6,
+                        color: dCtx.textSecondary),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dCtx, false),
+                      child: const Text('إلغاء',
+                          style: TextStyle(
+                              fontFamily: 'Cairo', color: Colors.grey)),
+                    ),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10)),
+                      ),
+                      onPressed: () => Navigator.pop(dCtx, true),
+                      child: const Text('تأكيد الحذف',
+                          style: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+              );
+
+              if (confirmed == true && context.mounted) {
+                final mId = AppStorage.userId ?? '';
+                await LedgerService.instance.deleteCustomer(
+                  merchantId: mId,
+                  customerId: _customer.id,
+                  currentBalance: _customer.currentBalance,
+                );
+                if (context.mounted) {
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('تم حذف الزبون (${_customer.name}) بنجاح ✅',
+                          style: const TextStyle(fontFamily: 'Cairo')),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                }
+              }
+            },
+          ),
+          IconButton(
             tooltip: 'تصدير كشف حساب PDF رسمي',
             icon: const Icon(Icons.picture_as_pdf_rounded,
                 color: Colors.redAccent),
@@ -268,38 +346,41 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     serverAppliedIds.add(serverLastTxId);
                   }
 
-                  // 🚀 منع احتساب القيود المضاعفة: إذا كانت الوثيقة حديثة وقادمة مباشرة من الخادم لا نطبق أرصدة معلقة متزامنة
+                  // 🔒 حل التعارض المالي: إذا كانت لقطة السيرفر حية وخالية من الكاش (Live Server)، نعتمد رصيد السيرفر مباشرة
+                  final isLiveFromServer = !custSnap.data!.metadata.isFromCache;
+                  double localAdjustments = 0.0;
 
-                  final pendingTxs =
-                      AppStorage.getPendingLedgerTxs(_customer.merchantId)
-                          .where((t) => t['customer_id'] == _customer.id);
-                  double pendingDelta = 0.0;
-                  // تطبيق الفوارق المعلقة دائماً سواء كانت الوثيقة من السيرفر أو الكاش طالما لم يقيدها السيرفر بعد
-                  for (final tx in pendingTxs) {
-                    final txType = tx['type']?.toString();
-                    if (txType == 'add_customer' || txType == 'void_request') {
-                      continue;
+                  if (!isLiveFromServer) {
+                    final pendingTxs =
+                        AppStorage.getPendingLedgerTxs(_customer.merchantId)
+                            .where((t) => t['customer_id'] == _customer.id);
+                    double pendingDelta = 0.0;
+                    for (final tx in pendingTxs) {
+                      final txType = tx['type']?.toString();
+                      if (txType == 'add_customer' || txType == 'void_request')
+                        continue;
+                      final txId = tx['id']?.toString() ?? '';
+
+                      if (serverAppliedIds.contains(txId)) continue;
+                      if (_locallyDismissedEntryIds.contains(txId)) continue;
+
+                      final isDebt = txType == 'debt';
+                      final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+                      pendingDelta += isDebt ? amt : -amt;
                     }
-                    final txId = tx['id']?.toString() ?? '';
 
-                    if (serverAppliedIds.contains(txId)) continue;
-                    if (_locallyDismissedEntryIds.contains(txId)) continue;
+                    final voidRequests =
+                        pendingTxs.where((t) => t['type'] == 'void_request');
+                    double voidDelta = 0.0;
+                    for (final v in voidRequests) {
+                      final voidAmt = (v['amount'] as num?)?.toDouble() ?? 0.0;
+                      final isDebtVoid = v['is_debt'] != false;
+                      voidDelta += isDebtVoid ? -voidAmt : voidAmt;
+                    }
 
-                    final isDebt = txType == 'debt';
-                    final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-                    pendingDelta += isDebt ? amt : -amt;
+                    localAdjustments = (pendingDelta + voidDelta);
                   }
 
-                  final voidRequests =
-                      pendingTxs.where((t) => t['type'] == 'void_request');
-                  double voidDelta = 0.0;
-                  for (final v in voidRequests) {
-                    final voidAmt = (v['amount'] as num?)?.toDouble() ?? 0.0;
-                    final isDebtVoid = v['is_debt'] != false;
-                    voidDelta += isDebtVoid ? -voidAmt : voidAmt;
-                  }
-
-                  final double localAdjustments = (pendingDelta + voidDelta);
                   displayedCustomer = LedgerCustomer(
                     id: serverCustomer.id,
                     merchantId: serverCustomer.merchantId,
@@ -316,130 +397,146 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                 }
                 final isOverLimit = displayedCustomer.isOverLimit;
                 final isNegative = displayedCustomer.currentBalance < 0;
-                return Container(
-                  margin: const EdgeInsets.all(16),
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: displayedCustomer.currentBalance > 0
-                          ? [const Color(0xFFC0392B), const Color(0xFFE74C3C)]
-                          : [const Color(0xFF1E8449), const Color(0xFF2ECC71)],
-                      begin: Alignment.topRight,
-                      end: Alignment.bottomLeft,
-                    ),
-                    borderRadius: BorderRadius.circular(22),
-                    boxShadow: [
-                      BoxShadow(
-                        color: (displayedCustomer.currentBalance > 0
-                                ? Colors.red
-                                : Colors.green)
-                            .withValues(alpha: 0.35),
-                        blurRadius: 16,
-                        offset: const Offset(0, 6),
-                      ),
-                    ],
-                  ),
-                  child: Column(
-                    children: [
-                      Text(
-                        isNegative
-                            ? 'رصيد دائن لصالح الزبون (له في ذمتك)'
-                            : 'إجمالي المبلغ المتبقي على الزبون',
-                        style: const TextStyle(
-                            fontFamily: 'Cairo',
-                            fontSize: 12,
-                            color: Colors.white70),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        '${displayedCustomer.currentBalance.abs().toStringAsFixed(0)} ر.ي',
-                        style: const TextStyle(
-                          fontFamily: 'Cairo',
-                          fontSize: 32,
-                          fontWeight: FontWeight.w900,
-                          color: Colors.white,
+
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      margin: const EdgeInsets.all(16),
+                      padding: const EdgeInsets.all(20),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: displayedCustomer.currentBalance > 0
+                              ? [
+                                  const Color(0xFFC0392B),
+                                  const Color(0xFFE74C3C)
+                                ]
+                              : [
+                                  const Color(0xFF1E8449),
+                                  const Color(0xFF2ECC71)
+                                ],
+                          begin: Alignment.topRight,
+                          end: Alignment.bottomLeft,
                         ),
+                        borderRadius: BorderRadius.circular(22),
+                        boxShadow: [
+                          BoxShadow(
+                            color: (displayedCustomer.currentBalance > 0
+                                    ? Colors.red
+                                    : Colors.green)
+                                .withValues(alpha: 0.35),
+                            blurRadius: 16,
+                            offset: const Offset(0, 6),
+                          ),
+                        ],
                       ),
-                      if (displayedCustomer.creditLimit > 0) ...[
-                        const SizedBox(height: 8),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Text(
-                              'سقف الدين: ${displayedCustomer.creditLimit.toStringAsFixed(0)} ر.ي',
-                              style: const TextStyle(
-                                  fontFamily: 'Cairo',
-                                  fontSize: 11,
-                                  color: Colors.white),
+                      child: Column(
+                        children: [
+                          Text(
+                            isNegative
+                                ? 'رصيد دائن لصالح الزبون (له في ذمتك)'
+                                : 'إجمالي المبلغ المتبقي على الزبون',
+                            style: const TextStyle(
+                                fontFamily: 'Cairo',
+                                fontSize: 12,
+                                color: Colors.white70),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            '${displayedCustomer.currentBalance.abs().toStringAsFixed(0)} ر.ي',
+                            style: const TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 32,
+                              fontWeight: FontWeight.w900,
+                              color: Colors.white,
                             ),
-                            if (isOverLimit) ...[
-                              const SizedBox(width: 6),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 6, vertical: 1),
-                                decoration: BoxDecoration(
-                                  color: Colors.amber,
-                                  borderRadius: BorderRadius.circular(6),
+                          ),
+                          if (displayedCustomer.creditLimit > 0) ...[
+                            const SizedBox(height: 8),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Text(
+                                  'سقف الدين: ${displayedCustomer.creditLimit.toStringAsFixed(0)} ر.ي',
+                                  style: const TextStyle(
+                                      fontFamily: 'Cairo',
+                                      fontSize: 11,
+                                      color: Colors.white),
                                 ),
-                                child: const Text(
-                                  'تجاوز السقف ⚠️',
+                                if (isOverLimit) ...[
+                                  const SizedBox(width: 6),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 6, vertical: 1),
+                                    decoration: BoxDecoration(
+                                      color: Colors.amber,
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: const Text(
+                                      'تجاوز السقف ⚠️',
+                                      style: TextStyle(
+                                          fontFamily: 'Cairo',
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w800,
+                                          color: Colors.black),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.red.shade700,
+                                foregroundColor: Colors.white,
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 12),
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14)),
+                              ),
+                              onPressed: () =>
+                                  _showAddEntryDialog(true, displayedCustomer),
+                              icon: const Icon(Icons.add_rounded, size: 20),
+                              label: const Text('سجل عليه دين (+)',
                                   style: TextStyle(
                                       fontFamily: 'Cairo',
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w800,
-                                      color: Colors.black),
-                                ),
+                                      fontWeight: FontWeight.w800)),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.green.shade700,
+                                foregroundColor: Colors.white,
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 12),
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14)),
                               ),
-                            ],
-                          ],
-                        ),
-                      ],
-                    ],
-                  ),
+                              onPressed: () =>
+                                  _showAddEntryDialog(false, displayedCustomer),
+                              icon: const Icon(Icons.check_rounded, size: 20),
+                              label: const Text('سدد دفعة (-)',
+                                  style: TextStyle(
+                                      fontFamily: 'Cairo',
+                                      fontWeight: FontWeight.w800)),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 );
               },
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.red.shade700,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14)),
-                      ),
-                      onPressed: () => _showAddEntryDialog(true),
-                      icon: const Icon(Icons.add_rounded, size: 20),
-                      label: const Text('سجل عليه دين (+)',
-                          style: TextStyle(
-                              fontFamily: 'Cairo',
-                              fontWeight: FontWeight.w800)),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.green.shade700,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14)),
-                      ),
-                      onPressed: () => _showAddEntryDialog(false),
-                      icon: const Icon(Icons.check_rounded, size: 20),
-                      label: const Text('سدد دفعة (-)',
-                          style: TextStyle(
-                              fontFamily: 'Cairo',
-                              fontWeight: FontWeight.w800)),
-                    ),
-                  ),
-                ],
-              ),
             ),
             const SizedBox(height: 16),
             Padding(

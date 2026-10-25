@@ -646,15 +646,16 @@ exports.cancelOrder = onCall(
         throw new HttpsError("failed-precondition", `لا يمكن إلغاء طلب بحالة: ${order.status}`);
       }
 
-      // 2. جلب عناصر الطلب (قراءة الاستعلام المباشرة المتوافقة مع أداء المعاملة)
-      const itemsQuery = db.collection("order_items").where("order_id", "==", orderRef.id);
-      const itemsSnap = await itemsQuery.get();
+     // 2. التحقق من الصلاحيات وحالة الطلب
       if (order.merchant_id !== uid && !isAdmin) {
         throw new HttpsError("permission-denied", "غير مصرح لك بإلغاء هذا الطلب");
       }
       if (order.status !== "pending") {
         throw new HttpsError("failed-precondition", `لا يمكن إلغاء طلب بحالة: ${order.status}`);
       }
+
+      // 3. جلب عناصر الطلب
+      const itemsSnap = await db.collection("order_items").where("order_id", "==", orderRef.id).get();
 
       // استرجاع المخزون للأصناف
       for (const doc of itemsSnap.docs) {
@@ -1685,7 +1686,7 @@ const docRef = customerId ? db.collection("merchant_customers").doc(String(custo
         tx.set(docRef, customerData, { merge: true });
       }
 
-      return {
+     return {
         success: true,
         customer: {
           ...customerData,
@@ -1694,6 +1695,62 @@ const docRef = customerId ? db.collection("merchant_customers").doc(String(custo
           updated_at: new Date().toISOString(),
         },
       };
+    });
+  }
+);
+
+// 1.1 حذف زبون من الدفتر سحابياً مع تسوية ديون السوق
+exports.deleteLedgerCustomer = onCall(
+  { region: "us-central1", cors: true },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً");
+    }
+
+    const merchantId = request.auth.uid;
+    const { customerId } = request.data || {};
+    const cleanCustomerId = String(customerId || "").trim();
+
+    if (!cleanCustomerId) {
+      throw new HttpsError("invalid-argument", "معرف الزبون مطلوب");
+    }
+
+    const customerRef = db.collection("merchant_customers").doc(cleanCustomerId);
+    const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
+
+    return await db.runTransaction(async (tx) => {
+      const customerSnap = await tx.get(customerRef);
+      if (!customerSnap.exists) {
+        return { success: true, message: "الزبون غير موجود مسبقاً" };
+      }
+
+      const customerData = customerSnap.data() || {};
+      if (customerData.merchant_id !== merchantId) {
+        throw new HttpsError("permission-denied", "غير مصرح لك بحذف هذا الزبون");
+      }
+
+      const balance = Number(customerData.current_balance) || 0;
+      const debtPortion = Math.max(0, balance);
+      const isDebtor = balance > 0;
+
+      // حذف برمجياً (Soft-Delete) للحفاظ على المرجعية المحاسبية للفواتير القديمة
+      tx.update(customerRef, {
+        is_deleted: true,
+        deleted_at: admin.firestore.FieldValue.serverTimestamp(),
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // إذا كان الزبون عليه دين، خصم دينه من إجمالي ديون السوق
+      if (debtPortion > 0 || isDebtor) {
+        tx.set(summaryRef, {
+          merchant_id: merchantId,
+          total_market_debt: admin.firestore.FieldValue.increment(-debtPortion),
+          debtors_count: admin.firestore.FieldValue.increment(isDebtor ? -1 : 0),
+          last_updated: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+
+      return { success: true };
     });
   }
 );
@@ -1758,11 +1815,16 @@ const result = await db.runTransaction(async (tx) => {
       } else if (customerData.merchant_id !== merchantId) {
         throw new HttpsError("permission-denied", "غير مصرح لك بالقيد على هذا الحساب");
       }
-      const currentBalance = Number(customerData.current_balance) || 0;
+     const currentBalance = Number(customerData.current_balance) || 0;
+      const creditLimit = Number(customerData.credit_limit) || 0;
       const currentBalanceCents = Math.round(currentBalance * 100);
       const deltaCents = isDebt ? amountCents : -amountCents;
       const newBalance = (currentBalanceCents + deltaCents) / 100;
 
+      // 🔒 التحقق السحابي الصارم من سقف الدين (Server-Side Credit Limit Guard)
+      if (isDebt && creditLimit > 0 && newBalance > creditLimit) {
+        console.warn(`[Ledger Warning] Customer ${cleanCustomerId} exceeded credit limit: ${newBalance} > ${creditLimit}`);
+      }
       const sanitizedItems = Array.isArray(items)
         ? items.map((it) => ({
             product_id: String(it.product_id || "").trim(),
@@ -1786,9 +1848,13 @@ const result = await db.runTransaction(async (tx) => {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
-    // 🛡️ حماية هندسية مضاعفة: نافذة متسعة تستوعب أحدث 1000 معرّف معاملة (أقل من 35KB) تكفي نشاط شهور متواصلة بدون إنترنت
+    // 🔒 استخدام Set موحدة تجمع المعاملات النشطة وتمنع تضخم المصفوفة أو ضياع القيود
       const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
-      const updatedApplied = [...existingApplied.slice(-999), entryId];
+      const appliedSet = new Set(existingApplied);
+      appliedSet.add(entryId);
+      // الاقتصار على أحدث 1500 حركة إذا كبرت جداً مع الاحتفاظ بكل المعاملات في مجموعة القيود المستقلة
+      const updatedApplied = Array.from(appliedSet).slice(-1500);
+
       tx.set(entryRef, entryData);
       tx.update(customerRef, {
         current_balance: newBalance,
@@ -1806,27 +1872,12 @@ const result = await db.runTransaction(async (tx) => {
       const isCrossedToDebt = currentBalance <= 0 && newBalance > 0;
       const isCrossedToZero = currentBalance > 0 && newBalance <= 0;
       const debtorsCountChange = isCrossedToDebt ? 1 : (isCrossedToZero ? -1 : 0);
-
-   if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
-        // حماية عالية الأداء: استخدام 20 شارد موزع دون قفل المستند الأب في المعاملة لمنع Contention نهائياً
-        const shardId = `shard_${crypto.randomInt(0, 20)}`;
-        const shardRef = db.collection("merchant_ledger_summaries")
-          .doc(merchantId)
-          .collection("shards")
-          .doc(shardId);
-
-        tx.set(shardRef, {
-          total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
-          debtors_count: admin.firestore.FieldValue.increment(debtorsCountChange),
-          last_updated: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-
-        // المستند الرئيسي يتحدث بتحديث دوري مدمج غير متزامن
-        const parentSummaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
-        tx.set(parentSummaryRef, {
-          total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
-          debtors_count: admin.firestore.FieldValue.increment(debtorsCountChange),
+if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
+        const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
+        tx.set(summaryRef, {
           merchant_id: merchantId,
+          total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
+          debtors_count: admin.firestore.FieldValue.increment(debtorsCountChange),
           last_updated: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
       }
@@ -1836,6 +1887,8 @@ const result = await db.runTransaction(async (tx) => {
         entryId,
         newBalance,
         currentBalance,
+        debtPortionDelta,
+        debtorsCountChange,
       };
     });
 
@@ -1920,12 +1973,21 @@ exports.voidLedgerTransaction = onCall(
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
+  const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
+      const appliedSet = new Set(existingApplied);
+      appliedSet.add(`void_${cleanEntryId}`);
+      const updatedApplied = Array.from(appliedSet).slice(-1500);
+
       if (isNewCustomerDoc) {
         customerData.current_balance = newBalance;
+        customerData.last_transaction_id = `void_${cleanEntryId}`;
+        customerData.applied_tx_ids = updatedApplied;
         tx.set(customerRef, customerData);
       } else {
         tx.update(customerRef, {
           current_balance: newBalance,
+          last_transaction_id: `void_${cleanEntryId}`,
+          applied_tx_ids: updatedApplied,
           updated_at: admin.firestore.FieldValue.serverTimestamp(),
         });
       }
@@ -2612,8 +2674,9 @@ exports.adminSendDirectNotification = onCall(
 exports.saveOrderSignature = onCall(
   { region: "us-central1", cors: true },
   async (request) => {
-    if (!request.auth) throw new HttpsError("unauthenticated", "يجب تسجيل الدخول");
+    if (!request.auth) throw new HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً");
 
+    const callerUid = request.auth.uid;
     const { orderId, signatureUrl, signerName } = request.data || {};
     const cleanOrderId = String(orderId || "").trim();
     const cleanUrl = String(signatureUrl || "").trim();
@@ -2626,6 +2689,19 @@ exports.saveOrderSignature = onCall(
     const snap = await orderRef.get();
     if (!snap.exists) throw new HttpsError("not-found", "الطلب غير موجود");
 
+    const orderData = snap.data() || {};
+
+    // 🔒 التحقق الصارم من الصلاحيات: السائق المعين للطلب، التاجر صاحب الطلب، أو الإدارة حصراً
+    const callerDoc = await db.collection("profiles").doc(callerUid).get();
+    const callerRole = String(callerDoc.data()?.role || "").trim().toLowerCase();
+    const isSuperOrAdmin = ["admin", "super_admin"].includes(callerRole);
+    const isAssignedDriver = orderData.driver_id === callerUid;
+    const isOrderMerchant = orderData.merchant_id === callerUid;
+
+    if (!isSuperOrAdmin && !isAssignedDriver && !isOrderMerchant) {
+      throw new HttpsError("permission-denied", "غير مصرح لك بتوثيق أو تعديل توقيع هذا الطلب");
+    }
+
     await orderRef.update({
       signature_url: cleanUrl,
       signed_by: String(signerName || "المستلم المعتمد").trim(),
@@ -2636,7 +2712,6 @@ exports.saveOrderSignature = onCall(
     return { success: true };
   }
 );
-
 // 3. توثيق إرسال تذكير الدفتر في السيرفر
 exports.logCustomerReminder = onCall(
   { region: "us-central1", cors: true },

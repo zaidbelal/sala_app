@@ -158,7 +158,8 @@ class WalService {
       if (autoCompact) {
         final fileLength = await _logFile!.length();
         if (fileLength > _maxLogSizeBytes) {
-          Future.microtask(() => compactLog());
+          // 🔒 تجنب Deadlock: فك الحجز أولاً وجدولة الـ compactLog بعد اكتمال القفل الحالي
+          Timer.run(() => compactLog());
         }
       }
     } catch (e, st) {

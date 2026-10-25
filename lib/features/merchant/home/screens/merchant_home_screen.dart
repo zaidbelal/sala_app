@@ -170,8 +170,11 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
                   errorMsg.contains('timeout') ||
                   errorMsg.contains('socket') ||
                   errorMsg.contains('deadline-exceeded') ||
+                  errorMsg.contains('unauthenticated') ||
+                  errorMsg.contains('تسجيل الدخول') ||
                   errorMsg.contains('جلسة التاجر غير صالحة') ||
                   errorMsg.contains('user-not-found') ||
+                  errorMsg.contains('permission-denied') ||
                   (errorMsg.contains('unavailable') &&
                       !errorMsg.contains('product')));
 
@@ -182,7 +185,6 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             }
             continue;
           } else {
-            // محاولة ذكية: إذا كان الخطأ بسبب حذف/نفاد صنف معين، نعيد البضاعة الصالحة للسلة ونشعر التاجر
             await WalService.instance.markAborted(orderId);
             List<Map<String, dynamic>> availableProducts =
                 AppCache.instance.getProducts() ?? [];
@@ -251,20 +253,18 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
               };
             }
             if (cartMap.isNotEmpty) {
-              final currentCart = ref.read(cartProvider);
-              if (currentCart.isEmpty) {
-                await ref.read(cartProvider.notifier).restoreCart(cartMap);
-              } else {
-                for (final entry in cartMap.entries) {
-                  final oldItem =
-                      CartItem.fromJson(entry.value as Map<String, dynamic>);
-                  ref.read(cartProvider.notifier).addItem(
-                        oldItem.product,
-                        oldItem.quantity,
-                        unit: oldItem.selectedUnit,
-                      );
-                }
+              // 🔒 دمج كافة العناصر المعادة أولاً برمجياً ثم حفظها مرة واحدة لمنع تداخل عمليات الكتابة على القرص
+              final notifier = ref.read(cartProvider.notifier);
+              for (final entry in cartMap.entries) {
+                final oldItem =
+                    CartItem.fromJson(entry.value as Map<String, dynamic>);
+                notifier.addItem(
+                  oldItem.product,
+                  oldItem.quantity,
+                  unit: oldItem.selectedUnit,
+                );
               }
+              await notifier.forceSave();
             }
             await AppStorage.removePendingOrder(orderId, currentUserId);
             failCount++;

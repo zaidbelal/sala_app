@@ -185,7 +185,9 @@ class CategoriesNotifier extends AsyncNotifier<List<Map<String, dynamic>>> {
   }
 
   void listenRealtime() {
-    ref.listen<List<Map<String, dynamic>>>(
+    // 🔒 إغلاق الاشتراك السابق لمنع تراكم مستمعين في الذاكرة
+    _realtimeSub?.close();
+    _realtimeSub = ref.listen<List<Map<String, dynamic>>>(
       realtimeCategoriesProvider,
       (_, next) {
         if (next.isNotEmpty && !_isDisposed) {
@@ -310,7 +312,9 @@ class ProductsNotifier
   }
 
   void listenRealtime() {
-    ref.listen<List<Map<String, dynamic>>>(
+    // 🔒 إغلاق الاشتراك السابق لمنع تراكم مستمعين في الذاكرة
+    _realtimeSub?.close();
+    _realtimeSub = ref.listen<List<Map<String, dynamic>>>(
       realtimeProductsProvider,
       (_, next) {
         if (next.isNotEmpty && !_isDisposed) {

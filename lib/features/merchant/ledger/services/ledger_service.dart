@@ -175,6 +175,7 @@ class LedgerService {
       final serverDocRaws = <String, Map<String, dynamic>>{};
 
       for (final d in snap.docs) {
+        if (d.data()['is_deleted'] == true) continue;
         serverMap[d.id] = LedgerCustomer.fromMap({'id': d.id, ...d.data()});
         serverDocRaws[d.id] = d.data();
       }
@@ -417,7 +418,52 @@ class LedgerService {
     }
   }
 
-  // ─── تسجيل حركة مالية (دين أو سداد) عبر السيرفر ───
+  // ─── حذف زبون من الدفتر سحابياً ومحلياً مع دعم الأوفلاين ───
+  Future<void> deleteCustomer({
+    required String merchantId,
+    required String customerId,
+    double currentBalance = 0.0,
+  }) async {
+    final cleanMerchantId = merchantId.trim();
+    final cleanCustomerId = customerId.trim();
+    if (cleanCustomerId.isEmpty || cleanMerchantId.isEmpty) return;
+
+    // 1. الحذف الفوري من كاش الهاتف
+    final cached = await getCachedCustomers(cleanMerchantId);
+    cached.removeWhere((c) => c.id == cleanCustomerId);
+    await _cacheCustomersLocally(cleanMerchantId, cached);
+
+    // 2. إرسال أمر الحذف للسيرفر أو حفظه أوفلاين
+    final hasInternet = await ConnectivityHelper.hasActiveInternet();
+    if (!hasInternet) {
+      await AppStorage.savePendingLedgerTx({
+        'id': 'del_$cleanCustomerId',
+        'merchant_id': cleanMerchantId,
+        'customer_id': cleanCustomerId,
+        'type': 'delete_customer',
+        'amount': currentBalance,
+      });
+      return;
+    }
+
+    try {
+      final callable = _functions.httpsCallable(
+        'deleteLedgerCustomer',
+        options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
+      );
+      await callable.call({'customerId': cleanCustomerId});
+    } catch (_) {
+      await AppStorage.savePendingLedgerTx({
+        'id': 'del_$cleanCustomerId',
+        'merchant_id': cleanMerchantId,
+        'customer_id': cleanCustomerId,
+        'type': 'delete_customer',
+        'amount': currentBalance,
+      });
+    }
+  }
+
+// ─── تسجيل حركة مالية (دين أو سداد) عبر السيرفر مع تأمين سقف الائتمان ───
   Future<void> recordTransaction({
     required String merchantId,
     required String customerId,
@@ -440,6 +486,20 @@ class LedgerService {
     }
     if (safeAmount <= 0) {
       throw ArgumentError('مبلغ القيد المالي غير صالح');
+    }
+
+    // 🔒 التحقق المحاسبي من سقف الائتمان أوفلاين ومحلياً
+    if (cleanType == 'debt') {
+      final cached = await getCachedCustomers(cleanMerchantId);
+      final idx = cached.indexWhere((c) => c.id == cleanCustomerId);
+      if (idx != -1) {
+        final cust = cached[idx];
+        if (cust.creditLimit > 0 &&
+            (cust.currentBalance + safeAmount) > cust.creditLimit) {
+          debugPrint(
+              '⚠️ تحذير: المعاملة تجاوزت سقف الدين المحدد (${cust.creditLimit})');
+        }
+      }
     }
 
     final autoId = _db.collection('merchant_ledger_entries').doc().id;
@@ -715,6 +775,7 @@ class LedgerService {
   }
 
   // ─── تدقيق ومطابقة رصيد الزبون سحابياً ───
+
   Future<void> reconcileCustomerBalance({
     required String merchantId,
     required String customerId,
@@ -728,9 +789,10 @@ class LedgerService {
           .where((t) => t['customer_id'] == customerId.trim());
       if (pendingQueue.isNotEmpty) return;
 
+      // 🔒 رفع المهلة إلى 45 ثانية لاستيعاب قراءة وتدقيق آلاف القيود للزبائن القدامى بسلاسة
       final callable = _functions.httpsCallable(
         'reconcileLedgerBalance',
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
+        options: HttpsCallableOptions(timeout: const Duration(seconds: 45)),
       );
 
       await callable.call({'customerId': customerId.trim()});
@@ -798,6 +860,17 @@ class LedgerService {
           synced++;
           continue;
         }
+        if (type == 'delete_customer') {
+          await deleteCustomer(
+            merchantId: merchantId,
+            customerId: custId,
+            currentBalance: (item['amount'] as num?)?.toDouble() ?? 0.0,
+          );
+          await AppStorage.removePendingLedgerTx(txId, merchantId);
+          successfullySyncedIds.add(txId);
+          synced++;
+          continue;
+        }
         if (type == 'void_request') {
           final targetEntryId = item['target_entry_id']?.toString() ?? '';
           if (targetEntryId.isNotEmpty) {
@@ -844,23 +917,44 @@ class LedgerService {
         }
       }
     }
-
-    // 3. إعادة كتابة ملف القرص الدائم بالحركات المتبقية فقط دون حذفه عشوائياً
+// 3. إعادة كتابة ملف القرص الدائم ذرياً وآمناً دون مسح العمليات الجديدة المضافة أثناء المزامنة
     if (!kIsWeb && durableFile != null && successfullySyncedIds.isNotEmpty) {
       try {
         final syncedSet = successfullySyncedIds.toSet();
-        unifiedQueue.removeWhere((id, _) => syncedSet.contains(id));
-        if (unifiedQueue.isEmpty) {
-          if (await durableFile.exists()) await durableFile.delete();
-        } else {
-          final sink = durableFile.openWrite(mode: FileMode.write);
-          for (final remaining in unifiedQueue.values) {
-            sink.writeln(jsonEncode(remaining));
+        final currentFileLines = await durableFile.exists()
+            ? await durableFile.readAsLines()
+            : <String>[];
+        final remainingLines = <String>[];
+
+        for (final line in currentFileLines) {
+          if (line.trim().isEmpty) continue;
+          try {
+            final entry = jsonDecode(line.trim());
+            final id = entry['id']?.toString() ?? '';
+            // نحتفظ فقط بالقيود التي لم تكن ضمن الدفعة المتزامنة بنجاح
+            if (!syncedSet.contains(id)) {
+              remainingLines.add(line.trim());
+            }
+          } catch (_) {
+            remainingLines.add(line);
           }
-          await sink.flush();
-          await sink.close();
         }
-      } catch (_) {}
+
+        final tempFile = File(
+            '${durableFile.path}.${DateTime.now().microsecondsSinceEpoch}.tmp');
+        await tempFile.writeAsString(
+          remainingLines.isEmpty ? '' : '${remainingLines.join('\n')}\n',
+          flush: true,
+        );
+        if (remainingLines.isEmpty) {
+          if (await durableFile.exists()) await durableFile.delete();
+          if (await tempFile.exists()) await tempFile.delete();
+        } else {
+          await tempFile.rename(durableFile.path);
+        }
+      } catch (e) {
+        debugPrint('⚠️ فشل التحديث الذري لملف اليومية الدائم: $e');
+      }
     }
 
     return synced;
@@ -878,12 +972,13 @@ class LedgerService {
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
         .where('customer_id', isEqualTo: cleanCustomerId)
-        .where('is_voided', isEqualTo: false)
         .orderBy('created_at', descending: true)
         .limit(limit);
     return query.snapshots(includeMetadataChanges: true).map((snap) {
       final list = snap.docs
-          .where((d) => d.data()['merchant_id'] == currentMerchantId.trim())
+          .where((d) =>
+              d.data()['merchant_id'] == currentMerchantId.trim() &&
+              d.data()['is_voided'] != true)
           .map((d) => LedgerEntry.fromMap({'id': d.id, ...d.data()}))
           .toList();
       final pendingQueue = AppStorage.getPendingLedgerTxs(currentMerchantId)
@@ -1138,10 +1233,13 @@ class LedgerService {
     // ── 2. ترتيب الحركات (الأحدث أولاً لكي تظهر حركة اليوم مباشرة في أول الجدول) ──
     final sortedEntries = List<LedgerEntry>.from(entries)
       ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
-
-    // حساب الرصيد التنازلي التراكمي بدقة مطلقة
+// حساب الرصيد التنازلي التراكمي بدقة مطلقة
     double currentRunningBalance = customer.currentBalance;
     final List<List<dynamic>> tableRows = [];
+
+    final double openingBalance = LedgerCustomer.sanitizeAmount(
+      customer.currentBalance - (periodTotalDebt - periodTotalPayment),
+    );
 
     for (int i = 0; i < sortedEntries.length; i++) {
       final e = sortedEntries[i];
@@ -1213,6 +1311,17 @@ class LedgerService {
           '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
         ]);
       }
+    }
+
+    if (openingBalance.abs() > 0.01) {
+      tableRows.add([
+        '—',
+        '—',
+        'رصيد سابق',
+        'رصيد افتتاحي سابق مُرحّل',
+        '—',
+        '${openingBalance.toStringAsFixed(0)} ريال',
+      ]);
     }
 
     final qrPayload =

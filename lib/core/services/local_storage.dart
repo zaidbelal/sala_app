@@ -263,22 +263,24 @@ class AppStorage {
       currentQueue.add(order);
       final json = jsonEncode(currentQueue);
       await _db.setString(key, json);
-
-      // 🚀 استبدال ذري بنمط POSIX الذري المباشر دون مسح الملف الأصلي مسبقاً لمنع ضياع البيانات
+// 🔒 كتابة ذرية آمنة متوافقة مع أنظمة Android و iOS تضمن عدم تلف ملفات الطابور
       if (!kIsWeb && _appDocsPath != null) {
         try {
+          final finalFile = File('$_appDocsPath/${key}_backup.json');
           final nonce = DateTime.now().microsecondsSinceEpoch;
           final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
-          final finalFile = File('$_appDocsPath/${key}_backup.json');
 
           await tempFile.writeAsString(json, flush: true);
-          try {
-            await tempFile.rename(finalFile.path);
-          } catch (_) {
-            await tempFile.copy(finalFile.path);
-            if (await tempFile.exists()) await tempFile.delete();
+          if (await finalFile.exists()) {
+            await finalFile.delete();
           }
-        } catch (_) {}
+          await tempFile.rename(finalFile.path);
+        } catch (_) {
+          try {
+            final finalFile = File('$_appDocsPath/${key}_backup.json');
+            await finalFile.writeAsString(json, flush: true);
+          } catch (_) {}
+        }
       }
     } finally {
       completer.complete();
@@ -291,6 +293,15 @@ class AppStorage {
     if (targetUid == null || targetUid.isEmpty) return [];
     final key = _userPendingOrderKey(targetUid);
     var raw = _db.getString(key);
+    // حماية القراءة في حال تزامنها مع استبدال الملف الذري على القرص
+    if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
+      try {
+        final file = File('$_appDocsPath/${key}_backup.json');
+        if (file.existsSync()) {
+          raw = file.readAsStringSync();
+        }
+      } catch (_) {}
+    }
     if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
       try {
         final file = File('$_appDocsPath/${key}_backup.json');
@@ -434,7 +445,19 @@ class AppStorage {
         return;
       }
       queue.add(txData);
-      await _db.setString(key, jsonEncode(queue));
+      final json = jsonEncode(queue);
+      await _db.setString(key, json);
+
+      // 🔒 كتابة ذرية آمنة لحركات الدفتر على القرص لمنع فقدان ديون التجار عند انهيار التطبيق
+      if (!kIsWeb && _appDocsPath != null) {
+        try {
+          final nonce = DateTime.now().microsecondsSinceEpoch;
+          final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
+          final finalFile = File('$_appDocsPath/${key}_backup.json');
+          await tempFile.writeAsString(json, flush: true);
+          await tempFile.rename(finalFile.path);
+        } catch (_) {}
+      }
     } finally {
       completer.complete();
     }
@@ -505,7 +528,19 @@ class AppStorage {
         return;
       }
       currentQueue.add(returnData);
-      await _db.setString(key, jsonEncode(currentQueue));
+      final json = jsonEncode(currentQueue);
+      await _db.setString(key, json);
+
+      // 🔒 كتابة ذرية لطلبات الإرجاع أوفلاين على القرص
+      if (!kIsWeb && _appDocsPath != null) {
+        try {
+          final nonce = DateTime.now().microsecondsSinceEpoch;
+          final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
+          final finalFile = File('$_appDocsPath/${key}_backup.json');
+          await tempFile.writeAsString(json, flush: true);
+          await tempFile.rename(finalFile.path);
+        } catch (_) {}
+      }
     } finally {
       completer.complete();
     }

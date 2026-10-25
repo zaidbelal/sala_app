@@ -405,6 +405,76 @@ class _LedgerTabState extends State<LedgerTab> {
                                     ),
                                   ),
                                   child: ListTile(
+                                    onLongPress: () async {
+                                      HapticFeedback.heavyImpact();
+                                      final hasDebt = c.currentBalance > 0;
+                                      final confirmed = await showDialog<bool>(
+                                        context: context,
+                                        builder: (dCtx) => AlertDialog(
+                                          backgroundColor: dCtx.bgCard,
+                                          shape: RoundedRectangleBorder(
+                                              borderRadius:
+                                                  BorderRadius.circular(20)),
+                                          title: Row(
+                                            children: [
+                                              Icon(Icons.warning_amber_rounded,
+                                                  color: hasDebt
+                                                      ? Colors.red
+                                                      : Colors.orange),
+                                              const SizedBox(width: 8),
+                                              Text('حذف الزبون',
+                                                  style: TextStyle(
+                                                      fontFamily: 'Cairo',
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                      fontSize: 16,
+                                                      color: dCtx.textPrimary)),
+                                            ],
+                                          ),
+                                          content: Text(
+                                            hasDebt
+                                                ? 'تنبيه: الزبون (${c.name}) عليه دين قدره (${c.currentBalance.toStringAsFixed(0)} ر.ي).\n\nهل تريد حذفه وشطب دينه من دفتر الديون؟'
+                                                : 'هل تريد حذف الزبون (${c.name}) من الدفتر؟',
+                                            style: TextStyle(
+                                                fontFamily: 'Cairo',
+                                                fontSize: 13,
+                                                height: 1.6,
+                                                color: dCtx.textSecondary),
+                                          ),
+                                          actions: [
+                                            TextButton(
+                                              onPressed: () =>
+                                                  Navigator.pop(dCtx, false),
+                                              child: const Text('إلغاء',
+                                                  style: TextStyle(
+                                                      fontFamily: 'Cairo',
+                                                      color: Colors.grey)),
+                                            ),
+                                            ElevatedButton(
+                                              style: ElevatedButton.styleFrom(
+                                                  backgroundColor: Colors.red),
+                                              onPressed: () =>
+                                                  Navigator.pop(dCtx, true),
+                                              child: const Text('حذف',
+                                                  style: TextStyle(
+                                                      fontFamily: 'Cairo',
+                                                      color: Colors.white,
+                                                      fontWeight:
+                                                          FontWeight.bold)),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+
+                                      if (confirmed == true) {
+                                        await LedgerService.instance
+                                            .deleteCustomer(
+                                          merchantId: merchantId,
+                                          customerId: c.id,
+                                          currentBalance: c.currentBalance,
+                                        );
+                                      }
+                                    },
                                     onTap: () => Navigator.push(
                                       context,
                                       MaterialPageRoute(
