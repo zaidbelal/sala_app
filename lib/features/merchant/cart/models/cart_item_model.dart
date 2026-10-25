@@ -58,6 +58,7 @@ class CartItem {
         'brandId': product.brandId,
         'size_ml': product.sizeMl,
         'items_per_carton': product.itemsPerCarton,
+        'units': product.units.map((u) => u.toMap()).toList(),
       },
       'quantity': quantity,
       'snapshot_at': DateTime.now().millisecondsSinceEpoch,
@@ -70,6 +71,9 @@ class CartItem {
     final unitMap = j['selectedUnit'] as Map<String, dynamic>?;
     final img = (p['image_url'] ?? p['imageUrl']) as String?;
 
+    final parsedUnit = unitMap != null ? ProductUnit.fromMap(unitMap) : null;
+    final rawUnits = p['units'] as List<dynamic>?;
+
     return CartItem(
       product: ProductModel.fromMap({
         'id': p['id'],
@@ -79,13 +83,14 @@ class CartItem {
         'brand_id': p['brandId'] ?? p['brand_id'] ?? '',
         'size_ml': p['size_ml'],
         'items_per_carton': p['items_per_carton'],
+        'units': rawUnits ?? (parsedUnit != null ? [parsedUnit.toMap()] : []),
         'category_id': '',
         'cost_price': 0,
         'stock': 0,
         'is_active': true,
       }),
       quantity: (j['quantity'] as num?)?.toInt() ?? 1,
-      selectedUnit: unitMap != null ? ProductUnit.fromMap(unitMap) : null,
+      selectedUnit: parsedUnit,
     );
   }
 }

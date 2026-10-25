@@ -401,7 +401,7 @@ exports.deleteUserAccount = onCall(async (request) => {
     const targetUid = request.auth.uid;
 
     try {
-        await admin.auth().deleteUser(targetUid);
+        // تحديث وثيقة التاجر وإخلاء الهاتف أولاً لضمان عدم حظر رقمه إذا تعطل السيرفر
         await db.collection('profiles').doc(targetUid).update({
             is_active: false,
             is_banned: true, 
@@ -410,6 +410,7 @@ exports.deleteUserAccount = onCall(async (request) => {
             full_name: "مستخدم محذوف",
             updated_at: admin.firestore.FieldValue.serverTimestamp()
         });
+        await admin.auth().deleteUser(targetUid);
         return { success: true };
     } catch (error) {
         throw new HttpsError('internal', 'فشل حذف الحساب: ' + error.message);
@@ -624,8 +625,12 @@ exports.cancelOrder = onCall(
     if (!orderId) {
       throw new HttpsError("invalid-argument", "معرف الطلب مطلوب");
     }
+const cleanOrderId = String(orderId).trim();
+    const orderRef = db.collection("orders").doc(cleanOrderId);
 
- const orderRef = db.collection("orders").doc(String(orderId).trim());
+    // 1. جلب عناصر الطلب خارج المعاملة لحماية عزل المعاملة الذرية (Snapshot Isolation)
+    const itemsSnap = await db.collection("order_items").where("order_id", "==", cleanOrderId).get();
+    const itemDocs = itemsSnap.docs;
 
     return await db.runTransaction(async (tx) => {
       const orderSnap = await tx.get(orderRef);
@@ -634,7 +639,7 @@ exports.cancelOrder = onCall(
       }
       const order = orderSnap.data();
 
-     // 1. التحقق من الصلاحية: صاحب الطلب أو إدارة (قراءة لمرة واحدة فقط)
+      // التحقق من الصلاحية: صاحب الطلب أو إدارة
       const userProfile = await tx.get(db.collection("profiles").doc(uid));
       const role = userProfile.data()?.role || "merchant";
       const isAdmin = role === "admin" || role === "super_admin";
@@ -646,19 +651,8 @@ exports.cancelOrder = onCall(
         throw new HttpsError("failed-precondition", `لا يمكن إلغاء طلب بحالة: ${order.status}`);
       }
 
-     // 2. التحقق من الصلاحيات وحالة الطلب
-      if (order.merchant_id !== uid && !isAdmin) {
-        throw new HttpsError("permission-denied", "غير مصرح لك بإلغاء هذا الطلب");
-      }
-      if (order.status !== "pending") {
-        throw new HttpsError("failed-precondition", `لا يمكن إلغاء طلب بحالة: ${order.status}`);
-      }
-
-      // 3. جلب عناصر الطلب
-      const itemsSnap = await db.collection("order_items").where("order_id", "==", orderRef.id).get();
-
-      // استرجاع المخزون للأصناف
-      for (const doc of itemsSnap.docs) {
+      // 2. استرجاع المخزون للأصناف ذرياً
+      for (const doc of itemDocs) {
         const item = doc.data();
         const pId = item.product_id;
         const qty = Number(item.quantity) || 0;
@@ -907,26 +901,32 @@ exports.deliverOrderByDriver = onCall(
     }
 
     const orderRef = db.collection("orders").doc(String(orderId).trim());
-// 🚀 رفع التوقيع السحابي المتوافق 100% مع Uniform Bucket-Level Access (UBLA)
-    let finalSignatureUrl = signatureData || null;
-    if (signatureData && typeof signatureData === "string" && signatureData.startsWith("data:image")) {
-      try {
-        const base64Data = signatureData.replace(/^data:image\/\w+;base64,/, "");
-        const buffer = Buffer.from(base64Data, "base64");
-        const bucket = admin.storage().bucket();
-        const fileName = `signatures/order_${orderId}_${Date.now()}.png`;
-        const file = bucket.file(fileName);
-        const downloadToken = crypto.randomUUID();
+// 🚀 رفع التوقيع مع الحماية القطعية لقاعدة البيانات من نصوص Base64
+    let finalSignatureUrl = null;
+    if (signatureData && typeof signatureData === "string") {
+      if (signatureData.startsWith("https://")) {
+        finalSignatureUrl = signatureData;
+      } else if (signatureData.startsWith("data:image")) {
+        try {
+          const base64Data = signatureData.replace(/^data:image\/\w+;base64,/, "");
+          const buffer = Buffer.from(base64Data, "base64");
+          const bucket = admin.storage().bucket();
+          const fileName = `signatures/order_${orderId}_${Date.now()}.png`;
+          const file = bucket.file(fileName);
+          const downloadToken = crypto.randomUUID();
 
-        await file.save(buffer, {
-          metadata: {
-            contentType: "image/png",
-            metadata: { firebaseStorageDownloadTokens: downloadToken },
-          },
-        });
-        finalSignatureUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(fileName)}?alt=media&token=${downloadToken}`;
-      } catch (uploadError) {
-        console.error("[deliverOrderByDriver] Signature upload fallback:", uploadError);
+          await file.save(buffer, {
+            metadata: {
+              contentType: "image/png",
+              metadata: { firebaseStorageDownloadTokens: downloadToken },
+            },
+          });
+          finalSignatureUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(fileName)}?alt=media&token=${downloadToken}`;
+        } catch (uploadError) {
+          console.error("[deliverOrderByDriver] Failed to store signature file:", uploadError);
+          // لا يتم حفظ Base64 في Firestore مطلقاً لحماية وثيقة الطلب
+          finalSignatureUrl = null;
+        }
       }
     }
     return await db.runTransaction(async (tx) => {
@@ -1677,12 +1677,12 @@ const docRef = customerId ? db.collection("merchant_customers").doc(String(custo
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
 
+     customerData.is_deleted = false;
       if (!existingSnap.exists) {
         customerData.current_balance = 0.0;
         customerData.created_at = admin.firestore.FieldValue.serverTimestamp();
         tx.set(docRef, customerData);
       } else {
-        // حماية الرصيد القائم من التصفير في حال تزامن قيد أوفلاين مع إنشاء الزبون
         tx.set(docRef, customerData, { merge: true });
       }
 
@@ -1698,7 +1698,6 @@ const docRef = customerId ? db.collection("merchant_customers").doc(String(custo
     });
   }
 );
-
 // 1.1 حذف زبون من الدفتر سحابياً مع تسوية ديون السوق
 exports.deleteLedgerCustomer = onCall(
   { region: "us-central1", cors: true },
@@ -1729,6 +1728,11 @@ exports.deleteLedgerCustomer = onCall(
         throw new HttpsError("permission-denied", "غير مصرح لك بحذف هذا الزبون");
       }
 
+      // إذا تم حذفه مسبقاً وسُويت ديونه نخرج بسلام دون تكرار الخصم
+      if (customerData.is_deleted === true && customerData.summary_deducted === true) {
+        return { success: true, message: "تم حذف الزبون مسبقاً" };
+      }
+
       const balance = Number(customerData.current_balance) || 0;
       const debtPortion = Math.max(0, balance);
       const isDebtor = balance > 0;
@@ -1736,6 +1740,7 @@ exports.deleteLedgerCustomer = onCall(
       // حذف برمجياً (Soft-Delete) للحفاظ على المرجعية المحاسبية للفواتير القديمة
       tx.update(customerRef, {
         is_deleted: true,
+        summary_deducted: true,
         deleted_at: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -1754,7 +1759,6 @@ exports.deleteLedgerCustomer = onCall(
     });
   }
 );
-
 // 2. قيد حركة مالية (دين أو سداد) ذرياً بحسابات القروش (Integer Cents)
 exports.recordLedgerTransaction = onCall(
   { region: "us-central1", cors: true },
@@ -1864,7 +1868,7 @@ const result = await db.runTransaction(async (tx) => {
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      // 🚀 عزل الملخص عن قفل المعاملة لتفادي Contention الـ 1 write/sec عبر Distributed Counters Sharding
+    // 🔒 التحصين المالي: تحديث ملخص ديون السوق ذرياً داخل نفس المعاملة لمنع الانحراف المالي
       const oldDebtPortion = Math.max(0, currentBalance);
       const newDebtPortion = Math.max(0, newBalance);
       const debtPortionDelta = (Math.round(newDebtPortion * 100) - Math.round(oldDebtPortion * 100)) / 100;
@@ -1872,7 +1876,8 @@ const result = await db.runTransaction(async (tx) => {
       const isCrossedToDebt = currentBalance <= 0 && newBalance > 0;
       const isCrossedToZero = currentBalance > 0 && newBalance <= 0;
       const debtorsCountChange = isCrossedToDebt ? 1 : (isCrossedToZero ? -1 : 0);
-if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
+
+      if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
         const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
         tx.set(summaryRef, {
           merchant_id: merchantId,
@@ -1881,18 +1886,16 @@ if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
           last_updated: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
       }
+
       return {
         success: true,
         alreadyRecorded: false,
         entryId,
         newBalance,
-        currentBalance,
-        debtPortionDelta,
-        debtorsCountChange,
       };
     });
 
-   return {
+    return {
       success: true,
       entryId: result.entryId,
       newBalance: result.newBalance,
@@ -1991,7 +1994,7 @@ exports.voidLedgerTransaction = onCall(
           updated_at: admin.firestore.FieldValue.serverTimestamp(),
         });
       }
-      // 3. حساب وتحديث الملخص المالي الإجمالي بدقة Cents
+    // 3. التحديث الذري الشامل داخل نفس المعاملة (Atomic OCC)
       const oldDebtPortion = Math.max(0, currentBalance);
       const newDebtPortion = Math.max(0, newBalance);
       const debtPortionDelta = (Math.round(newDebtPortion * 100) - Math.round(oldDebtPortion * 100)) / 100;
@@ -2000,15 +2003,22 @@ exports.voidLedgerTransaction = onCall(
       const willBeDebt = newBalance > 0;
       const debtorsCountChange = (!wasDebt && willBeDebt) ? 1 : ((wasDebt && !willBeDebt) ? -1 : 0);
 
-      tx.set(summaryRef, {
-        merchant_id: merchantId,
-        total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
-        debtors_count: admin.firestore.FieldValue.increment(debtorsCountChange),
-        last_updated: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
+      if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
+        tx.set(summaryRef, {
+          merchant_id: merchantId,
+          total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
+          debtors_count: admin.firestore.FieldValue.increment(debtorsCountChange),
+          last_updated: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
 
-      return { success: true, newBalance };
+      return {
+        success: true,
+        newBalance,
+      };
     });
+
+    return { success: true, newBalance: result.newBalance };
   }
 );
 // 4. مطابقة وتدقيق الرصيد بنمط Version-Locking & Optimistic Concurrency Control (OCC)
@@ -2045,39 +2055,42 @@ exports.reconcileLedgerBalance = onCall(
     let lastVisibleDoc = null;
     let hasMoreEntries = true;
 
-  // 🔒 استعلام ترقيمي قطعي ومستقر بنسبة 100% يمنع تخطي أو تكرار قيود محاسبية
-    while (hasMoreEntries) {
-      let entriesQuery = db.collection("merchant_ledger_entries")
-        .where("customer_id", "==", cleanCustomerId)
-        .orderBy(admin.firestore.FieldPath.documentId())
-        .limit(500);
+  // 🔒 استعلام تدقيقي مقسم على دفعات متتالية (Chunked Stream) لمنع تجاوز الذاكرة مهما بلغت القيود
+    let calculatedTotalCents = 0;
+    let lastDoc = null;
+    let keepPaging = true;
+    const CHUNK_SIZE = 500;
 
-      if (lastVisibleDoc) {
-        entriesQuery = entriesQuery.startAfter(lastVisibleDoc);
+    while (keepPaging) {
+      let q = db.collection("merchant_ledger_entries")
+        .where("customer_id", "==", cleanCustomerId)
+        .limit(CHUNK_SIZE);
+
+      if (lastDoc) {
+        q = q.startAfter(lastDoc);
       }
 
-      const entriesSnap = await entriesQuery.get();
-      if (entriesSnap.empty) {
-        hasMoreEntries = false;
+      const chunkSnap = await q.get();
+      if (chunkSnap.empty) {
         break;
       }
 
-      for (const doc of entriesSnap.docs) {
+      for (const doc of chunkSnap.docs) {
         const entry = doc.data();
         if (entry.merchant_id !== merchantId || entry.is_voided === true) continue;
         const amtCents = Math.round((Number(entry.amount) || 0) * 100);
         if (entry.type === "debt") {
-          totalDebtCents += amtCents;
+          calculatedTotalCents += amtCents;
         } else if (entry.type === "payment") {
-          totalPaymentCents += amtCents;
+          calculatedTotalCents -= amtCents;
         }
       }
 
-      lastVisibleDoc = entriesSnap.docs[entriesSnap.docs.length - 1];
-      hasMoreEntries = entriesSnap.docs.length === 500;
+      lastDoc = chunkSnap.docs[chunkSnap.docs.length - 1];
+      keepPaging = chunkSnap.docs.length === CHUNK_SIZE;
     }
 
-    const calculatedAuthoritativeBalance = (totalDebtCents - totalPaymentCents) / 100;
+    const calculatedAuthoritativeBalance = calculatedTotalCents / 100;
     // 🔒 الخطوة 3: المعاملة الذرية المحمية بنمط قفل النسخة (Optimistic Version Lock)
     return await db.runTransaction(async (tx) => {
       const [postCustomerSnap, summarySnap] = await Promise.all([
@@ -2349,21 +2362,23 @@ exports.adminUpdateProduct = onCall(
           : admin.firestore.FieldValue.delete();
       }
 
-   // تعديل المخزون الذري والتدقيق
+  // تعديل المخزون الذري المحمي من السوالب والتدقيق
       let newStock = Number(existing.stock) || 0;
       if (updates.stock_delta !== undefined) {
+        const currentStock = Math.max(0, Number(existing.stock) || 0);
         const delta = Number(updates.stock_delta) || 0;
-        newStock = Math.max(0, newStock + delta);
-        // 🔒 استخدام increment لمنع محو مبيعات التجار اللحظية
-        safeUpdates.stock = admin.firestore.FieldValue.increment(delta);
+        // منع إنقاص المخزون تحت الصفر قطعياً
+        const effectiveDelta = delta < 0 ? -Math.min(currentStock, Math.abs(delta)) : delta;
+        newStock = currentStock + effectiveDelta;
+        safeUpdates.stock = admin.firestore.FieldValue.increment(effectiveDelta);
 
-        // تسجيل قيد حركة المخزون
+        // تسجيل قيد حركة المخزون الدقيق
         const auditRef = db.collection("inventory_audit_log").doc();
         tx.set(auditRef, {
           product_id: cleanId,
           product_name: safeUpdates.name || existing.name || "",
           action: "stock_delta",
-          delta: delta,
+          delta: effectiveDelta,
           resulting_stock: newStock,
           performed_by: callerUid,
           created_at: admin.firestore.FieldValue.serverTimestamp(),

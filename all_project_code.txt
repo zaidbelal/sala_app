@@ -919,7 +919,7 @@ Future<void> _initializeRemoteConfig() async {
         minimumFetchInterval: const Duration(hours: 1),
       ),
     );
-    await remoteConfig.setDefaults({'min_order_value': 8250.0});
+    await remoteConfig.setDefaults({'min_order_value': 4250.0});
     await remoteConfig.fetchAndActivate();
     final double fetchedMinOrder = remoteConfig.getDouble('min_order_value');
     if (fetchedMinOrder > 0) {
@@ -1064,8 +1064,8 @@ import 'package:flutter/material.dart';
 
 class AppConfig {
   AppConfig._();
-  // قيمة افتراضية يتم تحديثها ديناميكياً من Firebase Remote Config لمنع تعليق التجار الجدد
-  static double minOrderValue = 8250.0;
+  // الحد الأدنى الرسمي الموحد للطلب في المنصة
+  static double minOrderValue = 4250.0;
   static const int maxOrderItems = 50;
 }
 
@@ -5520,7 +5520,9 @@ class RealtimeHub {
   StreamSubscription? _profileSub;
 
   void _startUserChannels(String userId, {required String role}) {
-    // 🔒 عدم تكرار استدعاء الأصناف والشركات هنا لأنها بدأت وتعمل بالفعل في init()
+    // إعادة تفعيل قنوات الكتالوج في حال تم إلغاؤها عند تسجيل خروج سابق
+    if (_categoriesSub == null) _watchCategories();
+    if (_brandsSub == null) _watchBrands();
 
     _profileSub?.cancel();
     if (_profileSub != null) {
@@ -7364,7 +7366,8 @@ class WalService {
           final doc = await db
               .collection('orders')
               .doc(entry.id)
-              .get(const GetOptions(source: Source.server));
+              .get(const GetOptions(source: Source.server))
+              .timeout(const Duration(seconds: 4));
           verifiedOnServer = doc.exists;
           if (verifiedOnServer) {
             final uid =
@@ -7408,15 +7411,29 @@ class WalService {
                       .whereType<String>()
                       .toSet()
                   : <String>{};
-              final verifiedProductIds = pending
-                  .where((e) => verifiedIds.contains(e.id))
+              final matchingEntries = pending.where((e) =>
+                  verifiedIds.contains(e.id) &&
+                  (e.payload['merchant_id']?.toString() ?? AppStorage.userId) ==
+                      uid);
+
+              final verifiedProductIds = matchingEntries
                   .expand((e) => (e.payload['items'] as List? ?? []))
                   .map((it) => (it['product_id'])?.toString())
                   .whereType<String>()
                   .toSet();
 
+              final latestTimestamp = matchingEntries.isNotEmpty
+                  ? matchingEntries
+                      .map((e) => e.timestamp)
+                      .reduce((a, b) => a.isAfter(b) ? a : b)
+                  : DateTime.now();
+
+              final fileModTime = await file.lastModified();
               final isAssociatedWithPending = cartProductIds.isNotEmpty &&
-                  cartProductIds.every((id) => verifiedProductIds.contains(id));
+                  cartProductIds
+                      .every((id) => verifiedProductIds.contains(id)) &&
+                  fileModTime.isBefore(
+                      latestTimestamp.add(const Duration(minutes: 5)));
 
               if (isAssociatedWithPending) {
                 await file.delete();
@@ -30759,7 +30776,7 @@ class CartScreen extends ConsumerStatefulWidget {
 }
 
 class _CartScreenState extends ConsumerState<CartScreen> {
-  double get _minOrder => AppConfig.minOrderValue;
+  double get _minOrder => 4250.0;
   @override
   void initState() {
     super.initState();
@@ -31464,12 +31481,10 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           'عذراً، لا يمكن أن يحتوي الطلب الواحد على أكثر من ${AppConfig.maxOrderItems} صنفاً مختلفاً. يرجى تقسيم الطلب.');
       return;
     }
-    // ── 2. التحقق الموحد من الحد الأدنى للطلب مطابقاً لخادم السحابة ──
+    // ── 2. التحقق الموحد والقطعي من الحد الأدنى للطلب (4250 ر.ي) ──
     const double serverMinOrder = 4250.0;
-    final double minOrderLimit =
-        AppConfig.minOrderValue > 0 ? AppConfig.minOrderValue : serverMinOrder;
     final total = ref.read(cartTotalProvider);
-    if (total < minOrderLimit && total < serverMinOrder) {
+    if (total < serverMinOrder) {
       _showError(
           'الحد الأدنى للطلب هو ${serverMinOrder.toStringAsFixed(0)} ر.ي');
       return;
@@ -34847,19 +34862,19 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             continue;
           } else {
             await WalService.instance.markAborted(orderId);
-            List<Map<String, dynamic>> availableProducts =
-                AppCache.instance.getProducts() ?? [];
-            if (availableProducts.isEmpty) {
-              try {
-                final snap = await FirebaseFirestore.instance
-                    .collection('products')
-                    .where('is_deleted', isEqualTo: false)
-                    .where('is_active', isEqualTo: true)
-                    .limit(500)
-                    .get(const GetOptions(source: Source.serverAndCache));
-                availableProducts =
-                    snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
-              } catch (_) {}
+            // التحقق المباشر من السيرفر لضمان عدم إعادة أصناف محذوفة إلى السلة
+            List<Map<String, dynamic>> availableProducts = [];
+            try {
+              final snap = await FirebaseFirestore.instance
+                  .collection('products')
+                  .where('is_deleted', isEqualTo: false)
+                  .where('is_active', isEqualTo: true)
+                  .limit(500)
+                  .get(const GetOptions(source: Source.server));
+              availableProducts =
+                  snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+            } catch (_) {
+              availableProducts = AppCache.instance.getProducts() ?? [];
             }
 
             final activeProductMap = {
@@ -41365,11 +41380,8 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
         transactionId: entryId,
       );
 
-      _assignedTransactionId = null; // تصفير فقط بعد التأكيد الكامل
-
       if (!mounted) return;
       Navigator.pop(context, updatedCustomer);
-
       if (updatedCustomer.phone.trim().isNotEmpty) {
         final lastCreatedEntry = LedgerEntry(
           id: entryId,
@@ -41803,7 +41815,7 @@ class _LedgerTabState extends State<LedgerTab> {
                                   ),
                                 ),
                                 Text(
-                                  'عدد المدينين: ${allCustomers.where((c) => c.currentBalance > 0).length} زبون',
+                                  'عدد المدينين: ${summaryData['debtors_count'] ?? allCustomers.where((c) => c.currentBalance > 0).length} زبون',
                                   style: const TextStyle(
                                       fontFamily: 'Cairo',
                                       fontSize: 11,
@@ -43919,7 +43931,7 @@ class LedgerService {
   }
 
   Stream<List<LedgerCustomer>> watchCustomers(String merchantId,
-      {int limit = 200}) {
+      {int limit = 1000}) {
     final cleanMerchantId = merchantId.trim();
     if (cleanMerchantId.isEmpty) return const Stream.empty();
 
@@ -43931,16 +43943,21 @@ class LedgerService {
         .asyncMap((snap) async {
       final serverMap = <String, LedgerCustomer>{};
       final serverDocRaws = <String, Map<String, dynamic>>{};
+      final deletedCustomerIds = <String>{};
 
       for (final d in snap.docs) {
-        if (d.data()['is_deleted'] == true) continue;
+        if (d.data()['is_deleted'] == true) {
+          deletedCustomerIds.add(d.id);
+          continue;
+        }
         serverMap[d.id] = LedgerCustomer.fromMap({'id': d.id, ...d.data()});
         serverDocRaws[d.id] = d.data();
       }
 
-      // 🛡️ دمج الكاش المحلي التراكمي لمنع محو الزبائن خارج الـ limit(200)
+      // 🛡️ دمج الكاش المحلي مع استبعاد أي زبون محذوف نهائياً لمنع انبعاثه
       final existingLocalCached = await getCachedCustomers(cleanMerchantId);
       for (final cached in existingLocalCached) {
+        if (deletedCustomerIds.contains(cached.id)) continue;
         if (!serverMap.containsKey(cached.id)) {
           serverMap[cached.id] = cached;
         }
@@ -44361,9 +44378,13 @@ class LedgerService {
             final dir = await getApplicationDocumentsDirectory();
             final durableFile =
                 File('${dir.path}/ledger_durable_journal_$cleanMerchantId.db');
-            final line = '${jsonEncode(payload)}\n';
-            await durableFile.writeAsString(line,
-                mode: FileMode.append, flush: true);
+            final alreadyLogged = await durableFile.exists() &&
+                (await durableFile.readAsString()).contains('"id":"$entryId"');
+            if (!alreadyLogged) {
+              final line = '${jsonEncode(payload)}\n';
+              await durableFile.writeAsString(line,
+                  mode: FileMode.append, flush: true);
+            }
           } catch (_) {}
         }
         throw TimeoutException(
@@ -44386,7 +44407,7 @@ class LedgerService {
     final cleanCustomerId = customerId.trim();
     final cleanEntryId = entryId.trim();
 
-    // 1. فحص طابور الأوفلاين أولاً
+    // 1. فحص طابور الأوفلاين وتأمينه ضد انبعاث الدين
     final pendingQueue = AppStorage.getPendingLedgerTxs(cleanMerchantId);
     final pendingIdx = pendingQueue.indexWhere((t) => t['id'] == cleanEntryId);
     if (pendingIdx != -1) {
@@ -44396,6 +44417,17 @@ class LedgerService {
       final reverseDelta = isDebt ? -amt : amt;
 
       await AppStorage.removePendingLedgerTx(cleanEntryId, cleanMerchantId);
+
+      // تأمين مالي: جدولة طلب شطب في السيرفر تحسباً لوصول المعاملة إليه قبل انقطاع الشبكة
+      await AppStorage.savePendingLedgerTx({
+        'id': 'void_$cleanEntryId',
+        'merchant_id': cleanMerchantId,
+        'customer_id': cleanCustomerId,
+        'type': 'void_request',
+        'target_entry_id': cleanEntryId,
+        'amount': amt,
+        'is_debt': isDebt,
+      });
 
       if (!kIsWeb) {
         try {
@@ -44567,6 +44599,21 @@ class LedgerService {
       if (id.isNotEmpty) unifiedQueue[id] = item;
     }
 
+    // ترتيب المعاملات زمنياً لضمان معالجة الإضافة والسداد قبل أوامر الحذف
+    final sortedQueueList = unifiedQueue.values.toList()
+      ..sort((a, b) {
+        final typeOrder = (String t) => switch (t) {
+              'add_customer' => 0,
+              'debt' => 1,
+              'payment' => 2,
+              'void_request' => 3,
+              'delete_customer' => 4,
+              _ => 5,
+            };
+        return typeOrder(a['type']?.toString() ?? '')
+            .compareTo(typeOrder(b['type']?.toString() ?? ''));
+      });
+
     // 2. دمج أي قيود مسجلة في ملف القرص الصلب الدائم لمنع فقدانها
     File? durableFile;
     if (!kIsWeb) {
@@ -44597,7 +44644,7 @@ class LedgerService {
     int synced = 0;
     final List<String> successfullySyncedIds = [];
 
-    for (final item in unifiedQueue.values) {
+    for (final item in sortedQueueList) {
       final txId = item['id']?.toString() ?? '';
       final custId = item['customer_id']?.toString() ?? '';
       final type = item['type']?.toString() ?? '';
@@ -44729,6 +44776,7 @@ class LedgerService {
 // 🛡️ استعلام مؤمن وفوري بدون اشتراط فهارس مركبة معقدة
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
+        .where('merchant_id', isEqualTo: currentMerchantId.trim())
         .where('customer_id', isEqualTo: cleanCustomerId)
         .orderBy('created_at', descending: true)
         .limit(limit);
@@ -45025,22 +45073,20 @@ class LedgerService {
           '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
         ]);
 
-        // صف مستقل لكل منتج داخل نفس الفاتورة
+        // صف تفصيلي للأصناف دون تكرار خانة المبلغ لمنع لبس الإجمالي
         for (final item in e.items) {
           final pName =
               (item['name'] ?? item['product_name'] ?? 'صنف').toString().trim();
           final q = item['quantity'] ?? 1;
           final u = (item['unit_label'] ?? 'حبة').toString().trim();
           final uPrice = (item['unit_price'] as num?)?.toDouble() ?? 0.0;
-          final subtotal =
-              (item['subtotal'] as num?)?.toDouble() ?? (q * uPrice);
 
           tableRows.add([
             '—',
             '',
-            '↳ صنف',
-            '$pName  [عدد: $q $u × ${uPrice.toStringAsFixed(0)} ريال]',
-            '${subtotal.toStringAsFixed(0)} ريال',
+            '↳ تفصيل',
+            '$pName [عدد: $q $u × ${uPrice.toStringAsFixed(0)} ريال]',
+            '—',
             '',
           ]);
         }

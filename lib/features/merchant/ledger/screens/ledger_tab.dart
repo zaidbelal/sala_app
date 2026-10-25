@@ -228,7 +228,7 @@ class _LedgerTabState extends State<LedgerTab> {
                                   ),
                                 ),
                                 Text(
-                                  'عدد المدينين: ${allCustomers.where((c) => c.currentBalance > 0).length} زبون',
+                                  'عدد المدينين: ${summaryData['debtors_count'] ?? allCustomers.where((c) => c.currentBalance > 0).length} زبون',
                                   style: const TextStyle(
                                       fontFamily: 'Cairo',
                                       fontSize: 11,
@@ -433,8 +433,8 @@ class _LedgerTabState extends State<LedgerTab> {
                                           ),
                                           content: Text(
                                             hasDebt
-                                                ? 'تنبيه: الزبون (${c.name}) عليه دين قدره (${c.currentBalance.toStringAsFixed(0)} ر.ي).\n\nهل تريد حذفه وشطب دينه من دفتر الديون؟'
-                                                : 'هل تريد حذف الزبون (${c.name}) من الدفتر؟',
+                                                ? 'تنبيه مالي ⚠️: الزبون (${c.name}) في ذمته دين قدره (${c.currentBalance.toStringAsFixed(0)} ر.ي).\n\nحذفه سيشطب هذا الدين ويسقطه من إجمالي ديون السوق لديك.\n\nهل أنت متأكد من الحذف؟'
+                                                : 'هل تريد حذف الزبون (${c.name}) نهائياً من الدفتر؟',
                                             style: TextStyle(
                                                 fontFamily: 'Cairo',
                                                 fontSize: 13,
@@ -455,7 +455,7 @@ class _LedgerTabState extends State<LedgerTab> {
                                                   backgroundColor: Colors.red),
                                               onPressed: () =>
                                                   Navigator.pop(dCtx, true),
-                                              child: const Text('حذف',
+                                              child: const Text('تأكيد الحذف',
                                                   style: TextStyle(
                                                       fontFamily: 'Cairo',
                                                       color: Colors.white,
@@ -466,13 +466,36 @@ class _LedgerTabState extends State<LedgerTab> {
                                         ),
                                       );
 
-                                      if (confirmed == true) {
+                                      if (confirmed == true && mounted) {
+                                        setState(() {
+                                          _remoteSearchResults
+                                              .removeWhere((r) => r.id == c.id);
+                                        });
+
                                         await LedgerService.instance
                                             .deleteCustomer(
                                           merchantId: merchantId,
                                           customerId: c.id,
                                           currentBalance: c.currentBalance,
                                         );
+
+                                        if (mounted) {
+                                          ScaffoldMessenger.of(context)
+                                              .showSnackBar(
+                                            SnackBar(
+                                              content: Text(
+                                                  'تم حذف الزبون (${c.name}) بنجاح ✅',
+                                                  style: const TextStyle(
+                                                      fontFamily: 'Cairo')),
+                                              backgroundColor:
+                                                  Colors.red.shade700,
+                                              behavior:
+                                                  SnackBarBehavior.floating,
+                                              duration:
+                                                  const Duration(seconds: 2),
+                                            ),
+                                          );
+                                        }
                                       }
                                     },
                                     onTap: () => Navigator.push(

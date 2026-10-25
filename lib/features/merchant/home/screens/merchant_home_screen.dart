@@ -186,19 +186,19 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             continue;
           } else {
             await WalService.instance.markAborted(orderId);
-            List<Map<String, dynamic>> availableProducts =
-                AppCache.instance.getProducts() ?? [];
-            if (availableProducts.isEmpty) {
-              try {
-                final snap = await FirebaseFirestore.instance
-                    .collection('products')
-                    .where('is_deleted', isEqualTo: false)
-                    .where('is_active', isEqualTo: true)
-                    .limit(500)
-                    .get(const GetOptions(source: Source.serverAndCache));
-                availableProducts =
-                    snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
-              } catch (_) {}
+            // التحقق المباشر من السيرفر لضمان عدم إعادة أصناف محذوفة إلى السلة
+            List<Map<String, dynamic>> availableProducts = [];
+            try {
+              final snap = await FirebaseFirestore.instance
+                  .collection('products')
+                  .where('is_deleted', isEqualTo: false)
+                  .where('is_active', isEqualTo: true)
+                  .limit(500)
+                  .get(const GetOptions(source: Source.server));
+              availableProducts =
+                  snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+            } catch (_) {
+              availableProducts = AppCache.instance.getProducts() ?? [];
             }
 
             final activeProductMap = {

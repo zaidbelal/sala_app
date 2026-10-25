@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 
 class AppConfig {
   AppConfig._();
-  // قيمة افتراضية يتم تحديثها ديناميكياً من Firebase Remote Config لمنع تعليق التجار الجدد
-  static double minOrderValue = 8250.0;
+  // الحد الأدنى الرسمي الموحد للطلب في المنصة
+  static double minOrderValue = 4250.0;
   static const int maxOrderItems = 50;
 }
 

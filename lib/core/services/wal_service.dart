@@ -234,7 +234,8 @@ class WalService {
           final doc = await db
               .collection('orders')
               .doc(entry.id)
-              .get(const GetOptions(source: Source.server));
+              .get(const GetOptions(source: Source.server))
+              .timeout(const Duration(seconds: 4));
           verifiedOnServer = doc.exists;
           if (verifiedOnServer) {
             final uid =
@@ -278,15 +279,29 @@ class WalService {
                       .whereType<String>()
                       .toSet()
                   : <String>{};
-              final verifiedProductIds = pending
-                  .where((e) => verifiedIds.contains(e.id))
+              final matchingEntries = pending.where((e) =>
+                  verifiedIds.contains(e.id) &&
+                  (e.payload['merchant_id']?.toString() ?? AppStorage.userId) ==
+                      uid);
+
+              final verifiedProductIds = matchingEntries
                   .expand((e) => (e.payload['items'] as List? ?? []))
                   .map((it) => (it['product_id'])?.toString())
                   .whereType<String>()
                   .toSet();
 
+              final latestTimestamp = matchingEntries.isNotEmpty
+                  ? matchingEntries
+                      .map((e) => e.timestamp)
+                      .reduce((a, b) => a.isAfter(b) ? a : b)
+                  : DateTime.now();
+
+              final fileModTime = await file.lastModified();
               final isAssociatedWithPending = cartProductIds.isNotEmpty &&
-                  cartProductIds.every((id) => verifiedProductIds.contains(id));
+                  cartProductIds
+                      .every((id) => verifiedProductIds.contains(id)) &&
+                  fileModTime.isBefore(
+                      latestTimestamp.add(const Duration(minutes: 5)));
 
               if (isAssociatedWithPending) {
                 await file.delete();

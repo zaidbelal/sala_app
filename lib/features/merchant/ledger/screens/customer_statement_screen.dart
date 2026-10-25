@@ -130,12 +130,21 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
               ),
               onTap: () async {
                 Navigator.pop(sheetCtx);
-                // 🛡️ جلب السجل مع ضمان احتساب الرصيد السابق المرحل لضمان تطابق الأرقام 100%
+                final liveCustDoc = await FirebaseFirestore.instance
+                    .collection('merchant_customers')
+                    .doc(_customer.id)
+                    .get(const GetOptions(source: Source.serverAndCache));
+                final authoritativeCustomer =
+                    (liveCustDoc.exists && liveCustDoc.data() != null)
+                        ? LedgerCustomer.fromMap(
+                            {'id': liveCustDoc.id, ...liveCustDoc.data()!})
+                        : _customer;
+
                 final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(_customer.id, limit: 1000)
+                    .watchCustomerEntries(authoritativeCustomer.id, limit: 1000)
                     .first;
                 await LedgerService.instance.shareCustomerStatementPdf(
-                  customer: _customer,
+                  customer: authoritativeCustomer,
                   storeName: widget.storeName,
                   entries: entriesSnap,
                 );
@@ -166,12 +175,21 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
               ),
               onTap: () async {
                 Navigator.pop(sheetCtx);
-                // 🔒 حماية الذاكرة: تقييد الكشف بأحدث 500 قيد محاسبي لمنع انهيار تطبيق الهاتف
+                final liveCustDoc = await FirebaseFirestore.instance
+                    .collection('merchant_customers')
+                    .doc(_customer.id)
+                    .get(const GetOptions(source: Source.serverAndCache));
+                final authoritativeCustomer =
+                    (liveCustDoc.exists && liveCustDoc.data() != null)
+                        ? LedgerCustomer.fromMap(
+                            {'id': liveCustDoc.id, ...liveCustDoc.data()!})
+                        : _customer;
+
                 final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(_customer.id, limit: 500)
+                    .watchCustomerEntries(authoritativeCustomer.id, limit: 1000)
                     .first;
                 await LedgerService.instance.printOrPreviewStatementPdf(
-                  customer: _customer,
+                  customer: authoritativeCustomer,
                   storeName: widget.storeName,
                   entries: entriesSnap,
                 );
@@ -1034,11 +1052,8 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
         transactionId: entryId,
       );
 
-      _assignedTransactionId = null; // تصفير فقط بعد التأكيد الكامل
-
       if (!mounted) return;
       Navigator.pop(context, updatedCustomer);
-
       if (updatedCustomer.phone.trim().isNotEmpty) {
         final lastCreatedEntry = LedgerEntry(
           id: entryId,

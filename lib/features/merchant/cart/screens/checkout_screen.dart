@@ -345,12 +345,10 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           'عذراً، لا يمكن أن يحتوي الطلب الواحد على أكثر من ${AppConfig.maxOrderItems} صنفاً مختلفاً. يرجى تقسيم الطلب.');
       return;
     }
-    // ── 2. التحقق الموحد من الحد الأدنى للطلب مطابقاً لخادم السحابة ──
+    // ── 2. التحقق الموحد والقطعي من الحد الأدنى للطلب (4250 ر.ي) ──
     const double serverMinOrder = 4250.0;
-    final double minOrderLimit =
-        AppConfig.minOrderValue > 0 ? AppConfig.minOrderValue : serverMinOrder;
     final total = ref.read(cartTotalProvider);
-    if (total < minOrderLimit && total < serverMinOrder) {
+    if (total < serverMinOrder) {
       _showError(
           'الحد الأدنى للطلب هو ${serverMinOrder.toStringAsFixed(0)} ر.ي');
       return;

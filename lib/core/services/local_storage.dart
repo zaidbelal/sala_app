@@ -498,8 +498,24 @@ class AppStorage {
 
       if (queue.isEmpty) {
         await _db.remove(key);
+        if (!kIsWeb && _appDocsPath != null) {
+          try {
+            final backupFile = File('$_appDocsPath/${key}_backup.json');
+            if (await backupFile.exists()) await backupFile.delete();
+          } catch (_) {}
+        }
       } else {
-        await _db.setString(key, jsonEncode(queue));
+        final json = jsonEncode(queue);
+        await _db.setString(key, json);
+        if (!kIsWeb && _appDocsPath != null) {
+          try {
+            final backupFile = File('$_appDocsPath/${key}_backup.json');
+            final nonce = DateTime.now().microsecondsSinceEpoch;
+            final tmpFile = File('$_appDocsPath/${key}_backup_$nonce.tmp');
+            await tmpFile.writeAsString(json, flush: true);
+            await tmpFile.rename(backupFile.path);
+          } catch (_) {}
+        }
       }
     } finally {
       completer.complete();

@@ -252,7 +252,9 @@ class RealtimeHub {
   StreamSubscription? _profileSub;
 
   void _startUserChannels(String userId, {required String role}) {
-    // 🔒 عدم تكرار استدعاء الأصناف والشركات هنا لأنها بدأت وتعمل بالفعل في init()
+    // إعادة تفعيل قنوات الكتالوج في حال تم إلغاؤها عند تسجيل خروج سابق
+    if (_categoriesSub == null) _watchCategories();
+    if (_brandsSub == null) _watchBrands();
 
     _profileSub?.cancel();
     if (_profileSub != null) {
@@ -282,6 +284,10 @@ class RealtimeHub {
             container.invalidate(cartProvider);
             container.invalidate(realtimeNotifsProvider);
             container.invalidate(merchantOrdersProvider);
+            container.invalidate(realtimeConfirmedOrdersProvider);
+            container.invalidate(realtimeMyShippedOrdersProvider);
+            container.invalidate(realtimeAllOrdersProvider);
+            container.invalidate(driverNewOrderCallbackProvider);
           } catch (_) {}
         }
         try {

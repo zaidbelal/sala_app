@@ -22,6 +22,9 @@ class LedgerService {
   final _db = FirebaseFirestore.instance;
   final _functions = FirebaseFunctions.instanceFor(region: 'us-central1');
 
+  // 🔒 مصفوفة ذاكرة لحجب الزبائن المحذوفين فورياً في 0ms ومنع ظهورهم نهائياً
+  final Set<String> _locallyDeletedCustomerIds = {};
+
   // ─── مراقبة ملخص ديون التاجر الإجمالية في السوق لحظياً ───
   Stream<Map<String, dynamic>> watchMerchantLedgerSummary(String merchantId) {
     final cleanMerchantId = merchantId.trim();
@@ -161,7 +164,7 @@ class LedgerService {
   }
 
   Stream<List<LedgerCustomer>> watchCustomers(String merchantId,
-      {int limit = 200}) {
+      {int limit = 1000}) {
     final cleanMerchantId = merchantId.trim();
     if (cleanMerchantId.isEmpty) return const Stream.empty();
 
@@ -173,28 +176,48 @@ class LedgerService {
         .asyncMap((snap) async {
       final serverMap = <String, LedgerCustomer>{};
       final serverDocRaws = <String, Map<String, dynamic>>{};
+      final deletedCustomerIds = <String>{};
+
+      // 1. التقاط الحركات المحذوفة في طابور الأوفلاين لاستبعادها فوراً
+      final allPending = AppStorage.getPendingLedgerTxs(cleanMerchantId);
+      final pendingDeletes = allPending
+          .where((t) => t['type'] == 'delete_customer')
+          .map((t) => t['customer_id']?.toString() ?? '')
+          .toSet();
 
       for (final d in snap.docs) {
-        if (d.data()['is_deleted'] == true) continue;
-        serverMap[d.id] = LedgerCustomer.fromMap({'id': d.id, ...d.data()});
-        serverDocRaws[d.id] = d.data();
+        final custId = d.id;
+        // إذا كان محذوفاً في السيرفر أو محلياً بالذاكرة أو في طابور الحذف يتم حذفه فوراً
+        if (d.data()['is_deleted'] == true ||
+            _locallyDeletedCustomerIds.contains(custId) ||
+            pendingDeletes.contains(custId)) {
+          deletedCustomerIds.add(custId);
+          continue;
+        }
+        serverMap[custId] = LedgerCustomer.fromMap({'id': custId, ...d.data()});
+        serverDocRaws[custId] = d.data();
       }
 
-      // 🛡️ دمج الكاش المحلي التراكمي لمنع محو الزبائن خارج الـ limit(200)
+      // 🛡️ دمج الكاش المحلي مع استبعاد أي زبون محذوف نهائياً لمنع انبعاثه
       final existingLocalCached = await getCachedCustomers(cleanMerchantId);
       for (final cached in existingLocalCached) {
+        if (deletedCustomerIds.contains(cached.id) ||
+            _locallyDeletedCustomerIds.contains(cached.id) ||
+            pendingDeletes.contains(cached.id)) continue;
         if (!serverMap.containsKey(cached.id)) {
           serverMap[cached.id] = cached;
         }
       }
 
-      final allPending = AppStorage.getPendingLedgerTxs(cleanMerchantId);
       final pendingNewCustomers =
           allPending.where((t) => t['type'] == 'add_customer');
 
       for (final p in pendingNewCustomers) {
         final custId = p['customer_id']?.toString() ?? '';
-        if (custId.isNotEmpty && !serverMap.containsKey(custId)) {
+        if (custId.isNotEmpty &&
+            !serverMap.containsKey(custId) &&
+            !_locallyDeletedCustomerIds.contains(custId) &&
+            !pendingDeletes.contains(custId)) {
           serverMap[custId] = LedgerCustomer(
             id: custId,
             merchantId: cleanMerchantId,
@@ -227,7 +250,6 @@ class LedgerService {
         final unappliedPending = pendingTxs.where((tx) {
           if (tx['customer_id'] != c.id) return false;
           final txId = tx['id']?.toString() ?? '';
-          // 🔒 مطابقة قطعية: لا تعيد إضافة القيد إذا كان مسجلاً مسبقاً في الوثيقة
           return !appliedIds.contains(txId);
         });
 
@@ -418,7 +440,7 @@ class LedgerService {
     }
   }
 
-  // ─── حذف زبون من الدفتر سحابياً ومحلياً مع دعم الأوفلاين ───
+// ─── حذف زبون من الدفتر سحابياً ومحلياً مع ضمان الاختفاء الفوري (0ms) ───
   Future<void> deleteCustomer({
     required String merchantId,
     required String customerId,
@@ -428,12 +450,23 @@ class LedgerService {
     final cleanCustomerId = customerId.trim();
     if (cleanCustomerId.isEmpty || cleanMerchantId.isEmpty) return;
 
-    // 1. الحذف الفوري من كاش الهاتف
+    // 1. الإخفاء الفوري اللحظي من شاشة المستخدم وقوائم التطبيق (0ms)
+    _locallyDeletedCustomerIds.add(cleanCustomerId);
+
+    // 2. الحذف الفوري من كاش القرص الصلب بالهاتف
     final cached = await getCachedCustomers(cleanMerchantId);
     cached.removeWhere((c) => c.id == cleanCustomerId);
     await _cacheCustomersLocally(cleanMerchantId, cached);
 
-    // 2. إرسال أمر الحذف للسيرفر أو حفظه أوفلاين
+    // 3. تحديث مباشر وفوري في Firestore لوثيقة الزبون لتختفي من تدفقات البيانات فوراً
+    try {
+      await _db.collection('merchant_customers').doc(cleanCustomerId).update({
+        'is_deleted': true,
+        'updated_at': FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+
+    // 4. استدعاء السيرفر لتسوية ديون السوق أو حفظها في طابور الأوفلاين
     final hasInternet = await ConnectivityHelper.hasActiveInternet();
     if (!hasInternet) {
       await AppStorage.savePendingLedgerTx({
@@ -603,9 +636,13 @@ class LedgerService {
             final dir = await getApplicationDocumentsDirectory();
             final durableFile =
                 File('${dir.path}/ledger_durable_journal_$cleanMerchantId.db');
-            final line = '${jsonEncode(payload)}\n';
-            await durableFile.writeAsString(line,
-                mode: FileMode.append, flush: true);
+            final alreadyLogged = await durableFile.exists() &&
+                (await durableFile.readAsString()).contains('"id":"$entryId"');
+            if (!alreadyLogged) {
+              final line = '${jsonEncode(payload)}\n';
+              await durableFile.writeAsString(line,
+                  mode: FileMode.append, flush: true);
+            }
           } catch (_) {}
         }
         throw TimeoutException(
@@ -628,7 +665,7 @@ class LedgerService {
     final cleanCustomerId = customerId.trim();
     final cleanEntryId = entryId.trim();
 
-    // 1. فحص طابور الأوفلاين أولاً
+    // 1. فحص طابور الأوفلاين وتأمينه ضد انبعاث الدين
     final pendingQueue = AppStorage.getPendingLedgerTxs(cleanMerchantId);
     final pendingIdx = pendingQueue.indexWhere((t) => t['id'] == cleanEntryId);
     if (pendingIdx != -1) {
@@ -638,6 +675,17 @@ class LedgerService {
       final reverseDelta = isDebt ? -amt : amt;
 
       await AppStorage.removePendingLedgerTx(cleanEntryId, cleanMerchantId);
+
+      // تأمين مالي: جدولة طلب شطب في السيرفر تحسباً لوصول المعاملة إليه قبل انقطاع الشبكة
+      await AppStorage.savePendingLedgerTx({
+        'id': 'void_$cleanEntryId',
+        'merchant_id': cleanMerchantId,
+        'customer_id': cleanCustomerId,
+        'type': 'void_request',
+        'target_entry_id': cleanEntryId,
+        'amount': amt,
+        'is_debt': isDebt,
+      });
 
       if (!kIsWeb) {
         try {
@@ -809,6 +857,21 @@ class LedgerService {
       if (id.isNotEmpty) unifiedQueue[id] = item;
     }
 
+    // ترتيب المعاملات زمنياً لضمان معالجة الإضافة والسداد قبل أوامر الحذف
+    final sortedQueueList = unifiedQueue.values.toList()
+      ..sort((a, b) {
+        final typeOrder = (String t) => switch (t) {
+              'add_customer' => 0,
+              'debt' => 1,
+              'payment' => 2,
+              'void_request' => 3,
+              'delete_customer' => 4,
+              _ => 5,
+            };
+        return typeOrder(a['type']?.toString() ?? '')
+            .compareTo(typeOrder(b['type']?.toString() ?? ''));
+      });
+
     // 2. دمج أي قيود مسجلة في ملف القرص الصلب الدائم لمنع فقدانها
     File? durableFile;
     if (!kIsWeb) {
@@ -839,7 +902,7 @@ class LedgerService {
     int synced = 0;
     final List<String> successfullySyncedIds = [];
 
-    for (final item in unifiedQueue.values) {
+    for (final item in sortedQueueList) {
       final txId = item['id']?.toString() ?? '';
       final custId = item['customer_id']?.toString() ?? '';
       final type = item['type']?.toString() ?? '';
@@ -971,6 +1034,7 @@ class LedgerService {
 // 🛡️ استعلام مؤمن وفوري بدون اشتراط فهارس مركبة معقدة
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
+        .where('merchant_id', isEqualTo: currentMerchantId.trim())
         .where('customer_id', isEqualTo: cleanCustomerId)
         .orderBy('created_at', descending: true)
         .limit(limit);
@@ -1267,22 +1331,20 @@ class LedgerService {
           '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
         ]);
 
-        // صف مستقل لكل منتج داخل نفس الفاتورة
+        // صف تفصيلي للأصناف دون تكرار خانة المبلغ لمنع لبس الإجمالي
         for (final item in e.items) {
           final pName =
               (item['name'] ?? item['product_name'] ?? 'صنف').toString().trim();
           final q = item['quantity'] ?? 1;
           final u = (item['unit_label'] ?? 'حبة').toString().trim();
           final uPrice = (item['unit_price'] as num?)?.toDouble() ?? 0.0;
-          final subtotal =
-              (item['subtotal'] as num?)?.toDouble() ?? (q * uPrice);
 
           tableRows.add([
             '—',
             '',
-            '↳ صنف',
-            '$pName  [عدد: $q $u × ${uPrice.toStringAsFixed(0)} ريال]',
-            '${subtotal.toStringAsFixed(0)} ريال',
+            '↳ تفصيل',
+            '$pName [عدد: $q $u × ${uPrice.toStringAsFixed(0)} ريال]',
+            '—',
             '',
           ]);
         }

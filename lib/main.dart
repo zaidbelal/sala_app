@@ -142,15 +142,17 @@ void main() async {
     debugPrint('❌ AppStorage Error: $e');
   }
 
-  // 5. تهيئة الكاش وسجل العمليات
+// 5. تهيئة الكاش وسجل العمليات ومطابقة السلة قبل بدء الـ ProviderContainer
   try {
     await AppCache.instance.init();
     await WalService.instance.init();
-    unawaited(WalService.instance.reconcilePendingEntries());
+    await WalService.instance.reconcilePendingEntries().timeout(
+          const Duration(milliseconds: 1200),
+          onTimeout: () => null,
+        );
   } catch (e) {
-    debugPrint('❌ Cache Error: $e');
+    debugPrint('❌ Cache/WAL Initialization Warning: $e');
   }
-
   if (isFirebaseReady) {
     FirebaseService.initialize();
     unawaited(DeltaSyncService.instance.syncProductsDelta());
@@ -234,7 +236,7 @@ Future<void> _initializeRemoteConfig() async {
         minimumFetchInterval: const Duration(hours: 1),
       ),
     );
-    await remoteConfig.setDefaults({'min_order_value': 8250.0});
+    await remoteConfig.setDefaults({'min_order_value': 4250.0});
     await remoteConfig.fetchAndActivate();
     final double fetchedMinOrder = remoteConfig.getDouble('min_order_value');
     if (fetchedMinOrder > 0) {

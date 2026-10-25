@@ -21,7 +21,7 @@ class CartScreen extends ConsumerStatefulWidget {
 }
 
 class _CartScreenState extends ConsumerState<CartScreen> {
-  double get _minOrder => AppConfig.minOrderValue;
+  double get _minOrder => 4250.0;
   @override
   void initState() {
     super.initState();
