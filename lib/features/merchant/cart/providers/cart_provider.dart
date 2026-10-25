@@ -112,7 +112,6 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
       try {
         final uid = AppStorage.userId ?? 'guest';
         if (AppStorage.isLoggedIn && AppStorage.userId != null) {
-          final dir = Directory.systemTemp; // fallback سريع إن تعذر الـ async
           final dataMap = state.map((k, v) => MapEntry(k, v.toJson()));
           final jsonString = jsonEncode(dataMap);
           AppStorage.setString('sala_cart_backup_$uid', jsonString);
