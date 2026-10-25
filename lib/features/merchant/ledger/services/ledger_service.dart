@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -226,7 +227,7 @@ class LedgerService {
         final unappliedPending = pendingTxs.where((tx) {
           if (tx['customer_id'] != c.id) return false;
           final txId = tx['id']?.toString() ?? '';
-          if (isOfflineSnapshot) return true;
+          // 🔒 مطابقة قطعية: لا تعيد إضافة القيد إذا كان مسجلاً مسبقاً في الوثيقة
           return !appliedIds.contains(txId);
         });
 
@@ -737,18 +738,24 @@ class LedgerService {
     } catch (_) {}
   }
 
-  // ─── مزامنة طابور الأوفلاين مع السيرفر ───
+// ─── مزامنة طابور الأوفلاين مع السيرفر بدقة موحدة وبدون فقدان للملف الدائم ───
   Future<int> syncPendingLedgerQueue(String merchantId) async {
-    var queue = AppStorage.getPendingLedgerTxs(merchantId);
+    final Map<String, Map<String, dynamic>> unifiedQueue = {};
 
-    if (queue.isEmpty && !kIsWeb) {
+    // 1. قراءة الطابور المخزن محلياً في SharedPreferences أولاً
+    for (final item in AppStorage.getPendingLedgerTxs(merchantId)) {
+      final id = item['id']?.toString() ?? '';
+      if (id.isNotEmpty) unifiedQueue[id] = item;
+    }
+
+    // 2. دمج أي قيود مسجلة في ملف القرص الصلب الدائم لمنع فقدانها
+    File? durableFile;
+    if (!kIsWeb) {
       try {
         final dir = await getApplicationDocumentsDirectory();
-        final durableFile =
-            File('${dir.path}/ledger_durable_journal_$merchantId.db');
+        durableFile = File('${dir.path}/ledger_durable_journal_$merchantId.db');
         if (await durableFile.exists()) {
           final lines = await durableFile.readAsLines();
-          final Map<String, Map<String, dynamic>> validEntriesMap = {};
           for (final line in lines) {
             if (line.trim().isEmpty) continue;
             try {
@@ -756,21 +763,22 @@ class LedgerService {
               final id = item['id']?.toString() ?? '';
               if (id.isEmpty) continue;
               if (item['action'] == 'void_local' || item['is_voided'] == true) {
-                validEntriesMap.remove(id);
-              } else {
-                validEntriesMap[id] = item;
+                unifiedQueue.remove(id);
+              } else if (!unifiedQueue.containsKey(id)) {
+                unifiedQueue[id] = item;
               }
             } catch (_) {}
           }
-          queue = validEntriesMap.values.toList();
         }
       } catch (_) {}
     }
 
-    if (queue.isEmpty) return 0;
+    if (unifiedQueue.isEmpty) return 0;
 
     int synced = 0;
-    for (final item in queue) {
+    final List<String> successfullySyncedIds = [];
+
+    for (final item in unifiedQueue.values) {
       final txId = item['id']?.toString() ?? '';
       final custId = item['customer_id']?.toString() ?? '';
       final type = item['type']?.toString() ?? '';
@@ -787,6 +795,7 @@ class LedgerService {
             existingCustomerId: custId,
           );
           await AppStorage.removePendingLedgerTx(txId, merchantId);
+          successfullySyncedIds.add(txId);
           synced++;
           continue;
         }
@@ -797,9 +806,12 @@ class LedgerService {
               merchantId: merchantId,
               customerId: custId,
               entryId: targetEntryId,
+              knownAmount: (item['amount'] as num?)?.toDouble(),
+              knownIsDebt: item['is_debt'] != false,
             );
           }
           await AppStorage.removePendingLedgerTx(txId, merchantId);
+          successfullySyncedIds.add(txId);
           synced++;
           continue;
         }
@@ -814,6 +826,7 @@ class LedgerService {
           transactionId: txId,
         );
         await AppStorage.removePendingLedgerTx(txId, merchantId);
+        successfullySyncedIds.add(txId);
         synced++;
       } catch (e) {
         final errStr = e.toString().toLowerCase();
@@ -822,23 +835,31 @@ class LedgerService {
             errStr.contains('unavailable') ||
             errStr.contains('socket');
 
-        if (!isTransient) {
+        // لا نحذف طلبات الشطب أبداً عند خطأ not-found لأن وثيقة الزبون قد تكون في طريقها للإنشاء
+        final isVoidNotFound =
+            type == 'void_request' && errStr.contains('not-found');
+        if (!isTransient && !isVoidNotFound) {
           if (kDebugMode) debugPrint('⚠️ تم تنظيف قيد غير صالح: $txId');
           await AppStorage.removePendingLedgerTx(txId, merchantId);
+          successfullySyncedIds.add(txId);
         }
       }
     }
 
-    if (!kIsWeb) {
+    // 3. إعادة كتابة ملف القرص الدائم بالحركات المتبقية فقط دون حذفه عشوائياً
+    if (!kIsWeb && durableFile != null && successfullySyncedIds.isNotEmpty) {
       try {
-        final remainingQueue = AppStorage.getPendingLedgerTxs(merchantId);
-        if (remainingQueue.isEmpty) {
-          final dir = await getApplicationDocumentsDirectory();
-          final durableFile =
-              File('${dir.path}/ledger_durable_journal_$merchantId.db');
-          if (await durableFile.exists()) {
-            await durableFile.delete();
+        final syncedSet = successfullySyncedIds.toSet();
+        unifiedQueue.removeWhere((id, _) => syncedSet.contains(id));
+        if (unifiedQueue.isEmpty) {
+          if (await durableFile.exists()) await durableFile.delete();
+        } else {
+          final sink = durableFile.openWrite(mode: FileMode.write);
+          for (final remaining in unifiedQueue.values) {
+            sink.writeln(jsonEncode(remaining));
           }
+          await sink.flush();
+          await sink.close();
         }
       } catch (_) {}
     }
@@ -859,8 +880,8 @@ class LedgerService {
         .collection('merchant_ledger_entries')
         .where('customer_id', isEqualTo: cleanCustomerId)
         .where('is_voided', isEqualTo: false)
-        .limit(limit * 2);
-
+        .orderBy('created_at', descending: true)
+        .limit(limit);
     return query.snapshots(includeMetadataChanges: true).map((snap) {
       final list = snap.docs
           .where((d) => d.data()['merchant_id'] == currentMerchantId.trim())
@@ -1018,10 +1039,31 @@ class LedgerService {
     required String storeName,
     required List<LedgerEntry> entries,
   }) async {
+    // جلب بايتات الخط من الكاش أو الأصول في الـ Main Isolate مسبقاً لضمان عدم اعتماده على الإنترنت
+    Uint8List? regularFontBytes;
+    Uint8List? boldFontBytes;
+    try {
+      final fontData = await rootBundle.load('assets/fonts/Cairo-Regular.ttf');
+      regularFontBytes = fontData.buffer
+          .asUint8List(fontData.offsetInBytes, fontData.lengthInBytes);
+      final boldData = await rootBundle.load('assets/fonts/Cairo-Bold.ttf');
+      boldFontBytes = boldData.buffer
+          .asUint8List(boldData.offsetInBytes, boldData.lengthInBytes);
+    } catch (_) {
+      try {
+        final f1 = await PdfGoogleFonts.cairoRegular();
+        final f2 = await PdfGoogleFonts.cairoBold();
+        regularFontBytes = (f1 as dynamic).data as Uint8List?;
+        boldFontBytes = (f2 as dynamic).data as Uint8List?;
+      } catch (_) {}
+    }
+
     return await compute(_generatePdfIsolate, {
       'customer': customer.toMap(),
       'storeName': storeName,
       'entries': entries.map((e) => e.toMap()).toList(),
+      'fontRegular': regularFontBytes,
+      'fontBold': boldFontBytes,
     });
   }
 
@@ -1034,20 +1076,16 @@ class LedgerService {
         .map((e) => LedgerEntry.fromMap(e as Map<String, dynamic>))
         .toList();
 
-    pw.Font regularFont;
-    pw.Font boldFont;
-    try {
-      regularFont = await PdfGoogleFonts.cairoRegular();
-      boldFont = await PdfGoogleFonts.cairoBold();
-    } catch (_) {
-      try {
-        regularFont = await PdfGoogleFonts.amiriRegular();
-        boldFont = await PdfGoogleFonts.amiriBold();
-      } catch (e) {
-        regularFont = pw.Font.courier();
-        boldFont = pw.Font.courierBold();
-      }
+    final Uint8List? fontRegularBytes = args['fontRegular'] as Uint8List?;
+    final Uint8List? fontBoldBytes = args['fontBold'] as Uint8List?;
+
+    if (fontRegularBytes == null || fontBoldBytes == null) {
+      throw StateError(
+          'خط القاهرة المعتمد غير محمل محلياً، تأكد من وجود ملفات الخط في assets/fonts');
     }
+    final pw.Font regularFont =
+        pw.Font.ttf(fontRegularBytes.buffer.asByteData());
+    final pw.Font boldFont = pw.Font.ttf(fontBoldBytes.buffer.asByteData());
 
     final pdf = pw.Document();
     final now = DateTime.now();

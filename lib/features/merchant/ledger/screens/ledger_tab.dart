@@ -20,7 +20,7 @@ class _LedgerTabState extends State<LedgerTab> {
   final _searchCtrl = TextEditingController();
   String _searchQuery = '';
   int _selectedFilter = 0; // 0: الكل، 1: عليهم ديون فقط، 2: تجاوزوا السقف
-
+  final List<LedgerCustomer> _remoteSearchResults = [];
   @override
   void dispose() {
     _searchCtrl.dispose();
@@ -100,7 +100,12 @@ class _LedgerTabState extends State<LedgerTab> {
                       child:
                           CircularProgressIndicator(color: AppColors.primary));
                 }
-                final allCustomers = snapshot.data ?? [];
+                final streamCustomers = snapshot.data ?? [];
+                final Map<String, LedgerCustomer> unifiedMap = {
+                  for (final c in streamCustomers) c.id: c,
+                  for (final c in _remoteSearchResults) c.id: c,
+                };
+                final allCustomers = unifiedMap.values.toList();
                 String normalize(String text) {
                   return text
                       .replaceAll(RegExp(r'[\u064B-\u065F\u0670]'), '')
@@ -369,10 +374,12 @@ class _LedgerTabState extends State<LedgerTab> {
                                         if (context.mounted &&
                                             results.isNotEmpty) {
                                           setState(() {
-                                            allCustomers.addAll(
-                                              results.where((r) => !allCustomers
-                                                  .any((ex) => ex.id == r.id)),
-                                            );
+                                            for (final r in results) {
+                                              if (!_remoteSearchResults
+                                                  .any((ex) => ex.id == r.id)) {
+                                                _remoteSearchResults.add(r);
+                                              }
+                                            }
                                           });
                                         }
                                       },
@@ -1448,630 +1455,652 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      height: MediaQuery.of(context).size.height * 0.9,
-      decoration: BoxDecoration(
-        color: context.bgCard,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-      ),
-      child: Column(
-        children: [
-          Container(
-            width: 44,
-            height: 4,
-            margin: const EdgeInsets.only(top: 12),
-            decoration: BoxDecoration(
-                color: Colors.grey.shade300,
-                borderRadius: BorderRadius.circular(2)),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+    return PopScope(
+      canPop: !_isSaving,
+      child: Container(
+        height: MediaQuery.of(context).size.height * 0.9,
+        decoration: BoxDecoration(
+          color: context.bgCard,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+        ),
+        child: Column(
+          children: [
+            Container(
+              width: 44,
+              height: 4,
+              margin: const EdgeInsets.only(top: 12),
               decoration: BoxDecoration(
-                color: context.bgInput,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: context.borderColor),
-              ),
-              child: Row(
-                children: [
-                  CircleAvatar(
-                    backgroundColor: AppColors.primary.withValues(alpha: 0.12),
-                    child: Text(
-                      _selectedCustomer.name.isNotEmpty
-                          ? _selectedCustomer.name[0]
-                          : 'ز',
-                      style: const TextStyle(
-                          fontFamily: 'Cairo',
-                          fontWeight: FontWeight.bold,
-                          color: AppColors.primary),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _selectedCustomer.name,
-                          style: TextStyle(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2)),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: context.bgInput,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: context.borderColor),
+                ),
+                child: Row(
+                  children: [
+                    CircleAvatar(
+                      backgroundColor:
+                          AppColors.primary.withValues(alpha: 0.12),
+                      child: Text(
+                        _selectedCustomer.name.isNotEmpty
+                            ? _selectedCustomer.name[0]
+                            : 'ز',
+                        style: const TextStyle(
                             fontFamily: 'Cairo',
-                            fontSize: 14,
-                            fontWeight: FontWeight.w800,
-                            color: context.textPrimary,
-                          ),
-                        ),
-                        Text(
-                          'الدين السابق: ${_selectedCustomer.currentBalance.toStringAsFixed(0)} ر.ي',
-                          style: const TextStyle(
-                              fontFamily: 'Cairo',
-                              fontSize: 11,
-                              color: Colors.red),
-                        ),
-                      ],
+                            fontWeight: FontWeight.bold,
+                            color: AppColors.primary),
+                      ),
                     ),
-                  ),
-                  TextButton.icon(
-                    onPressed: () async {
-                      final selected =
-                          await showModalBottomSheet<LedgerCustomer>(
-                        context: context,
-                        isScrollControlled: true,
-                        useRootNavigator: true,
-                        backgroundColor: Colors.transparent,
-                        builder: (sCtx) {
-                          final searchCtrl = TextEditingController();
-                          return StatefulBuilder(
-                            builder: (sheetCtx, setSheetSt) {
-                              final q = searchCtrl.text.trim().toLowerCase();
-                              final sheetList = q.isEmpty
-                                  ? widget.customers
-                                  : widget.customers
-                                      .where((c) =>
-                                          c.name.toLowerCase().contains(q) ||
-                                          c.phone.contains(q))
-                                      .toList();
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _selectedCustomer.name,
+                            style: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 14,
+                              fontWeight: FontWeight.w800,
+                              color: context.textPrimary,
+                            ),
+                          ),
+                          Text(
+                            'الدين السابق: ${_selectedCustomer.currentBalance.toStringAsFixed(0)} ر.ي',
+                            style: const TextStyle(
+                                fontFamily: 'Cairo',
+                                fontSize: 11,
+                                color: Colors.red),
+                          ),
+                        ],
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: () async {
+                        final selected =
+                            await showModalBottomSheet<LedgerCustomer>(
+                          context: context,
+                          isScrollControlled: true,
+                          useRootNavigator: true,
+                          backgroundColor: Colors.transparent,
+                          builder: (sCtx) {
+                            final searchCtrl = TextEditingController();
+                            return StatefulBuilder(
+                              builder: (sheetCtx, setSheetSt) {
+                                final q = searchCtrl.text.trim().toLowerCase();
+                                final sheetList = q.isEmpty
+                                    ? widget.customers
+                                    : widget.customers
+                                        .where((c) =>
+                                            c.name.toLowerCase().contains(q) ||
+                                            c.phone.contains(q))
+                                        .toList();
 
-                              return Container(
-                                height:
-                                    MediaQuery.of(sheetCtx).size.height * 0.75,
-                                padding: EdgeInsets.fromLTRB(
-                                    16,
-                                    16,
-                                    16,
-                                    MediaQuery.of(sheetCtx).viewInsets.bottom +
-                                        16),
-                                decoration: BoxDecoration(
-                                  color: sheetCtx.bgCard,
-                                  borderRadius: const BorderRadius.vertical(
-                                      top: Radius.circular(24)),
-                                ),
-                                child: Column(
-                                  children: [
-                                    Container(
-                                      width: 40,
-                                      height: 4,
-                                      decoration: BoxDecoration(
-                                          color: Colors.grey.shade300,
-                                          borderRadius:
-                                              BorderRadius.circular(2)),
-                                    ),
-                                    const SizedBox(height: 14),
-                                    TextField(
-                                      controller: searchCtrl,
-                                      autofocus: true,
-                                      style: TextStyle(
-                                          fontFamily: 'Cairo',
-                                          color: sheetCtx.textPrimary),
-                                      onChanged: (text) async {
-                                        setSheetSt(() {});
-                                        if (text.trim().isNotEmpty &&
-                                            sheetList.isEmpty) {
-                                          final remoteResults =
-                                              await LedgerService.instance
-                                                  .searchCustomersRemotely(
-                                            merchantId: AppStorage.userId ?? '',
-                                            query: text.trim(),
-                                          );
-                                          if (remoteResults.isNotEmpty) {
-                                            setSheetSt(() {
-                                              for (final r in remoteResults) {
-                                                if (!widget.customers
-                                                    .any((c) => c.id == r.id)) {
-                                                  widget.customers.add(r);
-                                                }
-                                              }
-                                            });
-                                          }
-                                        }
-                                      },
-                                      decoration: InputDecoration(
-                                        hintText:
-                                            'ابحث عن اسم الزبون لتحديده (محلياً وسحابياً)...',
-                                        hintStyle: TextStyle(
-                                            fontFamily: 'Cairo',
-                                            color: sheetCtx.textHint),
-                                        prefixIcon:
-                                            const Icon(Icons.search_rounded),
-                                        filled: true,
-                                        fillColor: sheetCtx.bgInput,
-                                        border: OutlineInputBorder(
+                                return Container(
+                                  height: MediaQuery.of(sheetCtx).size.height *
+                                      0.75,
+                                  padding: EdgeInsets.fromLTRB(
+                                      16,
+                                      16,
+                                      16,
+                                      MediaQuery.of(sheetCtx)
+                                              .viewInsets
+                                              .bottom +
+                                          16),
+                                  decoration: BoxDecoration(
+                                    color: sheetCtx.bgCard,
+                                    borderRadius: const BorderRadius.vertical(
+                                        top: Radius.circular(24)),
+                                  ),
+                                  child: Column(
+                                    children: [
+                                      Container(
+                                        width: 40,
+                                        height: 4,
+                                        decoration: BoxDecoration(
+                                            color: Colors.grey.shade300,
                                             borderRadius:
-                                                BorderRadius.circular(14),
-                                            borderSide: BorderSide.none),
-                                        contentPadding:
-                                            const EdgeInsets.symmetric(
-                                                vertical: 10),
+                                                BorderRadius.circular(2)),
                                       ),
-                                    ),
-                                    const SizedBox(height: 10),
-                                    Expanded(
-                                      child: ListView.builder(
-                                        itemCount: sheetList.length,
-                                        itemBuilder: (_, i) {
-                                          final item = sheetList[i];
-                                          return ListTile(
-                                            leading: CircleAvatar(
-                                              backgroundColor: AppColors.primary
-                                                  .withValues(alpha: 0.1),
-                                              child: Text(
-                                                  item.name.isNotEmpty
-                                                      ? item.name[0]
-                                                      : 'ز',
-                                                  style: const TextStyle(
-                                                      color: AppColors.primary,
+                                      const SizedBox(height: 14),
+                                      TextField(
+                                        controller: searchCtrl,
+                                        autofocus: true,
+                                        style: TextStyle(
+                                            fontFamily: 'Cairo',
+                                            color: sheetCtx.textPrimary),
+                                        onChanged: (text) async {
+                                          setSheetSt(() {});
+                                          if (text.trim().isNotEmpty &&
+                                              sheetList.isEmpty) {
+                                            final remoteResults =
+                                                await LedgerService.instance
+                                                    .searchCustomersRemotely(
+                                              merchantId:
+                                                  AppStorage.userId ?? '',
+                                              query: text.trim(),
+                                            );
+                                            if (remoteResults.isNotEmpty) {
+                                              setSheetSt(() {
+                                                for (final r in remoteResults) {
+                                                  if (!widget.customers.any(
+                                                      (c) => c.id == r.id)) {
+                                                    widget.customers.add(r);
+                                                  }
+                                                }
+                                              });
+                                            }
+                                          }
+                                        },
+                                        decoration: InputDecoration(
+                                          hintText:
+                                              'ابحث عن اسم الزبون لتحديده (محلياً وسحابياً)...',
+                                          hintStyle: TextStyle(
+                                              fontFamily: 'Cairo',
+                                              color: sheetCtx.textHint),
+                                          prefixIcon:
+                                              const Icon(Icons.search_rounded),
+                                          filled: true,
+                                          fillColor: sheetCtx.bgInput,
+                                          border: OutlineInputBorder(
+                                              borderRadius:
+                                                  BorderRadius.circular(14),
+                                              borderSide: BorderSide.none),
+                                          contentPadding:
+                                              const EdgeInsets.symmetric(
+                                                  vertical: 10),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 10),
+                                      Expanded(
+                                        child: ListView.builder(
+                                          itemCount: sheetList.length,
+                                          itemBuilder: (_, i) {
+                                            final item = sheetList[i];
+                                            return ListTile(
+                                              leading: CircleAvatar(
+                                                backgroundColor: AppColors
+                                                    .primary
+                                                    .withValues(alpha: 0.1),
+                                                child: Text(
+                                                    item.name.isNotEmpty
+                                                        ? item.name[0]
+                                                        : 'ز',
+                                                    style: const TextStyle(
+                                                        color:
+                                                            AppColors.primary,
+                                                        fontWeight:
+                                                            FontWeight.bold)),
+                                              ),
+                                              title: Text(item.name,
+                                                  style: TextStyle(
+                                                      fontFamily: 'Cairo',
+                                                      color:
+                                                          sheetCtx.textPrimary,
                                                       fontWeight:
                                                           FontWeight.bold)),
-                                            ),
-                                            title: Text(item.name,
-                                                style: TextStyle(
-                                                    fontFamily: 'Cairo',
-                                                    color: sheetCtx.textPrimary,
-                                                    fontWeight:
-                                                        FontWeight.bold)),
-                                            subtitle: Text(item.phone,
-                                                style: TextStyle(
-                                                    fontFamily: 'Cairo',
-                                                    color:
-                                                        sheetCtx.textSecondary,
-                                                    fontSize: 11)),
-                                            trailing: Text(
-                                                '${item.currentBalance.toStringAsFixed(0)} ر.ي',
-                                                style: const TextStyle(
-                                                    fontFamily: 'Cairo',
-                                                    fontWeight: FontWeight.w800,
-                                                    color: Colors.red)),
-                                            onTap: () {
-                                              FocusScope.of(sheetCtx).unfocus();
-                                              Navigator.pop(sCtx, item);
-                                            },
-                                          );
-                                        },
+                                              subtitle: Text(item.phone,
+                                                  style: TextStyle(
+                                                      fontFamily: 'Cairo',
+                                                      color: sheetCtx
+                                                          .textSecondary,
+                                                      fontSize: 11)),
+                                              trailing: Text(
+                                                  '${item.currentBalance.toStringAsFixed(0)} ر.ي',
+                                                  style: const TextStyle(
+                                                      fontFamily: 'Cairo',
+                                                      fontWeight:
+                                                          FontWeight.w800,
+                                                      color: Colors.red)),
+                                              onTap: () {
+                                                FocusScope.of(sheetCtx)
+                                                    .unfocus();
+                                                Navigator.pop(sCtx, item);
+                                              },
+                                            );
+                                          },
+                                        ),
                                       ),
-                                    ),
-                                  ],
-                                ),
-                              );
-                            },
-                          );
-                        },
-                      );
-                      if (selected != null && mounted) {
-                        setState(() => _selectedCustomer = selected);
-                      }
-                    },
-                    icon: const Icon(Icons.swap_horiz_rounded, size: 16),
-                    label: const Text('تغيير الزبون',
-                        style: TextStyle(
-                            fontFamily: 'Cairo',
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold)),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            child: SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppColors.primary,
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14)),
-                ),
-                onPressed: _scanItem,
-                icon: const Icon(Icons.qr_code_scanner_rounded, size: 22),
-                label: const Text(
-                  'مسح باركود سلعة جديدة [📷]',
-                  style: TextStyle(
-                      fontFamily: 'Cairo',
-                      fontSize: 14,
-                      fontWeight: FontWeight.w800),
-                ),
-              ),
-            ),
-          ),
-          Expanded(
-            child: _items.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.shopping_cart_outlined,
-                            size: 50, color: context.iconSecondary),
-                        const SizedBox(height: 10),
-                        Text(
-                          'الفاتورة فارغة حالياً.\nامسح باركود أول سلعة للبدء بالبيع.',
-                          textAlign: TextAlign.center,
+                                    ],
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                        );
+                        if (selected != null && mounted) {
+                          setState(() => _selectedCustomer = selected);
+                        }
+                      },
+                      icon: const Icon(Icons.swap_horiz_rounded, size: 16),
+                      label: const Text('تغيير الزبون',
                           style: TextStyle(
                               fontFamily: 'Cairo',
-                              color: context.textSecondary),
-                        ),
-                      ],
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold)),
                     ),
-                  )
-                : ListView.builder(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    itemCount: _items.length,
-                    itemBuilder: (context, idx) {
-                      final item = _items[idx];
-                      final merchantId = AppStorage.userId ?? '';
+                  ],
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              child: SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColors.primary,
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                  ),
+                  onPressed: _scanItem,
+                  icon: const Icon(Icons.qr_code_scanner_rounded, size: 22),
+                  label: const Text(
+                    'مسح باركود سلعة جديدة [📷]',
+                    style: TextStyle(
+                        fontFamily: 'Cairo',
+                        fontSize: 14,
+                        fontWeight: FontWeight.w800),
+                  ),
+                ),
+              ),
+            ),
+            Expanded(
+              child: _items.isEmpty
+                  ? Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.shopping_cart_outlined,
+                              size: 50, color: context.iconSecondary),
+                          const SizedBox(height: 10),
+                          Text(
+                            'الفاتورة فارغة حالياً.\nامسح باركود أول سلعة للبدء بالبيع.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                fontFamily: 'Cairo',
+                                color: context.textSecondary),
+                          ),
+                        ],
+                      ),
+                    )
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 8),
+                      itemCount: _items.length,
+                      itemBuilder: (context, idx) {
+                        final item = _items[idx];
+                        final merchantId = AppStorage.userId ?? '';
 
-                      return Container(
-                        margin: const EdgeInsets.only(bottom: 10),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: context.bgInput,
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(color: context.borderColor),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    '${item.productName} (${item.unitLabel})',
-                                    style: TextStyle(
-                                      fontFamily: 'Cairo',
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.w800,
-                                      color: context.textPrimary,
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 10),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: context.bgInput,
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: context.borderColor),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      '${item.productName} (${item.unitLabel})',
+                                      style: TextStyle(
+                                        fontFamily: 'Cairo',
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w800,
+                                        color: context.textPrimary,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
                                     ),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
                                   ),
-                                ),
-                                IconButton(
-                                  icon: const Icon(Icons.delete_outline_rounded,
-                                      color: Colors.red, size: 20),
-                                  padding: EdgeInsets.zero,
-                                  constraints: const BoxConstraints(),
-                                  onPressed: () {
-                                    HapticFeedback.lightImpact();
-                                    setState(() => _items.removeAt(idx));
-                                  },
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 10),
-                            Row(
-                              children: [
-                                InkWell(
-                                  borderRadius: BorderRadius.circular(8),
-                                  onTap: () async {
-                                    HapticFeedback.lightImpact();
-                                    final ctrl = TextEditingController(
-                                        text:
-                                            item.unitPrice.toStringAsFixed(0));
-                                    final newPrice = await showDialog<double>(
-                                      context: context,
-                                      builder: (dCtx) => AlertDialog(
-                                        backgroundColor: dCtx.bgCard,
-                                        title: Text(
-                                          'تعديل سعر ${item.unitLabel}',
-                                          style: TextStyle(
-                                              fontFamily: 'Cairo',
-                                              fontWeight: FontWeight.bold,
-                                              color: dCtx.textPrimary,
-                                              fontSize: 15),
-                                        ),
-                                        content: TextField(
-                                          controller: ctrl,
-                                          keyboardType: const TextInputType
-                                              .numberWithOptions(decimal: true),
-                                          autofocus: true,
-                                          textAlign: TextAlign.center,
-                                          style: const TextStyle(
-                                              fontFamily: 'Cairo',
-                                              fontSize: 22,
-                                              fontWeight: FontWeight.bold),
-                                        ),
-                                        actions: [
-                                          TextButton(
-                                            onPressed: () =>
-                                                Navigator.pop(dCtx),
-                                            child: const Text('إلغاء'),
+                                  IconButton(
+                                    icon: const Icon(
+                                        Icons.delete_outline_rounded,
+                                        color: Colors.red,
+                                        size: 20),
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(),
+                                    onPressed: () {
+                                      HapticFeedback.lightImpact();
+                                      setState(() => _items.removeAt(idx));
+                                    },
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              Row(
+                                children: [
+                                  InkWell(
+                                    borderRadius: BorderRadius.circular(8),
+                                    onTap: () async {
+                                      HapticFeedback.lightImpact();
+                                      final ctrl = TextEditingController(
+                                          text: item.unitPrice
+                                              .toStringAsFixed(0));
+                                      final newPrice = await showDialog<double>(
+                                        context: context,
+                                        builder: (dCtx) => AlertDialog(
+                                          backgroundColor: dCtx.bgCard,
+                                          title: Text(
+                                            'تعديل سعر ${item.unitLabel}',
+                                            style: TextStyle(
+                                                fontFamily: 'Cairo',
+                                                fontWeight: FontWeight.bold,
+                                                color: dCtx.textPrimary,
+                                                fontSize: 15),
                                           ),
-                                          ElevatedButton(
-                                            style: ElevatedButton.styleFrom(
-                                              backgroundColor:
-                                                  AppColors.primary,
-                                              foregroundColor: Colors.white,
+                                          content: TextField(
+                                            controller: ctrl,
+                                            keyboardType: const TextInputType
+                                                .numberWithOptions(
+                                                decimal: true),
+                                            autofocus: true,
+                                            textAlign: TextAlign.center,
+                                            style: const TextStyle(
+                                                fontFamily: 'Cairo',
+                                                fontSize: 22,
+                                                fontWeight: FontWeight.bold),
+                                          ),
+                                          actions: [
+                                            TextButton(
+                                              onPressed: () =>
+                                                  Navigator.pop(dCtx),
+                                              child: const Text('إلغاء'),
                                             ),
-                                            onPressed: () => Navigator.pop(
-                                                dCtx,
-                                                double.tryParse(
-                                                    ctrl.text.trim())),
-                                            child: const Text('حفظ'),
+                                            ElevatedButton(
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor:
+                                                    AppColors.primary,
+                                                foregroundColor: Colors.white,
+                                              ),
+                                              onPressed: () => Navigator.pop(
+                                                  dCtx,
+                                                  double.tryParse(
+                                                      ctrl.text.trim())),
+                                              child: const Text('حفظ'),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+
+                                      if (newPrice != null && newPrice > 0) {
+                                        setState(() {
+                                          item.unitPrice = newPrice;
+                                          if (item.unitLabel == 'حبة') {
+                                            LedgerService.instance
+                                                .setSavedPiecePrice(merchantId,
+                                                    item.productId, newPrice);
+                                          }
+                                        });
+                                      }
+                                    },
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: AppColors.primary
+                                            .withValues(alpha: 0.08),
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(
+                                            color: AppColors.primary
+                                                .withValues(alpha: 0.25)),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Text(
+                                            '${item.unitPrice.toStringAsFixed(0)} ر.ي',
+                                            style: const TextStyle(
+                                              fontFamily: 'Cairo',
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w800,
+                                              color: AppColors.primary,
+                                            ),
                                           ),
+                                          const SizedBox(width: 4),
+                                          const Icon(Icons.edit_rounded,
+                                              size: 13,
+                                              color: AppColors.primary),
                                         ],
                                       ),
-                                    );
-
-                                    if (newPrice != null && newPrice > 0) {
-                                      setState(() {
-                                        item.unitPrice = newPrice;
-                                        if (item.unitLabel == 'حبة') {
-                                          LedgerService.instance
-                                              .setSavedPiecePrice(merchantId,
-                                                  item.productId, newPrice);
-                                        }
-                                      });
-                                    }
-                                  },
-                                  child: Container(
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 8, vertical: 4),
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  Container(
                                     decoration: BoxDecoration(
-                                      color: AppColors.primary
-                                          .withValues(alpha: 0.08),
-                                      borderRadius: BorderRadius.circular(8),
+                                      color: context.bgCard,
+                                      borderRadius: BorderRadius.circular(10),
                                       border: Border.all(
-                                          color: AppColors.primary
-                                              .withValues(alpha: 0.25)),
+                                          color: context.borderColor),
                                     ),
                                     child: Row(
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
-                                        Text(
-                                          '${item.unitPrice.toStringAsFixed(0)} ر.ي',
-                                          style: const TextStyle(
-                                            fontFamily: 'Cairo',
-                                            fontSize: 12,
-                                            fontWeight: FontWeight.w800,
-                                            color: AppColors.primary,
+                                        IconButton(
+                                          icon: const Icon(Icons.remove_rounded,
+                                              size: 16),
+                                          padding: EdgeInsets.zero,
+                                          constraints: const BoxConstraints(
+                                              minWidth: 30, minHeight: 30),
+                                          onPressed: () {
+                                            HapticFeedback.lightImpact();
+                                            setState(() {
+                                              if (item.quantity > 1) {
+                                                item.quantity--;
+                                              } else {
+                                                _items.removeAt(idx);
+                                              }
+                                            });
+                                          },
+                                        ),
+                                        GestureDetector(
+                                          onTap: () async {
+                                            final qCtrl = TextEditingController(
+                                                text: '${item.quantity}');
+                                            final manualQ =
+                                                await showDialog<int>(
+                                              context: context,
+                                              builder: (qCtx) => AlertDialog(
+                                                backgroundColor: qCtx.bgCard,
+                                                title: Text('أدخل الكمية',
+                                                    style: TextStyle(
+                                                        fontFamily: 'Cairo',
+                                                        color:
+                                                            qCtx.textPrimary)),
+                                                content: TextField(
+                                                  controller: qCtrl,
+                                                  keyboardType:
+                                                      TextInputType.number,
+                                                  autofocus: true,
+                                                  textAlign: TextAlign.center,
+                                                  style: TextStyle(
+                                                      fontFamily: 'Cairo',
+                                                      fontSize: 22,
+                                                      color: qCtx.textPrimary,
+                                                      fontWeight:
+                                                          FontWeight.bold),
+                                                ),
+                                                actions: [
+                                                  ElevatedButton(
+                                                    style: ElevatedButton
+                                                        .styleFrom(
+                                                      backgroundColor:
+                                                          AppColors.primary,
+                                                      foregroundColor:
+                                                          Colors.white,
+                                                    ),
+                                                    onPressed: () =>
+                                                        Navigator.pop(
+                                                            qCtx,
+                                                            int.tryParse(qCtrl
+                                                                .text
+                                                                .trim())),
+                                                    child: const Text('تأكيد'),
+                                                  ),
+                                                ],
+                                              ),
+                                            );
+                                            if (manualQ != null &&
+                                                manualQ > 0) {
+                                              setState(() =>
+                                                  item.quantity = manualQ);
+                                            }
+                                          },
+                                          child: Padding(
+                                            padding: const EdgeInsets.symmetric(
+                                                horizontal: 8),
+                                            child: Text(
+                                              '${item.quantity}',
+                                              style: TextStyle(
+                                                fontFamily: 'Cairo',
+                                                fontSize: 14,
+                                                fontWeight: FontWeight.w900,
+                                                color: context.textPrimary,
+                                              ),
+                                            ),
                                           ),
                                         ),
-                                        const SizedBox(width: 4),
-                                        const Icon(Icons.edit_rounded,
-                                            size: 13, color: AppColors.primary),
+                                        IconButton(
+                                          icon: const Icon(Icons.add_rounded,
+                                              size: 16,
+                                              color: AppColors.primary),
+                                          padding: EdgeInsets.zero,
+                                          constraints: const BoxConstraints(
+                                              minWidth: 30, minHeight: 30),
+                                          onPressed: () {
+                                            HapticFeedback.lightImpact();
+                                            setState(() => item.quantity++);
+                                          },
+                                        ),
                                       ],
                                     ),
                                   ),
-                                ),
-                                const Spacer(),
-                                Container(
-                                  decoration: BoxDecoration(
-                                    color: context.bgCard,
-                                    borderRadius: BorderRadius.circular(10),
-                                    border:
-                                        Border.all(color: context.borderColor),
+                                  const SizedBox(width: 12),
+                                  Text(
+                                    '${item.total.toStringAsFixed(0)} ر.ي',
+                                    style: const TextStyle(
+                                      fontFamily: 'Cairo',
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w900,
+                                      color: AppColors.primary,
+                                    ),
                                   ),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      IconButton(
-                                        icon: const Icon(Icons.remove_rounded,
-                                            size: 16),
-                                        padding: EdgeInsets.zero,
-                                        constraints: const BoxConstraints(
-                                            minWidth: 30, minHeight: 30),
-                                        onPressed: () {
-                                          HapticFeedback.lightImpact();
-                                          setState(() {
-                                            if (item.quantity > 1) {
-                                              item.quantity--;
-                                            } else {
-                                              _items.removeAt(idx);
-                                            }
-                                          });
-                                        },
-                                      ),
-                                      GestureDetector(
-                                        onTap: () async {
-                                          final qCtrl = TextEditingController(
-                                              text: '${item.quantity}');
-                                          final manualQ = await showDialog<int>(
-                                            context: context,
-                                            builder: (qCtx) => AlertDialog(
-                                              backgroundColor: qCtx.bgCard,
-                                              title: Text('أدخل الكمية',
-                                                  style: TextStyle(
-                                                      fontFamily: 'Cairo',
-                                                      color: qCtx.textPrimary)),
-                                              content: TextField(
-                                                controller: qCtrl,
-                                                keyboardType:
-                                                    TextInputType.number,
-                                                autofocus: true,
-                                                textAlign: TextAlign.center,
-                                                style: TextStyle(
-                                                    fontFamily: 'Cairo',
-                                                    fontSize: 22,
-                                                    color: qCtx.textPrimary,
-                                                    fontWeight:
-                                                        FontWeight.bold),
-                                              ),
-                                              actions: [
-                                                ElevatedButton(
-                                                  style:
-                                                      ElevatedButton.styleFrom(
-                                                    backgroundColor:
-                                                        AppColors.primary,
-                                                    foregroundColor:
-                                                        Colors.white,
-                                                  ),
-                                                  onPressed: () =>
-                                                      Navigator.pop(
-                                                          qCtx,
-                                                          int.tryParse(qCtrl
-                                                              .text
-                                                              .trim())),
-                                                  child: const Text('تأكيد'),
-                                                ),
-                                              ],
-                                            ),
-                                          );
-                                          if (manualQ != null && manualQ > 0) {
-                                            setState(
-                                                () => item.quantity = manualQ);
-                                          }
-                                        },
-                                        child: Padding(
-                                          padding: const EdgeInsets.symmetric(
-                                              horizontal: 8),
-                                          child: Text(
-                                            '${item.quantity}',
-                                            style: TextStyle(
-                                              fontFamily: 'Cairo',
-                                              fontSize: 14,
-                                              fontWeight: FontWeight.w900,
-                                              color: context.textPrimary,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                      IconButton(
-                                        icon: const Icon(Icons.add_rounded,
-                                            size: 16, color: AppColors.primary),
-                                        padding: EdgeInsets.zero,
-                                        constraints: const BoxConstraints(
-                                            minWidth: 30, minHeight: 30),
-                                        onPressed: () {
-                                          HapticFeedback.lightImpact();
-                                          setState(() => item.quantity++);
-                                        },
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Text(
-                                  '${item.total.toStringAsFixed(0)} ر.ي',
-                                  style: const TextStyle(
-                                    fontFamily: 'Cairo',
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.w900,
-                                    color: AppColors.primary,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
-          ),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: context.bgCard,
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.08),
-                  blurRadius: 10,
-                  offset: const Offset(0, -3),
-                ),
-              ],
+                                ],
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
             ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      'الأصناف: ${_items.length}',
-                      style: TextStyle(
-                        fontFamily: 'Cairo',
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700,
-                        color: context.textSecondary,
-                      ),
-                    ),
-                    Row(
-                      children: [
-                        Text(
-                          'الإجمالي: ',
-                          style: TextStyle(
-                            fontFamily: 'Cairo',
-                            fontSize: 14,
-                            fontWeight: FontWeight.w700,
-                            color: context.textPrimary,
-                          ),
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: context.bgCard,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.08),
+                    blurRadius: 10,
+                    offset: const Offset(0, -3),
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'الأصناف: ${_items.length}',
+                        style: TextStyle(
+                          fontFamily: 'Cairo',
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: context.textSecondary,
                         ),
-                        Text(
-                          '${_grandTotal.toStringAsFixed(0)} ر.ي',
-                          style: const TextStyle(
-                            fontFamily: 'Cairo',
-                            fontSize: 20,
-                            fontWeight: FontWeight.w900,
-                            color: AppColors.primary,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                SizedBox(
-                  width: double.infinity,
-                  height: 52,
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.red.shade700,
-                      foregroundColor: Colors.white,
-                      elevation: 0,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16),
                       ),
-                    ),
-                    onPressed:
-                        (_items.isEmpty || _isSaving) ? null : _submitFullBill,
-                    icon: _isSaving
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(
-                              color: Colors.white,
-                              strokeWidth: 2,
+                      Row(
+                        children: [
+                          Text(
+                            'الإجمالي: ',
+                            style: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                              color: context.textPrimary,
                             ),
-                          )
-                        : const Icon(Icons.check_circle_rounded, size: 22),
-                    label: Text(
-                      _isSaving
-                          ? 'جاري الحفظ والقيد...'
-                          : 'تسجيل في حساب (${_selectedCustomer.name})',
-                      style: const TextStyle(
-                        fontFamily: 'Cairo',
-                        fontSize: 15,
-                        fontWeight: FontWeight.w800,
+                          ),
+                          Text(
+                            '${_grandTotal.toStringAsFixed(0)} ر.ي',
+                            style: const TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 20,
+                              fontWeight: FontWeight.w900,
+                              color: AppColors.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 52,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red.shade700,
+                        foregroundColor: Colors.white,
+                        elevation: 0,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                      ),
+                      onPressed: (_items.isEmpty || _isSaving)
+                          ? null
+                          : _submitFullBill,
+                      icon: _isSaving
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                color: Colors.white,
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Icon(Icons.check_circle_rounded, size: 22),
+                      label: Text(
+                        _isSaving
+                            ? 'جاري الحفظ والقيد...'
+                            : 'تسجيل في حساب (${_selectedCustomer.name})',
+                        style: const TextStyle(
+                          fontFamily: 'Cairo',
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                        ),
                       ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

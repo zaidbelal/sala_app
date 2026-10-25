@@ -7,8 +7,8 @@ import '../../services/admin_service.dart';
 import '../../widgets/orders/order_card.dart';
 
 // مزود استماع سحابي مفلتر ومرتب زمنياً في الخادم لضمان جلب أحدث الطلبات
-final adminOrdersRealtimeProvider =
-    StreamProvider.family<List<AdminOrder>, List<String>?>((ref, statuses) {
+final adminOrdersRealtimeProvider = StreamProvider.autoDispose
+    .family<List<AdminOrder>, List<String>?>((ref, statuses) {
   Query<Map<String, dynamic>> query = FirebaseFirestore.instance
       .collection('orders')
       .orderBy('created_at', descending: true);

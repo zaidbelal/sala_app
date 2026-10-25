@@ -655,6 +655,16 @@ class RealtimeHub {
 
   Future<void> _restartAsync() async {
     _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+
+    // إلغاء اشتراكات الأصناف والشركات والإشعارات صراحة لمنع تضاعف الذاكرة
+    await _categoriesSub?.cancel();
+    _categoriesSub = null;
+    await _brandsSub?.cancel();
+    _brandsSub = null;
+    await _notificationsSub?.cancel();
+    _notificationsSub = null;
+
     final subscriptions = List<StreamSubscription>.from(_userSubs);
     _userSubs.clear();
 
@@ -677,8 +687,10 @@ class RealtimeHub {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
 
-    _connectivitySub?.cancel();
-    _connectivitySub = null;
+    if (_connectivitySub != null) {
+      _connectivitySub?.cancel();
+      _connectivitySub = null;
+    }
 
     _notificationsSub?.cancel();
     _notificationsSub = null;
@@ -696,7 +708,6 @@ class RealtimeHub {
         s.cancel();
       } catch (_) {}
     }
-
     final c = _container;
     if (c != null) {
       try {

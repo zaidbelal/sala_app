@@ -264,20 +264,21 @@ class AppStorage {
       final json = jsonEncode(currentQueue);
       await _db.setString(key, json);
 
-      // ✅ كتابة ذرية آمنة متوافقة مع Android Sandbox باسم مطابق للمسترجع
+      // 🚀 استبدال ذري بنمط POSIX الذري المباشر دون مسح الملف الأصلي مسبقاً لمنع ضياع البيانات
       if (!kIsWeb && _appDocsPath != null) {
         try {
-          final tempFile = File('$_appDocsPath/${key}_backup.tmp');
+          final nonce = DateTime.now().microsecondsSinceEpoch;
+          final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
           final finalFile = File('$_appDocsPath/${key}_backup.json');
 
           await tempFile.writeAsString(json, flush: true);
-          if (await finalFile.exists()) {
-            await finalFile.delete();
+          try {
+            await tempFile.rename(finalFile.path);
+          } catch (_) {
+            await tempFile.copy(finalFile.path);
+            if (await tempFile.exists()) await tempFile.delete();
           }
-          await tempFile.rename(finalFile.path);
-        } catch (_) {
-          // في حال فشل الـ rename، نكتفي بالحفظ المكتمل في SharedPreferences
-        }
+        } catch (_) {}
       }
     } finally {
       completer.complete();
@@ -293,14 +294,26 @@ class AppStorage {
     if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
       try {
         final file = File('$_appDocsPath/${key}_backup.json');
-        final tmpFile = File('$_appDocsPath/${key}_backup.tmp');
         if (file.existsSync()) {
           raw = file.readAsStringSync();
-        } else if (tmpFile.existsSync()) {
-          raw = tmpFile.readAsStringSync();
-          try {
-            tmpFile.renameSync(file.path);
-          } catch (_) {}
+        } else {
+          final dir = Directory(_appDocsPath!);
+          final candidates = dir
+              .listSync()
+              .whereType<File>()
+              .where(
+                (f) =>
+                    f.path.contains('${key}_tmp_') && f.path.endsWith('.json'),
+              )
+              .toList();
+          if (candidates.isNotEmpty) {
+            candidates.sort(
+                (a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+            raw = candidates.first.readAsStringSync();
+            try {
+              candidates.first.copySync(file.path);
+            } catch (_) {}
+          }
         }
       } catch (_) {}
     }
@@ -319,7 +332,7 @@ class AppStorage {
     }
   }
 
-  /// يحذف طلباً محدداً من الطابور ويحدث ملف القرص الدائم تزامناً لمنع قيامة الطلبات القديمة (Zombie Orders)
+  /// يحذف طلباً محدداً من الطابور ويحدث ملف القرص الدائم وينظف كافة الملفات المؤقتة لمنع قيامة الطلبات القديمة نهائياً
   static Future<void> removePendingOrder(String orderId, [String? uid]) async {
     final previousLock = _queueLock;
     final completer = Completer<void>();
@@ -334,6 +347,26 @@ class AppStorage {
       final key = _userPendingOrderKey(targetUid);
       final currentQueue = getPendingOrders(targetUid);
       currentQueue.removeWhere((order) => order['orderId'] == orderId);
+
+      // تنظيف شامل وجذري لكافة الملفات المؤقتة التابعة لهذا المفتاح
+      if (!kIsWeb && _appDocsPath != null) {
+        try {
+          final dir = Directory(_appDocsPath!);
+          if (dir.existsSync()) {
+            final leftovers = dir.listSync().whereType<File>().where(
+                  (f) =>
+                      f.path.contains('${key}_tmp_') &&
+                      f.path.endsWith('.json'),
+                );
+            for (final f in leftovers) {
+              try {
+                f.deleteSync();
+              } catch (_) {}
+            }
+          }
+        } catch (_) {}
+      }
+
       if (currentQueue.isEmpty) {
         await _db.remove(key);
         await _db.remove(_kPendingOrder);
@@ -354,9 +387,6 @@ class AppStorage {
             final nonce = DateTime.now().microsecondsSinceEpoch;
             final tmpFile = File('$_appDocsPath/${key}_backup_$nonce.tmp');
             await tmpFile.writeAsString(json, flush: true);
-            if (await backupFile.exists()) {
-              await backupFile.delete();
-            }
             await tmpFile.rename(backupFile.path);
           } catch (_) {}
         }

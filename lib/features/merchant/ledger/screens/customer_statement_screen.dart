@@ -34,7 +34,12 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
     _customer = widget.customer;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final mId = AppStorage.userId ?? '';
-      if (mId.isNotEmpty) {
+      final lastReconciled = _customer.lastReminderSentAt;
+      final shouldReconcile = lastReconciled == null ||
+          DateTime.now().difference(lastReconciled).inHours > 12;
+
+      // تدقيق الحساب من السيرفر فقط إذا مضت 12 ساعة على الأقل أو عند أول فتح
+      if (mId.isNotEmpty && shouldReconcile) {
         LedgerService.instance.reconcileCustomerBalance(
           merchantId: mId,
           customerId: _customer.id,
@@ -263,21 +268,22 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     serverAppliedIds.add(serverLastTxId);
                   }
 
+                  // 🚀 منع احتساب القيود المضاعفة: إذا كانت الوثيقة حديثة وقادمة مباشرة من الخادم لا نطبق أرصدة معلقة متزامنة
+                  final bool isFromCache =
+                      custSnap.data?.metadata.isFromCache ?? true;
                   final pendingTxs =
                       AppStorage.getPendingLedgerTxs(_customer.merchantId)
                           .where((t) => t['customer_id'] == _customer.id);
-
                   double pendingDelta = 0.0;
-                  final isOfflineCache = custSnap.data!.metadata.isFromCache;
-
+                  // تطبيق الفوارق المعلقة دائماً سواء كانت الوثيقة من السيرفر أو الكاش طالما لم يقيدها السيرفر بعد
                   for (final tx in pendingTxs) {
                     final txType = tx['type']?.toString();
-                    if (txType == 'add_customer' || txType == 'void_request')
+                    if (txType == 'add_customer' || txType == 'void_request') {
                       continue;
+                    }
                     final txId = tx['id']?.toString() ?? '';
 
-                    if (!isOfflineCache && serverAppliedIds.contains(txId))
-                      continue;
+                    if (serverAppliedIds.contains(txId)) continue;
                     if (_locallyDismissedEntryIds.contains(txId)) continue;
 
                     final isDebt = txType == 'debt';
@@ -295,7 +301,6 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   }
 
                   final double localAdjustments = (pendingDelta + voidDelta);
-
                   displayedCustomer = LedgerCustomer(
                     id: serverCustomer.id,
                     merchantId: serverCustomer.merchantId,
@@ -317,7 +322,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   padding: const EdgeInsets.all(20),
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
-                      colors: _customer.currentBalance > 0
+                      colors: displayedCustomer.currentBalance > 0
                           ? [const Color(0xFFC0392B), const Color(0xFFE74C3C)]
                           : [const Color(0xFF1E8449), const Color(0xFF2ECC71)],
                       begin: Alignment.topRight,
@@ -326,7 +331,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     borderRadius: BorderRadius.circular(22),
                     boxShadow: [
                       BoxShadow(
-                        color: (_customer.currentBalance > 0
+                        color: (displayedCustomer.currentBalance > 0
                                 ? Colors.red
                                 : Colors.green)
                             .withValues(alpha: 0.35),
@@ -348,7 +353,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        '${_customer.currentBalance.abs().toStringAsFixed(0)} ر.ي',
+                        '${displayedCustomer.currentBalance.abs().toStringAsFixed(0)} ر.ي',
                         style: const TextStyle(
                           fontFamily: 'Cairo',
                           fontSize: 32,
@@ -356,13 +361,13 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                           color: Colors.white,
                         ),
                       ),
-                      if (_customer.creditLimit > 0) ...[
+                      if (displayedCustomer.creditLimit > 0) ...[
                         const SizedBox(height: 8),
                         Row(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
                             Text(
-                              'سقف الدين: ${_customer.creditLimit.toStringAsFixed(0)} ر.ي',
+                              'سقف الدين: ${displayedCustomer.creditLimit.toStringAsFixed(0)} ر.ي',
                               style: const TextStyle(
                                   fontFamily: 'Cairo',
                                   fontSize: 11,
@@ -608,21 +613,57 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                             }
                             return true;
                           } catch (e) {
+                            final err = e.toString().toLowerCase();
+                            final isOfflineOrTimeout =
+                                err.contains('network') ||
+                                    err.contains('timeout') ||
+                                    err.contains('socket') ||
+                                    err.contains('unavailable');
+
                             if (mounted) {
-                              final err = e.toString().toLowerCase();
-                              final message = (err.contains('network') ||
-                                      err.contains('timeout') ||
-                                      err.contains('socket'))
-                                  ? 'تعذر الاتصال بالخادم، تم حفظ طلب الإلغاء أوفلاين'
-                                  : 'تعذر إبطال القيد المالي حالياً، يرجى المحاولة لاحقاً';
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text(message,
-                                      style:
-                                          const TextStyle(fontFamily: 'Cairo')),
-                                  backgroundColor: Colors.red,
-                                ),
-                              );
+                              if (isOfflineOrTimeout) {
+                                // تم حفظ الشطب محلياً في الطابور بنجاح، لذا نسمح بإخفاء العنصر فوراً لمنع تكرار حذفه
+                                final delta =
+                                    isDebt ? -item.amount : item.amount;
+                                setState(() {
+                                  _locallyDismissedEntryIds.add(item.id);
+                                  _customer = LedgerCustomer(
+                                    id: _customer.id,
+                                    merchantId: _customer.merchantId,
+                                    name: _customer.name,
+                                    phone: _customer.phone,
+                                    currentBalance:
+                                        LedgerCustomer.sanitizeAmount(
+                                      _customer.currentBalance + delta,
+                                    ),
+                                    creditLimit: _customer.creditLimit,
+                                    salaryDay: _customer.salaryDay,
+                                    lastReminderSentAt:
+                                        _customer.lastReminderSentAt,
+                                    createdAt: _customer.createdAt,
+                                    updatedAt: DateTime.now(),
+                                  );
+                                });
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                        '📡 تم حفظ طلب الإلغاء أوفلاين وسيُشطب تلقائياً فور توفر الشبكة',
+                                        style: TextStyle(fontFamily: 'Cairo')),
+                                    backgroundColor: Colors.orange,
+                                  ),
+                                );
+                                return true; // حذف العنصر من الشاشة فوراً
+                              } else {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text('تعذر إبطال القيد: $e',
+                                        style: const TextStyle(
+                                            fontFamily: 'Cairo')),
+                                    backgroundColor: Colors.red,
+                                  ),
+                                );
+                                return false;
+                              }
                             }
                             return false;
                           }

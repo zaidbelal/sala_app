@@ -99,16 +99,27 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
           }
         } catch (e) {
           final err = e.toString().toLowerCase();
-          // فحص شامل لجميع أكواد السيرفر القياسية لمنع حبس تسليمات السائق في الطابور
+          // 🔒 فحص شامل يتضمن أخطاء الصلاحيات لمنع حبس تسليمات السائق في الطابور نهائياً
           if (err.contains('order-not-found') ||
               err.contains('not_found') ||
               err.contains('already-delivered') ||
               err.contains('already_delivered') ||
               err.contains('failed-precondition') ||
               err.contains('already-exists') ||
+              err.contains('permission-denied') ||
+              err.contains('permission_denied') ||
+              err.contains('غير مصرح') ||
+              err.contains('غير مسند') ||
               err.contains('تم تسجيل تسليم الطلب مسبقاً') ||
               err.contains('الطلب غير موجود')) {
             await AppStorage.removePendingDriverDelivery(orderId, driverId);
+            if (!kIsWeb) {
+              try {
+                final dir = await getApplicationDocumentsDirectory();
+                final f = File('${dir.path}/sig_${orderId}.b64');
+                if (await f.exists()) await f.delete();
+              } catch (_) {}
+            }
           }
         }
       }

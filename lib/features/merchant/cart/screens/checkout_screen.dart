@@ -43,8 +43,62 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
   void initState() {
     super.initState();
     _prefillMerchantDetails();
-    WidgetsBinding.instance
-        .addPostFrameCallback((_) => _validateCartBeforeCheckout());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final changed = await _validateCartBeforeCheckout();
+      if (changed && mounted) {
+        _notifyCartModified();
+      }
+    });
+  }
+
+  void _notifyCartModified() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: ctx.bgCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.orange),
+            SizedBox(width: 8),
+            Text('تنبيه في محتويات السلة',
+                style: TextStyle(
+                    fontFamily: 'Cairo',
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16)),
+          ],
+        ),
+        content: const Text(
+          'تم تحديث سلتك واستبعاد بعض الأصناف أو تعديل أسعارها لعدم توفرها في المستودع. يرجى مراجعة إجمالي الطلب قبل المتابعة.',
+          style: TextStyle(fontFamily: 'Cairo', fontSize: 13, height: 1.6),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              if (Navigator.of(context).canPop()) {
+                Navigator.of(context).pop();
+              }
+            },
+            child: const Text('العودة للسلة',
+                style: TextStyle(fontFamily: 'Cairo', color: Colors.grey)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.primary,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('متابعة بالمتوفر',
+                style: TextStyle(
+                    fontFamily: 'Cairo', fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _prefillMerchantDetails() async {

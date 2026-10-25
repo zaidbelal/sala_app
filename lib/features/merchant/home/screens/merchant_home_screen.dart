@@ -136,7 +136,7 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
         }
 
         try {
-          // إرسال الطلب وإزالته فوراً من طابور التاجر الحالي
+          // إرسال الطلب وإزالته فوراً وتأكيد الـ WAL
           await OrdersService.placeOrder(
             merchantId: currentUserId,
             items: List<Map<String, dynamic>>.from(pending['items']),
@@ -147,6 +147,7 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             orderId: orderId,
           );
 
+          await WalService.instance.markCommitted(orderId);
           await AppStorage.removePendingOrder(orderId, currentUserId);
           successCount++;
         } catch (e) {

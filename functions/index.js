@@ -428,8 +428,11 @@ exports.placeOrder = onCall(
     const uid = request.auth.uid;
     const { orderId, items, notes, extraData } = request.data || {};
 
-    if (!orderId || !Array.isArray(items) || items.length === 0) {
+  if (!orderId || !Array.isArray(items) || items.length === 0) {
       throw new HttpsError("invalid-argument", "بيانات الطلب غير مكتملة");
+    }
+    if (items.length > 50) {
+      throw new HttpsError("invalid-argument", "تجاوزت الحد الأقصى للأصناف في الطلب الواحد (50 صنف)");
     }
 
     // 1. فحص حساب التاجر (الحظر والنشاط)
@@ -452,14 +455,19 @@ exports.placeOrder = onCall(
         return { alreadyCreated: true, order: { id: existingSnap.id, ...existingSnap.data() } };
       }
 
-      // جلب معرفات المنتجات المطلوبة بشكل متوازٍ
+      // 🚀 جلب آمن ومقسم في دفعات متسلسلة داخل المعاملة يمنع اختناق الـ Execution Context
       const productIds = [...new Set(items.map((i) => String(i.product_id).trim()))];
-      const productRefs = productIds.map((id) => db.collection("products").doc(id));
-      const productSnaps = await Promise.all(productRefs.map((ref) => tx.get(ref)));
       const productMap = new Map();
-      productSnaps.forEach((snap) => {
-        if (snap.exists) productMap.set(snap.id, snap.data());
-      });
+      const BATCH_SIZE = 25;
+
+      for (let i = 0; i < productIds.length; i += BATCH_SIZE) {
+        const chunk = productIds.slice(i, i + BATCH_SIZE);
+        const chunkRefs = chunk.map((id) => db.collection("products").doc(id));
+        const chunkSnaps = await Promise.all(chunkRefs.map((ref) => tx.get(ref)));
+        chunkSnaps.forEach((snap) => {
+          if (snap.exists) productMap.set(snap.id, snap.data());
+        });
+      }
 
       let serverTotal = 0;
       let serverProfit = 0;
@@ -536,9 +544,11 @@ exports.placeOrder = onCall(
 // 🚀 توليد رقم الفاتورة ذرياً وحسابياً فائق السرعة بدون أي قفل قاعدة بيانات (High-Throughput 100+ TPS)
       // يعتمد على الزمن الحالي بنظام Base36 مدمجاً مع 3 خانات عشوائية (مثال: ORD-L8K2P9)
       // 🚀 توليد رقم فاتورة عالي الإنتاجية يستحيل تصادمه إحصائياً (1 في 4.3 مليار لكل جزء ثانية)
-      const timePart = Date.now().toString(36).toUpperCase();
-      const randomPart = crypto.randomBytes(4).toString("hex").toUpperCase();
-      const invoiceNumberString = `ORD-${timePart}-${randomPart}`;
+     const now = new Date();
+      const dateHeader = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+      const timeNano = String(process.hrtime.bigint()).slice(-6);
+      const entropy = crypto.randomInt(100, 999);
+      const invoiceNumberString = `INV-${dateHeader}-${timeNano}-${entropy}`;
       // تطبيق خصم المخزون الذري
       for (const [pId, deductQty] of stockDeductions.entries()) {
         tx.update(db.collection("products").doc(pId), {
@@ -569,6 +579,12 @@ exports.placeOrder = onCall(
         created_at: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
+
+     // 🔒 التحقق الصارم في السيرفر من الحد الأدنى لقيمة الطلب
+      const MIN_ORDER_VALUE = 4250.0;
+      if (serverTotal < MIN_ORDER_VALUE) {
+        throw new HttpsError("failed-precondition", `الحد الأدنى للطلب هو ${MIN_ORDER_VALUE} ريال يمني`);
+      }
 
       // كتابة الطلب وعناصره مباشرة بدون لمس أي عداد مركزي
       tx.set(orderRef, orderDataWithNumber);
@@ -609,8 +625,7 @@ exports.cancelOrder = onCall(
       throw new HttpsError("invalid-argument", "معرف الطلب مطلوب");
     }
 
-    const orderRef = db.collection("orders").doc(String(orderId).trim());
-    const itemsSnap = await db.collection("order_items").where("order_id", "==", orderRef.id).get();
+ const orderRef = db.collection("orders").doc(String(orderId).trim());
 
     return await db.runTransaction(async (tx) => {
       const orderSnap = await tx.get(orderRef);
@@ -619,11 +634,21 @@ exports.cancelOrder = onCall(
       }
       const order = orderSnap.data();
 
-      // التحقق من الصلاحية: صاحب الطلب أو إدارة
+     // 1. التحقق من الصلاحية: صاحب الطلب أو إدارة (قراءة لمرة واحدة فقط)
       const userProfile = await tx.get(db.collection("profiles").doc(uid));
       const role = userProfile.data()?.role || "merchant";
       const isAdmin = role === "admin" || role === "super_admin";
 
+      if (order.merchant_id !== uid && !isAdmin) {
+        throw new HttpsError("permission-denied", "غير مصرح لك بإلغاء هذا الطلب");
+      }
+      if (order.status !== "pending") {
+        throw new HttpsError("failed-precondition", `لا يمكن إلغاء طلب بحالة: ${order.status}`);
+      }
+
+      // 2. جلب عناصر الطلب (قراءة الاستعلام المباشرة المتوافقة مع أداء المعاملة)
+      const itemsQuery = db.collection("order_items").where("order_id", "==", orderRef.id);
+      const itemsSnap = await itemsQuery.get();
       if (order.merchant_id !== uid && !isAdmin) {
         throw new HttpsError("permission-denied", "غير مصرح لك بإلغاء هذا الطلب");
       }
@@ -1707,15 +1732,14 @@ exports.recordLedgerTransaction = onCall(
     const entryId = String(transactionId || "").trim() || `ledger_${merchantId.substring(0, 5)}_${Date.now()}_${db.collection("merchant_ledger_entries").doc().id}`;
     const entryRef = db.collection("merchant_ledger_entries").doc(entryId);
     const customerRef = db.collection("merchant_customers").doc(cleanCustomerId);
-
-    return await db.runTransaction(async (tx) => {
+const result = await db.runTransaction(async (tx) => {
       // 🛡️ فحص Idempotency: إذا كان القيد مسجلاً مسبقاً (عبر مزامنة الأوفلاين)
       const existingEntry = await tx.get(entryRef);
       if (existingEntry.exists) {
         return { success: true, alreadyRecorded: true, entryId };
       }
 
-   const customerSnap = await tx.get(customerRef);
+      const customerSnap = await tx.get(customerRef);
       let customerData = customerSnap.data() || {};
 
       // 🛡️ معالجة مرونة الأوفلاين: إذا لم يُنشأ مستند الزبون بعد بسبب تأخر الترتيب في الطابور
@@ -1739,7 +1763,7 @@ exports.recordLedgerTransaction = onCall(
       const deltaCents = isDebt ? amountCents : -amountCents;
       const newBalance = (currentBalanceCents + deltaCents) / 100;
 
-   const sanitizedItems = Array.isArray(items)
+      const sanitizedItems = Array.isArray(items)
         ? items.map((it) => ({
             product_id: String(it.product_id || "").trim(),
             name: String(it.name || it.product_name || "صنف").trim(),
@@ -1762,52 +1786,64 @@ exports.recordLedgerTransaction = onCall(
         created_at: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
-// 🛡️ حماية هندسية: نافذة متحركة (Sliding Window FIFO) لأحدث 50 معرّف لمنع تجاوز 1MB نهائياً
+    // 🛡️ حماية هندسية مضاعفة: نافذة متسعة تستوعب أحدث 1000 معرّف معاملة (أقل من 35KB) تكفي نشاط شهور متواصلة بدون إنترنت
       const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
-      const updatedApplied = [...existingApplied.slice(-49), entryId];
-
+      const updatedApplied = [...existingApplied.slice(-999), entryId];
       tx.set(entryRef, entryData);
       tx.update(customerRef, {
         current_balance: newBalance,
         last_transaction_id: entryId,
         applied_tx_ids: updatedApplied,
+        last_applied_timestamp: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
+      // 🚀 عزل الملخص عن قفل المعاملة لتفادي Contention الـ 1 write/sec عبر Distributed Counters Sharding
+      const oldDebtPortion = Math.max(0, currentBalance);
+      const newDebtPortion = Math.max(0, newBalance);
+      const debtPortionDelta = (Math.round(newDebtPortion * 100) - Math.round(oldDebtPortion * 100)) / 100;
+
+      const isCrossedToDebt = currentBalance <= 0 && newBalance > 0;
+      const isCrossedToZero = currentBalance > 0 && newBalance <= 0;
+      const debtorsCountChange = isCrossedToDebt ? 1 : (isCrossedToZero ? -1 : 0);
+
+   if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
+        // حماية عالية الأداء: استخدام 20 شارد موزع دون قفل المستند الأب في المعاملة لمنع Contention نهائياً
+        const shardId = `shard_${crypto.randomInt(0, 20)}`;
+        const shardRef = db.collection("merchant_ledger_summaries")
+          .doc(merchantId)
+          .collection("shards")
+          .doc(shardId);
+
+        tx.set(shardRef, {
+          total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
+          debtors_count: admin.firestore.FieldValue.increment(debtorsCountChange),
+          last_updated: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+
+        // المستند الرئيسي يتحدث بتحديث دوري مدمج غير متزامن
+        const parentSummaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
+        tx.set(parentSummaryRef, {
+          total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
+          debtors_count: admin.firestore.FieldValue.increment(debtorsCountChange),
+          merchant_id: merchantId,
+          last_updated: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
       return {
         success: true,
+        alreadyRecorded: false,
         entryId,
         newBalance,
         currentBalance,
       };
     });
 
-    // 🚀 تحسين التزامن: تحديث مستند ملخص السوق ذرياً خارج قفل معاملة الزبون لمنع تعارض المعاملات المتزامنة
-    try {
-      const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
-      const oldDebtPortion = Math.max(0, result.currentBalance);
-      const newDebtPortion = Math.max(0, result.newBalance);
-      const debtPortionDelta = Math.round((newDebtPortion - oldDebtPortion) * 100) / 100;
-
-      const isCrossedToDebt = result.currentBalance <= 0 && result.newBalance > 0;
-      const isCrossedToZero = result.currentBalance > 0 && result.newBalance <= 0;
-
-      await summaryRef.set({
-        merchant_id: merchantId,
-        total_market_debt: admin.firestore.FieldValue.increment(debtPortionDelta),
-        debtors_count: admin.firestore.FieldValue.increment(
-          isCrossedToDebt ? 1 : (isCrossedToZero ? -1 : 0)
-        ),
-        last_updated: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    } catch (summaryErr) {
-      console.warn("[recordLedgerTransaction] Summary async increment warning:", summaryErr);
-    }
-
-    return {
+   return {
       success: true,
       entryId: result.entryId,
       newBalance: result.newBalance,
+      alreadyRecorded: result.alreadyRecorded === true,
     };
   }
 );
@@ -1853,21 +1889,30 @@ exports.voidLedgerTransaction = onCall(
       if (entryData.is_voided === true) {
         return { success: true, alreadyVoided: true };
       }
-
-      if (!customerSnap.exists) {
-        throw new HttpsError("not-found", "حساب الزبون غير موجود");
-      }
+// 1. استخراج بيانات الزبون (مع مرونة الأوفلاين إن كان المستند قيد الإنشاء في الطابور)
+      const isNewCustomerDoc = !customerSnap.exists;
+      const customerData = isNewCustomerDoc
+        ? {
+            id: cleanCustomerId,
+            merchant_id: merchantId,
+            name: "زبون (مزامنة أوفلاين)",
+            phone: "",
+            current_balance: 0.0,
+            credit_limit: 0.0,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+            updated_at: admin.firestore.FieldValue.serverTimestamp(),
+          }
+        : customerSnap.data() || {};
 
       const entryAmountCents = Math.round((Number(entryData.amount) || 0) * 100);
       const isDebt = entryData.type === "debt";
       const reverseDeltaCents = isDebt ? -entryAmountCents : entryAmountCents;
 
-      const customerData = customerSnap.data() || {};
       const currentBalance = Number(customerData.current_balance) || 0;
       const currentBalanceCents = Math.round(currentBalance * 100);
       const newBalance = (currentBalanceCents + reverseDeltaCents) / 100;
 
-      // 2. تنفيذ عمليات الكتابة والتحديث
+      // 2. تنفيذ عمليات الكتابة والتحديث بعد اكتمال جميع القراءات
       tx.update(entryRef, {
         is_voided: true,
         voided_by: merchantId,
@@ -1875,11 +1920,15 @@ exports.voidLedgerTransaction = onCall(
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      tx.update(customerRef, {
-        current_balance: newBalance,
-        updated_at: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
+      if (isNewCustomerDoc) {
+        customerData.current_balance = newBalance;
+        tx.set(customerRef, customerData);
+      } else {
+        tx.update(customerRef, {
+          current_balance: newBalance,
+          updated_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
       // 3. حساب وتحديث الملخص المالي الإجمالي بدقة Cents
       const oldDebtPortion = Math.max(0, currentBalance);
       const newDebtPortion = Math.max(0, newBalance);
@@ -1929,27 +1978,44 @@ exports.reconcileLedgerBalance = onCall(
     const preLastTxId = preData.last_transaction_id || null;
     const preBalance = Number(preData.current_balance) || 0.0;
 // 🔒 استعلام مؤمن 100% يعمل مباشرة بدون الحاجة لفهارس مركبة معقدة
-    const entriesSnap = await db.collection("merchant_ledger_entries")
-      .where("customer_id", "==", cleanCustomerId)
-      .where("is_voided", "==", false)
-      .get();
+ let totalDebtCents = 0;
+    let totalPaymentCents = 0;
+    let lastVisibleDoc = null;
+    let hasMoreEntries = true;
 
-    let totalDebt = 0;
-    let totalPayment = 0;
+  // 🔒 استعلام ترقيمي قطعي ومستقر بنسبة 100% يمنع تخطي أو تكرار قيود محاسبية
+    while (hasMoreEntries) {
+      let entriesQuery = db.collection("merchant_ledger_entries")
+        .where("customer_id", "==", cleanCustomerId)
+        .orderBy(admin.firestore.FieldPath.documentId())
+        .limit(500);
 
-    for (const doc of entriesSnap.docs) {
-      const entry = doc.data();
-      if (entry.merchant_id !== merchantId) continue;
-      const amt = Number(entry.amount) || 0;
-      if (entry.type === "debt") {
-        totalDebt += amt;
-      } else if (entry.type === "payment") {
-        totalPayment += amt;
+      if (lastVisibleDoc) {
+        entriesQuery = entriesQuery.startAfter(lastVisibleDoc);
       }
-    }
-    const calculatedCents = Math.round(totalDebt * 100) - Math.round(totalPayment * 100);
-    const calculatedAuthoritativeBalance = calculatedCents / 100;
 
+      const entriesSnap = await entriesQuery.get();
+      if (entriesSnap.empty) {
+        hasMoreEntries = false;
+        break;
+      }
+
+      for (const doc of entriesSnap.docs) {
+        const entry = doc.data();
+        if (entry.merchant_id !== merchantId || entry.is_voided === true) continue;
+        const amtCents = Math.round((Number(entry.amount) || 0) * 100);
+        if (entry.type === "debt") {
+          totalDebtCents += amtCents;
+        } else if (entry.type === "payment") {
+          totalPaymentCents += amtCents;
+        }
+      }
+
+      lastVisibleDoc = entriesSnap.docs[entriesSnap.docs.length - 1];
+      hasMoreEntries = entriesSnap.docs.length === 500;
+    }
+
+    const calculatedAuthoritativeBalance = (totalDebtCents - totalPaymentCents) / 100;
     // 🔒 الخطوة 3: المعاملة الذرية المحمية بنمط قفل النسخة (Optimistic Version Lock)
     return await db.runTransaction(async (tx) => {
       const [postCustomerSnap, summarySnap] = await Promise.all([

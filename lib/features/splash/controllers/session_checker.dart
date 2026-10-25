@@ -4,6 +4,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:sala/core/services/local_storage.dart';
 import 'package:sala/core/services/realtime_hub.dart';
+import 'dart:async';
+import 'package:sala/core/services/notification_service.dart';
 
 enum SessionResult {
   merchant,
@@ -87,12 +89,20 @@ class SessionChecker {
     final userId = AppStorage.userId;
 
     if (!AppStorage.isLoggedIn || userId == null || userId.trim().isEmpty) {
+      try {
+        RealtimeHub().dispose();
+      } catch (_) {}
       await AppStorage.clearUserData();
       return SessionResult.unauthenticated;
     }
 
-    // انتهت مدة الجلسة (30 يوماً)
+    // انتهت مدة الجلسة (30 يوماً) - إيقاف الاشتراكات فوراً وتفريغ الذاكرة
     if (AppStorage.isSessionExpired) {
+      try {
+        RealtimeHub().dispose();
+        await NotificationService.instance.detachTokenFromFirestore(userId);
+        await FirebaseAuth.instance.signOut();
+      } catch (_) {}
       await AppStorage.clearUserData();
       return SessionResult.unauthenticated;
     }

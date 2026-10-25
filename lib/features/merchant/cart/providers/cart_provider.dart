@@ -89,13 +89,11 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
       await tempFile.writeAsString(jsonString, flush: true);
       if (await tempFile.exists()) {
         try {
-          if (await file.exists()) {
-            await file.delete();
-          }
+          // استبدال ذري مباشر بنمط POSIX الذري دون حذف مسبق
           await tempFile.rename(file.path);
         } catch (_) {
           await tempFile.copy(file.path);
-          if (await tempFile.exists()) await tempFile.delete();
+          await tempFile.delete().catchError((_) => tempFile);
         }
       }
     } catch (e, st) {
@@ -282,7 +280,8 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
           sizeMl: liveProduct.sizeMl,
         );
       }
-
+// 🛡️ حماية مالية صارمة: إذا حُذفت أو عُدلت عبوة البيع التي اختارها التاجر سحابياً،
+      // يُستبعد الصنف فوراً من السلسلة ليقوم التاجر بتحديد العبوة الجديدة بوعي تام
       if (matchingUnit == null) {
         hasChanges = true;
         continue;
