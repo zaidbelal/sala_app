@@ -1,7 +1,7 @@
 import Flutter
 import UIKit
 import UserNotifications
-import GoogleMaps // 👈 1. استيراد مكتبة خرائط قوقل
+import GoogleMaps
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
@@ -9,17 +9,20 @@ import GoogleMaps // 👈 1. استيراد مكتبة خرائط قوقل
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    // 🗺️ 2. تفعيل مفتاح خرائط قوقل للآيفون قبل تسجيل الـ Plugins لمنع الانهيار
     GMSServices.provideAPIKey("AIzaSyC_O1Uu7f5sCrg5Xy2uP1JNeb_qgBPMqjo")
 
-    // تسجيل الإشعارات الفورية الأصلية لنظام iOS
     if #available(iOS 10.0, *) {
-      UNUserNotificationCenter.current().delegate = self as UNUserNotificationCenterDelegate
+      UNUserNotificationCenter.current().delegate = self
     }
 
-    GeneratedPluginRegistrant.register(with: self)
     application.registerForRemoteNotifications()
+    GeneratedPluginRegistrant.register(with: self)
 
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  // تمرير جهاز الآيفون المسجل لدى APNs إلى إضافات فايربيز بنجاح
+  override func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+    super.application(application, didRegisterForRemoteNotificationsWithDeviceToken: deviceToken)
   }
 }

@@ -316,10 +316,21 @@ class NotificationService {
       _onMessageOpenedSub ??=
           FirebaseMessaging.onMessageOpenedApp.listen(_handleFcmTap);
 
+      // على نظام iOS ننتظر تأكيد اتصال الجهاز بسيرفرات Apple APNs أولاً
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        String? apnsToken = await _messaging.getAPNSToken();
+        int attempts = 0;
+        while (apnsToken == null && attempts < 10) {
+          await Future.delayed(const Duration(milliseconds: 500));
+          apnsToken = await _messaging.getAPNSToken();
+          attempts++;
+        }
+      }
+
+      // زيادة المهلة إلى 15 ثانية لتغطية الوقت الذي يقرأ فيه المستخدم نافذة "السماح بالإشعارات"
       final token = await _messaging
           .getToken()
-          .timeout(const Duration(seconds: 4), onTimeout: () => null);
-
+          .timeout(const Duration(seconds: 15), onTimeout: () => null);
       if (token == null || userId.isEmpty) return;
       try {
         await _messaging
