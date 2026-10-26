@@ -271,10 +271,15 @@ class AppStorage {
           final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
 
           await tempFile.writeAsString(json, flush: true);
-          if (await finalFile.exists()) {
-            await finalFile.delete();
+
+          // 🔒 استبدال ذري آمن بدون حذف مسبق: POSIX Atomic Rename
+          try {
+            await tempFile.rename(finalFile.path);
+          } catch (_) {
+            // حل بديل في حال قيود أنظمة الملفات بين الأقسام
+            await tempFile.copy(finalFile.path);
+            await tempFile.delete().catchError((_) => tempFile);
           }
-          await tempFile.rename(finalFile.path);
         } catch (_) {
           try {
             final finalFile = File('$_appDocsPath/${key}_backup.json');
@@ -462,7 +467,18 @@ class AppStorage {
     final targetUid = uid ?? userId;
     if (targetUid == null || targetUid.isEmpty) return [];
     final key = _userPendingLedgerKey(targetUid);
-    final raw = _db.getString(key);
+    var raw = _db.getString(key);
+
+    // 🔒 استعادة ذرية من القرص الصلب فوراً في حال فقدان بيانات SharedPreferences
+    if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
+      try {
+        final backupFile = File('$_appDocsPath/${key}_backup.json');
+        if (backupFile.existsSync()) {
+          raw = backupFile.readAsStringSync();
+        }
+      } catch (_) {}
+    }
+
     if (raw == null || raw.isEmpty) return [];
     try {
       final decoded = jsonDecode(raw);

@@ -886,6 +886,265 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
   }
 
   double get _grandTotal => _items.fold(0.0, (sum, i) => sum + i.total);
+// ── دالة إضافة سلعة يدوياً بدون باركود (بالاسم والسعر والوحدة كتابة حرة) ──
+  Future<void> _addManualItem() async {
+    final nameCtrl = TextEditingController();
+    final priceCtrl = TextEditingController();
+    final qtyCtrl = TextEditingController(text: '1');
+    final unitCtrl = TextEditingController(text: ''); // تبدأ فارغة على "لاشيء"
+
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          backgroundColor: ctx.bgCard,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+          title: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(Icons.edit_note_rounded,
+                    color: AppColors.primary, size: 22),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                'إضافة سلعة بدون باركود ✍️',
+                style: TextStyle(
+                  fontFamily: 'Cairo',
+                  fontSize: 15,
+                  fontWeight: FontWeight.w900,
+                  color: ctx.textPrimary,
+                ),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameCtrl,
+                  autofocus: true,
+                  style: TextStyle(fontFamily: 'Cairo', color: ctx.textPrimary),
+                  decoration: InputDecoration(
+                    hintText: 'اسم السلعة (مثال: روتي، بيض، شاي)...',
+                    hintStyle: TextStyle(
+                        fontFamily: 'Cairo', fontSize: 12, color: ctx.textHint),
+                    filled: true,
+                    fillColor: ctx.bgInput,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: priceCtrl,
+                  keyboardType:
+                      const TextInputType.numberWithOptions(decimal: true),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontFamily: 'Cairo',
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                    color: AppColors.primary,
+                  ),
+                  inputFormatters: [
+                    TextInputFormatter.withFunction((oldVal, newVal) {
+                      const arabic = {
+                        '٠': '0',
+                        '١': '1',
+                        '٢': '2',
+                        '٣': '3',
+                        '٤': '4',
+                        '٥': '5',
+                        '٦': '6',
+                        '٧': '7',
+                        '٨': '8',
+                        '٩': '9'
+                      };
+                      var t = newVal.text;
+                      arabic.forEach((k, v) => t = t.replaceAll(k, v));
+                      t = t.replaceAll(RegExp(r'[^0-9.]'), '');
+                      return TextEditingValue(
+                          text: t,
+                          selection: TextSelection.collapsed(offset: t.length));
+                    }),
+                  ],
+                  decoration: InputDecoration(
+                    hintText: 'السعر ر.ي *',
+                    hintStyle: TextStyle(
+                        fontFamily: 'Cairo', fontSize: 13, color: ctx.textHint),
+                    filled: true,
+                    fillColor: ctx.bgInput,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    // حقل الكمية
+                    Expanded(
+                      flex: 2,
+                      child: TextField(
+                        controller: qtyCtrl,
+                        keyboardType: TextInputType.number,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                            fontFamily: 'Cairo',
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: ctx.textPrimary),
+                        inputFormatters: [
+                          FilteringTextInputFormatter.digitsOnly,
+                        ],
+                        decoration: InputDecoration(
+                          hintText: 'الكمية',
+                          filled: true,
+                          fillColor: ctx.bgInput,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    // حقل كتابة الوحدة بحرية يدوياً (محددة مسبقاً على لا شيء)
+                    Expanded(
+                      flex: 3,
+                      child: TextField(
+                        controller: unitCtrl,
+                        style: TextStyle(
+                            fontFamily: 'Cairo',
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                            color: ctx.textPrimary),
+                        decoration: InputDecoration(
+                          hintText: 'الوحدة (كتابة: كيس، حبة)...',
+                          hintStyle: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 11,
+                              color: ctx.textHint),
+                          filled: true,
+                          fillColor: ctx.bgInput,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 12),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                // أزرار سريعة لاختيار الوحدة بنقرة واحدة وتعبئتها في الحقل كتابياً
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children:
+                        ['حبة', 'كيس', 'كرتون', 'كيلو', 'صحن', 'ربطة'].map((u) {
+                      return Padding(
+                        padding: const EdgeInsetsDirectional.only(end: 5),
+                        child: ActionChip(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          label: Text(u,
+                              style: const TextStyle(
+                                  fontFamily: 'Cairo', fontSize: 11)),
+                          backgroundColor: ctx.bgInput,
+                          onPressed: () {
+                            setDialogState(() => unitCtrl.text = u);
+                          },
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx, false),
+              child: const Text('إلغاء',
+                  style: TextStyle(fontFamily: 'Cairo', color: Colors.grey)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () {
+                final name = nameCtrl.text.trim();
+                const arabic = {
+                  '٠': '0',
+                  '١': '1',
+                  '٢': '2',
+                  '٣': '3',
+                  '٤': '4',
+                  '٥': '5',
+                  '٦': '6',
+                  '٧': '7',
+                  '٨': '8',
+                  '٩': '9'
+                };
+                var priceText = priceCtrl.text.trim();
+                arabic
+                    .forEach((k, v) => priceText = priceText.replaceAll(k, v));
+                final price = double.tryParse(priceText);
+                final qty = int.tryParse(qtyCtrl.text.trim()) ?? 1;
+                final customUnit = unitCtrl.text.trim();
+
+                if (name.isEmpty || price == null || price <= 0) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                        content:
+                            Text('يرجى كتابة اسم السلعة وسعرها بشكل صحيح')),
+                  );
+                  return;
+                }
+
+                setState(() {
+                  _items.add(_PosDebtItem(
+                    productId:
+                        'manual_${DateTime.now().millisecondsSinceEpoch}',
+                    productName: name,
+                    cartonPrice: price,
+                    cartonCapacity: 1,
+                    unitLabel:
+                        customUnit, // الوحدة التي كتبها التاجر بيده أو فارغة
+                    unitPrice: price,
+                    quantity: qty > 0 ? qty : 1,
+                  ));
+                });
+                SupermarketSoundHelper.playSupermarketBeep();
+                Navigator.pop(dialogCtx, true);
+              },
+              child: const Text('إضافة للفاتورة',
+                  style: TextStyle(
+                      fontFamily: 'Cairo', fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
 // ── 1. دالة مسح الباركود للدفتر: إغلاق الكاميرا فوراً وطلب السعر لأول مرة فقط ──
   Future<void> _scanItem() async {
     final matchedProduct =
@@ -1785,26 +2044,61 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              child: SizedBox(
-                width: double.infinity,
-                height: 48,
-                child: ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.primary,
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14)),
+              child: Row(
+                children: [
+                  // ── زر مسح الباركود بالعدسة ──
+                  Expanded(
+                    flex: 3,
+                    child: SizedBox(
+                      height: 48,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primary,
+                          foregroundColor: Colors.white,
+                          elevation: 0,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                        ),
+                        onPressed: _scanItem,
+                        icon:
+                            const Icon(Icons.qr_code_scanner_rounded, size: 20),
+                        label: const Text(
+                          'مسح باركود [📷]',
+                          style: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 13,
+                              fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ),
                   ),
-                  onPressed: _scanItem,
-                  icon: const Icon(Icons.qr_code_scanner_rounded, size: 22),
-                  label: const Text(
-                    'مسح باركود سلعة جديدة [📷]',
-                    style: TextStyle(
-                        fontFamily: 'Cairo',
-                        fontSize: 14,
-                        fontWeight: FontWeight.w800),
+                  const SizedBox(width: 8),
+                  // ── زر إضافة صنف يدوي بدون باركود ──
+                  Expanded(
+                    flex: 2,
+                    child: SizedBox(
+                      height: 48,
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: AppColors.primary,
+                          side: const BorderSide(
+                              color: AppColors.primary, width: 1.5),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                        ),
+                        onPressed: _addManualItem,
+                        icon: const Icon(Icons.edit_note_rounded, size: 20),
+                        label: const Text(
+                          'بدون باركود ✍️',
+                          style: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ),
                   ),
-                ),
+                ],
               ),
             ),
             Expanded(
@@ -1817,7 +2111,7 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
                               size: 50, color: context.iconSecondary),
                           const SizedBox(height: 10),
                           Text(
-                            'الفاتورة فارغة حالياً.\nامسح باركود أول سلعة للبدء بالبيع.',
+                            'الفاتورة فارغة حالياً.\nامسح باركود السلعة أو أضفها يدوياً بالاسم والسعر.',
                             textAlign: TextAlign.center,
                             style: TextStyle(
                                 fontFamily: 'Cairo',

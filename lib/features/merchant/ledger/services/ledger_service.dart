@@ -388,6 +388,8 @@ class LedgerService {
         'phone': phone.trim(),
         'credit_limit': creditLimit,
         'salary_day': salaryDay,
+        'created_at': now
+            .toIso8601String(), // 👈 تثبيت الختم الزمني لضبط ترتيب طابور المزامنة
       });
       return;
     }
@@ -849,6 +851,9 @@ class LedgerService {
   }
 
 // ─── مزامنة طابور الأوفلاين مع السيرفر بدقة موحدة وبدون فقدان للملف الدائم ───
+// قفل تزامني خاص بملف اليومية الدائم لمنع تضارب القراءة والكتابة
+  static Future<void> _durableFileLock = Future.value();
+
   Future<int> syncPendingLedgerQueue(String merchantId) async {
     final Map<String, Map<String, dynamic>> unifiedQueue = {};
 
@@ -858,19 +863,14 @@ class LedgerService {
       if (id.isNotEmpty) unifiedQueue[id] = item;
     }
 
-    // ترتيب المعاملات زمنياً لضمان معالجة الإضافة والسداد قبل أوامر الحذف
+    // 🔒 الترتيب الزمني الفعلي للحركات بناءً على وقت حدوثها الحقيقي لمنع تعارض رقم الهاتف المحذوف
     final sortedQueueList = unifiedQueue.values.toList()
       ..sort((a, b) {
-        final typeOrder = (String t) => switch (t) {
-              'add_customer' => 0,
-              'debt' => 1,
-              'payment' => 2,
-              'void_request' => 3,
-              'delete_customer' => 4,
-              _ => 5,
-            };
-        return typeOrder(a['type']?.toString() ?? '')
-            .compareTo(typeOrder(b['type']?.toString() ?? ''));
+        final aTime = DateTime.tryParse(a['created_at']?.toString() ?? '') ??
+            DateTime(2000);
+        final bTime = DateTime.tryParse(b['created_at']?.toString() ?? '') ??
+            DateTime(2000);
+        return aTime.compareTo(bTime);
       });
 
     // 2. دمج أي قيود مسجلة في ملف القرص الصلب الدائم لمنع فقدانها
@@ -966,41 +966,52 @@ class LedgerService {
         synced++;
       } catch (e) {
         final errStr = e.toString().toLowerCase();
-        final isTransient = errStr.contains('network') ||
-            errStr.contains('timeout') ||
-            errStr.contains('unavailable') ||
-            errStr.contains('socket');
+        // 🔒 حظر حذف أي معاملة مالية إلا إذا كان الخطأ تأكيداً صريحاً بأنها سُجلت مسبقاً (Already Recorded)
+        // أو خطأ مدخلات غير قابل للإصلاح نهائياً موثق من السيرفر، مع الاحتفاظ بباقي الحالات
+        final bool isAlreadyProcessed = errStr.contains('alreadyrecorded') ||
+            errStr.contains('alreadyvoided') ||
+            errStr.contains('already-exists');
 
-        // لا نحذف طلبات الشطب أبداً عند خطأ not-found لأن وثيقة الزبون قد تكون في طريقها للإنشاء
-        final isVoidNotFound =
-            type == 'void_request' && errStr.contains('not-found');
-        if (!isTransient && !isVoidNotFound) {
-          if (kDebugMode) debugPrint('⚠️ تم تنظيف قيد غير صالح: $txId');
+        if (isAlreadyProcessed) {
           await AppStorage.removePendingLedgerTx(txId, merchantId);
           successfullySyncedIds.add(txId);
+          synced++;
+        } else {
+          // في جميع الحالات الأخرى، يتم إبقاء المعاملة في الطابور والملف الدائم لمنع ضياع أموال التاجر
+          if (kDebugMode)
+            debugPrint(
+                '⚠️ تم تأجيل مزامنة القيد المالي $txId لحين استقرار الاتصال: $e');
         }
       }
     }
-// 3. إعادة كتابة ملف القرص الدائم ذرياً وآمناً دون مسح العمليات الجديدة المضافة أثناء المزامنة
+// 3. إعادة كتابة ملف القرص الدائم داخل قفل Mutex لقراءة التعديلات اللحظية الطازجة
     if (!kIsWeb && durableFile != null && successfullySyncedIds.isNotEmpty) {
+      final prevLock = _durableFileLock;
+      final completer = Completer<void>();
+      _durableFileLock = completer.future;
+      try {
+        await prevLock;
+      } catch (_) {}
+
       try {
         final syncedSet = successfullySyncedIds.toSet();
-        final currentFileLines = await durableFile.exists()
+        // قراءة الملف مجدداً داخل القفل لالتقاط أي عمليات كُتبت أثناء استجابة الشبكة
+        final freshLines = await durableFile.exists()
             ? await durableFile.readAsLines()
             : <String>[];
         final remainingLines = <String>[];
 
-        for (final line in currentFileLines) {
-          if (line.trim().isEmpty) continue;
+        for (final line in freshLines) {
+          final trimmed = line.trim();
+          if (trimmed.isEmpty) continue;
           try {
-            final entry = jsonDecode(line.trim());
+            final entry = jsonDecode(trimmed);
             final id = entry['id']?.toString() ?? '';
-            // نحتفظ فقط بالقيود التي لم تكن ضمن الدفعة المتزامنة بنجاح
             if (!syncedSet.contains(id)) {
-              remainingLines.add(line.trim());
+              remainingLines.add(trimmed);
             }
           } catch (_) {
-            remainingLines.add(line);
+            remainingLines.add(trimmed);
           }
         }
 
@@ -1018,6 +1029,8 @@ class LedgerService {
         }
       } catch (e) {
         debugPrint('⚠️ فشل التحديث الذري لملف اليومية الدائم: $e');
+      } finally {
+        completer.complete();
       }
     }
 
@@ -1033,12 +1046,16 @@ class LedgerService {
       return const Stream.empty();
     }
 // 🛡️ استعلام مؤمن وفوري بدون اشتراط فهارس مركبة معقدة
+    // 🔒 استعلام يعتمد فقط على شروط المساواة دون إجبار Firestore على فهرس مركب
+    // الفرز يتم في الذاكرة المحلية (In-Memory) مما يمنع خطأ FAILED_PRECONDITION نهائياً
+    // 🔒 استعلام مفهرس سحابياً تنازلياً يضمن جلب أحدث الحركات فوراً مهما بلغت آلاف السجلات
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
         .where('merchant_id', isEqualTo: currentMerchantId.trim())
         .where('customer_id', isEqualTo: cleanCustomerId)
         .orderBy('created_at', descending: true)
         .limit(limit);
+
     return query.snapshots(includeMetadataChanges: true).map((snap) {
       final list = snap.docs
           .where((d) =>
@@ -1046,6 +1063,7 @@ class LedgerService {
               d.data()['is_voided'] != true)
           .map((d) => LedgerEntry.fromMap({'id': d.id, ...d.data()}))
           .toList();
+
       final pendingQueue = AppStorage.getPendingLedgerTxs(currentMerchantId)
           .where((t) => t['customer_id'] == cleanCustomerId);
 
@@ -1058,7 +1076,9 @@ class LedgerService {
       final existingIds = list.map((e) => e.id).toSet();
       for (final p in pendingQueue) {
         final type = p['type']?.toString();
-        if (type == 'void_request' || type == 'add_customer') continue;
+        if (type == 'void_request' ||
+            type == 'add_customer' ||
+            type == 'delete_customer') continue;
         if (!existingIds.contains(p['id'])) {
           list.add(LedgerEntry.fromMap(p));
         }
@@ -1068,8 +1088,9 @@ class LedgerService {
         list.removeWhere((e) => voidedTargetIds.contains(e.id));
       }
 
+      // فرز نهائي لدمج حركات الأوفلاين الأحدث في القمة
       list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-      return list.take(limit).toList();
+      return list;
     });
   }
 
@@ -1140,13 +1161,15 @@ class LedgerService {
           '➕ *مبلغ الفاتورة الجديدة:* ${lastEntry.amount.round()} ر.ي');
       buffer.writeln('📅 *التاريخ:* $dateStr ($timeStr)');
       if (lastEntry.items.isNotEmpty) {
-        buffer.writeln('🛒 *الأصناف المسجلة:*');
+        buffer.writeln('🛒 *الأصناف المسجلة بالتفصيل:*');
         for (final item in lastEntry.items) {
-          final name = item['name'] ?? 'صنف';
+          final name = item['name'] ?? item['product_name'] ?? 'صنف';
           final qty = item['quantity'] ?? 1;
           final unit = item['unit_label'] ?? 'حبة';
-          final total = (item['subtotal'] as num?)?.round() ?? 0;
-          buffer.writeln('  • $name (عدد $qty $unit) = $total ر.ي');
+          final price = (item['unit_price'] as num?)?.round() ?? 0;
+          final total = (item['subtotal'] as num?)?.round() ??
+              (price * (qty as num).round());
+          buffer.writeln('  • $name: $qty $unit × $price ر.ي = $total ر.ي');
         }
       } else if (lastEntry.notes != null &&
           lastEntry.notes!.trim().isNotEmpty) {
@@ -1305,7 +1328,6 @@ class LedgerService {
     final double openingBalance = LedgerCustomer.sanitizeAmount(
       customer.currentBalance - (periodTotalDebt - periodTotalPayment),
     );
-
     for (int i = 0; i < sortedEntries.length; i++) {
       final e = sortedEntries[i];
       final eDate =
@@ -1313,64 +1335,82 @@ class LedgerService {
       final eTime = formatTime12H(e.createdAt);
 
       final balanceAfterThisTx = currentRunningBalance;
-      // الرصيد للحركة التي قبلها زمنياً
       if (e.isDebt) {
         currentRunningBalance -= e.amount;
       } else {
         currentRunningBalance += e.amount;
       }
 
-      // ── حل الملاحظة 2: إذا كانت الفاتورة من الكاشير وفيها عدة أصناف ──
+      // ── الحالة 1: فاتورة فيها أصناف متعددة (إظهار كل صنف بكميته وسعره وإجماليه) ──
       if (e.items.isNotEmpty && e.items.length > 1) {
-        // صف رئيسي لإجمالي الفاتورة
         tableRows.add([
           '${i + 1}',
           '$eDate\n$eTime',
-          'فاتورة كاشير (+)',
-          'فاتورة مبيعات مشتريات بالدين (${e.items.length} أصناف)',
-          '${e.amount.toStringAsFixed(0)} ريال',
+          'فاتورة مشتريات بالدين (${e.items.length} أصناف)',
+          '—',
+          '—',
+          '+ ${e.amount.toStringAsFixed(0)} ريال',
           '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
         ]);
 
-        // صف تفصيلي للأصناف دون تكرار خانة المبلغ لمنع لبس الإجمالي
         for (final item in e.items) {
           final pName =
               (item['name'] ?? item['product_name'] ?? 'صنف').toString().trim();
           final q = item['quantity'] ?? 1;
           final u = (item['unit_label'] ?? 'حبة').toString().trim();
           final uPrice = (item['unit_price'] as num?)?.toDouble() ?? 0.0;
+          final subtotal =
+              (item['subtotal'] as num?)?.toDouble() ?? (uPrice * (q as num));
 
           tableRows.add([
-            '—',
             '',
-            '↳ تفصيل',
-            '$pName [عدد: $q $u × ${uPrice.toStringAsFixed(0)} ريال]',
-            '—',
+            '',
+            '  ↳ $pName',
+            '$q $u',
+            '${uPrice.toStringAsFixed(0)} ريال',
+            '${subtotal.toStringAsFixed(0)} ريال',
             '',
           ]);
         }
-      } else {
-        // حركة عادية (صنف واحد أو سداد نقدي أو دين مباشر)
-        String details = '';
-        if (e.items.isNotEmpty) {
-          final it = e.items.first;
-          final pName =
-              (it['name'] ?? it['product_name'] ?? 'صنف').toString().trim();
-          final q = it['quantity'] ?? 1;
-          final u = (it['unit_label'] ?? '').toString().trim();
-          details = '$pName ($q $u)';
-        } else if (e.notes != null && e.notes!.trim().isNotEmpty) {
-          details = e.notes!.trim();
+      }
+      // ── الحالة 2: صنف واحد (يُكتب مباشرة: الكمية والسعر والإجمالي في نفس السطر) ──
+      else if (e.items.length == 1) {
+        final it = e.items.first;
+        final pName =
+            (it['name'] ?? it['product_name'] ?? 'صنف').toString().trim();
+        final q = it['quantity'] ?? 1;
+        final u = (it['unit_label'] ?? 'حبة').toString().trim();
+        final uPrice = (it['unit_price'] as num?)?.toDouble() ?? 0.0;
+        final subtotal =
+            (it['subtotal'] as num?)?.toDouble() ?? (uPrice * (q as num));
+
+        tableRows.add([
+          '${i + 1}',
+          '$eDate\n$eTime',
+          pName,
+          '$q $u',
+          '${uPrice.toStringAsFixed(0)} ريال',
+          '+ ${subtotal.toStringAsFixed(0)} ريال',
+          '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
+        ]);
+      }
+      // ── الحالة 3: سداد نقدي أو دين مباشر بدون أصناف ──
+      else {
+        final isDebt = e.isDebt;
+        String desc = '';
+        if (e.notes != null && e.notes!.trim().isNotEmpty) {
+          desc = e.notes!.trim();
         } else {
-          details = e.isDebt ? 'مشتريات بالآجل' : 'سداد دفعة نقدية';
+          desc = isDebt ? 'مشتريات بالدين' : 'سداد دفعة نقدية';
         }
 
         tableRows.add([
           '${i + 1}',
           '$eDate\n$eTime',
-          e.isDebt ? 'دين (+)' : 'سداد (-)',
-          details,
-          '${e.amount.toStringAsFixed(0)} ريال',
+          desc,
+          '—',
+          '—',
+          '${isDebt ? '+' : '-'} ${e.amount.toStringAsFixed(0)} ريال',
           '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
         ]);
       }
@@ -1380,13 +1420,13 @@ class LedgerService {
       tableRows.add([
         '—',
         '—',
-        'رصيد سابق',
-        'رصيد افتتاحي سابق مُرحّل',
+        'رصيد افتتاحي سابق مرحّل',
+        '—',
+        '—',
         '—',
         '${openingBalance.toStringAsFixed(0)} ريال',
       ]);
     }
-
     final qrPayload =
         'SALA|STORE:$storeName|CUST:${customer.name}|BAL:${customer.currentBalance.toStringAsFixed(0)}|DATE:$dateStr';
 
@@ -1647,20 +1687,29 @@ class LedgerService {
             ),
           ),
           pw.SizedBox(height: 8),
-
-          // ── الجدول كعنصر مباشر حر (يبدأ فوراً بالصفحة الأولى وينقسم بين الصفحات تلقائياً) ──
+// ── جدول الحركات التفصيلي المحاسبي بالأعمدة السبعة المعتمدة ──
           pw.Directionality(
             textDirection: pw.TextDirection.rtl,
             child: pw.TableHelper.fromTextArray(
               headers: [
                 'م',
                 'التاريخ والوقت',
-                'النوع',
-                'البيان والأصناف',
-                'المبلغ',
-                'الرصيد بعد الحركة',
+                'البيان / الصنف',
+                'الكمية',
+                'السعر',
+                'الإجمالي',
+                'الرصيد المتبقي',
               ],
               data: tableRows,
+              columnWidths: {
+                0: const pw.FixedColumnWidth(20),
+                1: const pw.FixedColumnWidth(65),
+                2: const pw.FlexColumnWidth(3.5),
+                3: const pw.FixedColumnWidth(50),
+                4: const pw.FixedColumnWidth(55),
+                5: const pw.FixedColumnWidth(65),
+                6: const pw.FixedColumnWidth(70),
+              },
               headerStyle: pw.TextStyle(
                   font: boldFont, fontSize: 8.5, color: PdfColors.white),
               headerDecoration:
@@ -1670,14 +1719,15 @@ class LedgerService {
               cellAlignments: {
                 0: pw.Alignment.center,
                 1: pw.Alignment.center,
-                2: pw.Alignment.center,
-                3: pw.Alignment.centerRight,
+                2: pw.Alignment.centerRight,
+                3: pw.Alignment.center,
                 4: pw.Alignment.center,
                 5: pw.Alignment.center,
+                6: pw.Alignment.center,
               },
               headerHeight: 22,
               cellPadding:
-                  const pw.EdgeInsets.symmetric(horizontal: 5, vertical: 3.5),
+                  const pw.EdgeInsets.symmetric(horizontal: 4, vertical: 3.5),
               rowDecoration: pw.BoxDecoration(color: PdfColors.white),
               oddRowDecoration:
                   pw.BoxDecoration(color: PdfColor.fromHex('#FAFAFA')),

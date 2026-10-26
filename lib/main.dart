@@ -146,8 +146,9 @@ void main() async {
   try {
     await AppCache.instance.init();
     await WalService.instance.init();
+    // 🔒 منح مهلة متوافقة مع استعلام السيرفر لضمان إتمام تسوية العمليات المالية بعد الانهيار
     await WalService.instance.reconcilePendingEntries().timeout(
-          const Duration(milliseconds: 1200),
+          const Duration(milliseconds: 4500),
           onTimeout: () => null,
         );
   } catch (e) {

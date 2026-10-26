@@ -1,7 +1,3 @@
-// ==================================================
-// FILE: lib\features\merchant\barcode\barcode_scanner_screen.dart
-// ==================================================
-
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -10,15 +6,36 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../../core/constants/app_colors.dart';
 import '../../../../core/services/app_cache.dart';
 import 'dart:math' as math;
+import 'package:audioplayers/audioplayers.dart' hide Source;
 
-/// صوت النقر التجاري التنبيهي الفوري المحاكي لأجهزة Zebra و Honeywell
+/// مشغل صوت البيب التجاري الفوري بصوت مرتفع واستجابة فورية بدون تأخير (0ms)
 class SupermarketSoundHelper {
   SupermarketSoundHelper._();
-  static void playSupermarketBeep() {
+  static AudioPlayer? _audioPlayer;
+
+  static AudioPlayer get _player {
+    if (_audioPlayer == null) {
+      _audioPlayer = AudioPlayer();
+      _audioPlayer!.setReleaseMode(ReleaseMode.stop);
+    }
+    return _audioPlayer!;
+  }
+
+  static Future<void> playSupermarketBeep() async {
     HapticFeedback.mediumImpact();
     try {
-      SystemSound.play(SystemSoundType.click);
-    } catch (_) {}
+      final p = _player;
+      await p.stop();
+      await p.setVolume(1.0); // 👈 أعلى درجة صوت 100%
+      await p.play(
+        AssetSource('sounds/beep.mp3'),
+        mode: PlayerMode.lowLatency, // 👈 استجابة فورية 0ms كأجهزة السوبرماركت
+      );
+    } catch (_) {
+      try {
+        SystemSound.play(SystemSoundType.click);
+      } catch (_) {}
+    }
   }
 
   static void playRetryFeedback() {

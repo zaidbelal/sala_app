@@ -130,24 +130,46 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
               ),
               onTap: () async {
                 Navigator.pop(sheetCtx);
-                final liveCustDoc = await FirebaseFirestore.instance
-                    .collection('merchant_customers')
-                    .doc(_customer.id)
-                    .get(const GetOptions(source: Source.serverAndCache));
-                final authoritativeCustomer =
-                    (liveCustDoc.exists && liveCustDoc.data() != null)
-                        ? LedgerCustomer.fromMap(
-                            {'id': liveCustDoc.id, ...liveCustDoc.data()!})
-                        : _customer;
+                try {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('جاري إعداد كشف الحساب الرسمي...',
+                          style: TextStyle(fontFamily: 'Cairo')),
+                      duration: Duration(seconds: 1),
+                    ),
+                  );
 
-                final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(authoritativeCustomer.id, limit: 1000)
-                    .first;
-                await LedgerService.instance.shareCustomerStatementPdf(
-                  customer: authoritativeCustomer,
-                  storeName: widget.storeName,
-                  entries: entriesSnap,
-                );
+                  final liveCustDoc = await FirebaseFirestore.instance
+                      .collection('merchant_customers')
+                      .doc(_customer.id)
+                      .get(const GetOptions(source: Source.serverAndCache));
+                  final authoritativeCustomer =
+                      (liveCustDoc.exists && liveCustDoc.data() != null)
+                          ? LedgerCustomer.fromMap(
+                              {'id': liveCustDoc.id, ...liveCustDoc.data()!})
+                          : _customer;
+
+                  final entriesSnap = await LedgerService.instance
+                      .watchCustomerEntries(authoritativeCustomer.id,
+                          limit: 250)
+                      .first;
+
+                  await LedgerService.instance.shareCustomerStatementPdf(
+                    customer: authoritativeCustomer,
+                    storeName: widget.storeName,
+                    entries: entriesSnap,
+                  );
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('تعذر تصدير كشف الحساب: $e',
+                            style: const TextStyle(fontFamily: 'Cairo')),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
               },
             ),
             const Divider(height: 12),
@@ -185,8 +207,9 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                             {'id': liveCustDoc.id, ...liveCustDoc.data()!})
                         : _customer;
 
+                // 🔒 تحديد سقف مدروس للتقرير الفوري لتفادي استنزاف ذاكرة جهاز التاجر (OOM Crash)
                 final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(authoritativeCustomer.id, limit: 1000)
+                    .watchCustomerEntries(authoritativeCustomer.id, limit: 250)
                     .first;
                 await LedgerService.instance.printOrPreviewStatementPdf(
                   customer: authoritativeCustomer,
@@ -368,19 +391,26 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   final isLiveFromServer = !custSnap.data!.metadata.isFromCache;
                   double localAdjustments = 0.0;
                   if (!isLiveFromServer) {
-                    // 🔒 تصحيح رياضي حتمي: احتساب المعاملات غير المنعكسة في السيرفر فقط دون إعادة خصم المشطوب محلياً
                     final pendingTxs =
                         AppStorage.getPendingLedgerTxs(_customer.merchantId)
                             .where((t) => t['customer_id'] == _customer.id);
                     double pendingDelta = 0.0;
                     for (final tx in pendingTxs) {
                       final txType = tx['type']?.toString();
+                      final txId = tx['id']?.toString() ?? '';
+
                       if (txType == 'add_customer' ||
-                          txType == 'void_request' ||
                           txType == 'delete_customer') {
                         continue;
                       }
-                      final txId = tx['id']?.toString() ?? '';
+
+                      // 🔒 احتساب أوامر الشطب المعلقة أوفلاين لعكس أثرها المالي فوراً في الواجهة
+                      if (txType == 'void_request') {
+                        final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+                        final isDebt = tx['is_debt'] != false;
+                        pendingDelta += isDebt ? -amt : amt;
+                        continue;
+                      }
 
                       if (serverAppliedIds.contains(txId)) continue;
                       if (_locallyDismissedEntryIds.contains(txId)) continue;
@@ -390,7 +420,6 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       pendingDelta += isDebt ? amt : -amt;
                     }
 
-                    // لا نعيد تطبيق voidDelta لأن الكاش المحلي serverCustomer تم تحديثه مسبقاً في voidTransaction
                     localAdjustments = pendingDelta;
                   }
                   displayedCustomer = LedgerCustomer(
@@ -834,24 +863,38 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                                     if (item.items.isNotEmpty)
                                       Padding(
                                         padding: const EdgeInsets.symmetric(
-                                            vertical: 2),
-                                        child: Text(
-                                          item.items.map((it) {
+                                            vertical: 4),
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: item.items.map((it) {
                                             final name = it['name'] ??
                                                 it['product_name'] ??
                                                 'صنف';
                                             final q = it['quantity'] ?? 1;
-                                            final u = it['unit_label'] ?? '';
-                                            return '$name ($q $u)';
-                                          }).join(' ، '),
-                                          style: const TextStyle(
-                                            fontFamily: 'Cairo',
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w700,
-                                            color: AppColors.primary,
-                                          ),
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis,
+                                            final u = it['unit_label'] ?? 'حبة';
+                                            final uPrice =
+                                                (it['unit_price'] as num?)
+                                                        ?.toDouble() ??
+                                                    0.0;
+                                            final subtotal =
+                                                (it['subtotal'] as num?)
+                                                        ?.toDouble() ??
+                                                    (uPrice * (q as num));
+                                            return Padding(
+                                              padding: const EdgeInsets.only(
+                                                  bottom: 2),
+                                              child: Text(
+                                                '• $name: $q $u × ${uPrice.toStringAsFixed(0)} = ${subtotal.toStringAsFixed(0)} ر.ي',
+                                                style: const TextStyle(
+                                                  fontFamily: 'Cairo',
+                                                  fontSize: 11.5,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: AppColors.primary,
+                                                ),
+                                              ),
+                                            );
+                                          }).toList(),
                                         ),
                                       )
                                     else if (item.notes != null &&
@@ -977,13 +1020,17 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
     setState(() => _isSaving = true);
 
     final merchantId = AppStorage.userId ?? '';
-    // ✅ تثبيت المعرف الحتمي لمنع توليد حركات مزدوجة عند النقر المتكرر أو فقدان الحزم الشبكية
     final safeMId =
         merchantId.length > 5 ? merchantId.substring(0, 5) : merchantId;
-    _assignedTransactionId ??=
-        'tx_${safeMId}_${widget.customer.id}_${DateTime.now().microsecondsSinceEpoch}_${(amt * 100).toInt()}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}';
-    final entryId = _assignedTransactionId!;
 
+    // 🔒 مفتاح حتمي غير قابل للتكرار مرتبط بمحتوى العملية وزمن النقر الأصلي (Idempotent Signature)
+    if (_assignedTransactionId == null) {
+      final clickTime = DateTime.now().millisecondsSinceEpoch;
+      final amountCents = (amt * 100).round();
+      _assignedTransactionId =
+          'tx_${safeMId}_${widget.customer.id}_${amountCents}_${widget.isDebt ? 'D' : 'P'}_$clickTime';
+    }
+    final entryId = _assignedTransactionId!;
     if (widget.isDebt && widget.customer.creditLimit > 0) {
       final projected = widget.customer.currentBalance + amt;
       if (projected > widget.customer.creditLimit) {

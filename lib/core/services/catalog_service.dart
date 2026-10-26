@@ -155,7 +155,8 @@ class CategoriesNotifier extends AsyncNotifier<List<Map<String, dynamic>>> {
     _realtimeSub = ref.listen<List<Map<String, dynamic>>>(
       realtimeCategoriesProvider,
       (_, next) {
-        if (!_isDisposed) {
+        // 🔒 حظر الكتابة فوق الكاش بالمصفوفات الفارغة الناتجة عن تسجيل الخروج
+        if (!_isDisposed && next.isNotEmpty) {
           state = AsyncData(next);
           unawaited(AppCache.instance.setCategories(next));
         }

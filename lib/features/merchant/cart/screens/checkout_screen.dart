@@ -469,28 +469,48 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
 
     bool isOffline = !(await ConnectivityHelper.hasActiveInternet());
     if (isOffline) {
-      // 🛡️ فحص حتمي محلي بالكاش قبل الحفظ أوفلاين لمنع تسلل سلع محذوفة
-      final cachedProducts = AppCache.instance.getProducts() ?? [];
-      final activeProductIds = cachedProducts
-          .where((p) => p['is_deleted'] != true && p['is_active'] != false)
-          .map((p) => p['id']?.toString())
-          .toSet();
-
-      final invalidItems = itemsList
-          .where(
-            (it) => !activeProductIds.contains(it['product_id']?.toString()),
-          )
-          .toList();
-
-      if (invalidItems.isNotEmpty) {
+      // 🔒 التحقق الصارم المزدوج: مطابقة الكاش الشامل وفحص حداثته (Stale Guard)
+      final allLocalProducts = AppCache.instance.getAllCachedProducts();
+      if (allLocalProducts.isEmpty) {
         safeDismissLoading();
-        for (final badIt in invalidItems) {
-          ref
-              .read(cartProvider.notifier)
-              .removeItem(badIt['product_id'].toString());
+        _showError(
+            'تعذر التحقق من توفر المنتجات في وضع عدم الاتصال، يرجى الاتصال بالإنترنت أولاً');
+        return;
+      }
+
+      final verifiedActiveMap = {
+        for (final p in allLocalProducts)
+          if (p['is_deleted'] != true && p['is_active'] != false)
+            p['id']?.toString(): p
+      };
+
+      final List<String> unverifiedOrStaleKeys = [];
+      for (final item in cart.values) {
+        final pId = item.product.id;
+        final liveP = verifiedActiveMap[pId];
+        if (liveP == null) {
+          unverifiedOrStaleKeys.add(item.cartKey);
+          continue;
+        }
+        // التحقق من توفر الوحدة المحددة وسعرها
+        final unitLabel = item.unitLabel;
+        if (unitLabel != 'كرتون') {
+          final unitsList = liveP['units'] as List<dynamic>? ?? [];
+          final unitExists = unitsList
+              .any((u) => u['label']?.toString().trim() == unitLabel.trim());
+          if (!unitExists) {
+            unverifiedOrStaleKeys.add(item.cartKey);
+          }
+        }
+      }
+
+      if (unverifiedOrStaleKeys.isNotEmpty) {
+        safeDismissLoading();
+        for (final k in unverifiedOrStaleKeys) {
+          ref.read(cartProvider.notifier).removeItem(k);
         }
         _showError(
-            'تم استبعاد أصناف غير متوفرة في الكتالوج المحلي، يرجى إعادة مراجعة الطلب');
+            'تم استبعاد أصناف غير متوفرة أو تغيرت وحداتها في الكتالوج، راجع سلتك');
         return;
       }
 
@@ -579,15 +599,7 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
               errorStr.contains('deadline-exceeded') ||
               errorStr.contains('unavailable'));
       if (isNetworkError) {
-        await WalService.instance.writeIntent(
-          transactionId: generatedOrderId,
-          type: WalOperationType.placeOrder,
-          payload: {
-            'merchant_id': merchantId,
-            'items': itemsList,
-            'expectedTotal': total,
-          },
-        );
+        // نية العملية مسجلة بالفعل في OrdersService.placeOrder، يتم الحفظ في طابور الأوفلاين مباشرة
         await AppStorage.savePendingOrder(orderData);
         _orderIdempotencyKey = null;
         ref.read(cartProvider.notifier).clear();

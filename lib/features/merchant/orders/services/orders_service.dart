@@ -120,11 +120,20 @@ class OrdersService {
       return OrderModel.fromJson(orderMap);
     } catch (e) {
       final err = e.toString().toLowerCase();
-      final bool isNetworkIssue = err.contains('network') ||
-          err.contains('timeout') ||
-          err.contains('socket') ||
-          err.contains('unavailable') ||
-          err.contains('deadline-exceeded');
+
+      // 🔒 عزل صارم لأخطاء المنتجات والمخزون عن أخطاء الشبكة لمنع تجميد الـ WAL
+      final bool isStockOrProductIssue = err.contains('product_unavailable') ||
+          err.contains('out_of_stock') ||
+          err.contains('صنف') ||
+          err.contains('غير متوفر');
+
+      final bool isNetworkIssue = !isStockOrProductIssue &&
+          (err.contains('network') ||
+              err.contains('timeout') ||
+              err.contains('socket') ||
+              err.contains('deadline-exceeded') ||
+              (err.contains('unavailable') &&
+                  !err.contains('product_unavailable')));
 
       if (!isNetworkIssue) {
         await WalService.instance.markAborted(resolvedOrderId);

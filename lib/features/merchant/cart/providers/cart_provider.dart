@@ -52,54 +52,51 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
     }
   }
 
-  Future<void> _cartSaveLock = Future.value();
+  Future<void> _cartSaveChain = Future.value();
+
   void _save() {
-    _saveDebounce?.cancel();
-    // 🔒 حفظ فوري بدون تأخير لحماية عناصر السلة من الإغلاق الفجائي للتطبيق
-    unawaited(forceSave());
+    // 🔒 جدولة تسلسلية حتمية (Sequential Mutex Queue) تضمن حفظ أحدث حالة دائماً بدون سباق
+    _cartSaveChain =
+        _cartSaveChain.then((_) => _executeSave()).catchError((_) {});
   }
 
   Future<void> forceSave() async {
+    _cartSaveChain =
+        _cartSaveChain.then((_) => _executeSave()).catchError((_) {});
+    return _cartSaveChain;
+  }
+
+  Future<void> _executeSave() async {
     if (kIsWeb) return;
-    final prev = _cartSaveLock;
-    final completer = Completer<void>();
-    _cartSaveLock = completer.future;
+    if (!AppStorage.isLoggedIn || AppStorage.userId == null) return;
 
     try {
-      await prev;
-    } catch (_) {}
-
-    try {
-      if (!AppStorage.isLoggedIn || AppStorage.userId == null) {
-        return;
-      }
-
       final file = await _cartFile;
       if (file == null) return;
 
-      if (state.isEmpty) {
-        if (await file.exists()) await file.delete();
+      // أخذ لقطة فورية للحالة الحالية داخل القفل
+      final currentState = state;
+      if (currentState.isEmpty) {
+        if (await file.exists()) await file.delete().catchError((_) => file);
         return;
       }
-      final dataMap = state.map((k, v) => MapEntry(k, v.toJson()));
+
+      final dataMap = currentState.map((k, v) => MapEntry(k, v.toJson()));
       final jsonString = jsonEncode(dataMap);
 
       final nonce = DateTime.now().microsecondsSinceEpoch;
-      final tempFile = File('${file.path}_$nonce.tmp.json');
+      final tempFile = File('${file.path}_$nonce.tmp');
       await tempFile.writeAsString(jsonString, flush: true);
-      if (await tempFile.exists()) {
-        try {
-          // استبدال ذري مباشر بنمط POSIX الذري دون حذف مسبق
-          await tempFile.rename(file.path);
-        } catch (_) {
-          await tempFile.copy(file.path);
-          await tempFile.delete().catchError((_) => tempFile);
-        }
+
+      // استبدال ذري بدون حذف
+      try {
+        await tempFile.rename(file.path);
+      } catch (_) {
+        await tempFile.copy(file.path);
+        await tempFile.delete().catchError((_) => tempFile);
       }
     } catch (e, st) {
-      if (kDebugMode) debugPrint('❌ CartNotifier.forceSave failed: $e\n$st');
-    } finally {
-      if (!completer.isCompleted) completer.complete();
+      if (kDebugMode) debugPrint('❌ Cart Sequential Save Error: $e\n$st');
     }
   }
 

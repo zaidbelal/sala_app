@@ -29,8 +29,8 @@ final _liveNewOrdersProvider = StreamProvider.autoDispose<int>((ref) {
       .snapshots(includeMetadataChanges: false)
       .map((snap) => snap.docs.length);
 });
-// صافي الربح الدائم من Firestore
-final _permanentProfitProvider = StreamProvider<double>((ref) {
+// صافي الربح الدائم من Firestore (يُفرغ تلقائياً عند إغلاق الشاشة لمنع تسريب الذاكرة)
+final _permanentProfitProvider = StreamProvider.autoDispose<double>((ref) {
   return ref.read(adminServiceProvider).watchPermanentProfit();
 });
 

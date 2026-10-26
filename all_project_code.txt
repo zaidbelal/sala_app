@@ -4317,10 +4317,15 @@ class AppStorage {
           final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
 
           await tempFile.writeAsString(json, flush: true);
-          if (await finalFile.exists()) {
-            await finalFile.delete();
+
+          // 🔒 استبدال ذري آمن بدون حذف مسبق: POSIX Atomic Rename
+          try {
+            await tempFile.rename(finalFile.path);
+          } catch (_) {
+            // حل بديل في حال قيود أنظمة الملفات بين الأقسام
+            await tempFile.copy(finalFile.path);
+            await tempFile.delete().catchError((_) => tempFile);
           }
-          await tempFile.rename(finalFile.path);
         } catch (_) {
           try {
             final finalFile = File('$_appDocsPath/${key}_backup.json');
@@ -5296,6 +5301,10 @@ class PrefetchService {
 // FILE: lib\core\services\realtime_hub.dart
 // ==================================================
 
+// ==================================================
+// FILE: lib/core/services/realtime_hub.dart
+// ==================================================
+
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -5312,12 +5321,6 @@ import 'package:sala/features/merchant/cart/providers/cart_provider.dart';
 
 // ══════════════════════════════════════════════════════════
 //  RealtimeHub — Production-Grade
-//
-//  ① لا .timeout() — Firestore SDK يدير timeout داخلياً
-//  ② لا for-loop retries — retry واحد فقط مع backoff
-//  ③ _silently() يمسك كل exception بصمت — لا debugger pause
-//  ④ StateNotifier.mounted محفوظ — StateNotifier يدعمه
-//  ⑤ Heartbeat خفيف بدون .timeout() لتجنب freeze
 // ══════════════════════════════════════════════════════════
 
 enum RealtimeStatus { connecting, connected, disconnected }
@@ -5429,12 +5432,12 @@ class RealtimeHub {
   static final RealtimeHub _instance = RealtimeHub._();
   factory RealtimeHub() => _instance;
   RealtimeHub._();
+
   final _db = FirebaseFirestore.instance;
   final List<StreamSubscription> _userSubs = [];
   StreamSubscription<bool>? _connectivitySub;
   ProviderContainer? _container;
-  ProviderContainer? get container =>
-      _container; // 👈 إتاحة الوصول الآمن للـ Container الجذري
+  ProviderContainer? get container => _container;
   bool _initialized = false;
   Timer? _reconnectTimer;
   Timer? _heartbeatTimer;
@@ -5443,7 +5446,17 @@ class RealtimeHub {
 
   static const int _productsPageSize = 100;
 
-  // ── التهيئة المحصنة لمنع تكرار المستمعات ───────────────
+  StreamSubscription? _profileSub;
+  StreamSubscription? _notificationsSub;
+  StreamSubscription? _categoriesSub;
+  StreamSubscription? _brandsSub;
+
+  Future<void> _startForUserLock = Future.value();
+  String? _activeUserId;
+  String? _activeUserRole;
+  bool _isRestarting = false;
+
+  // ── التهيئة ──────────────────────────────────────────────
   void init(ProviderContainer container) {
     if (_initialized) return;
     _initialized = true;
@@ -5467,7 +5480,6 @@ class RealtimeHub {
 
     _startHeartbeat();
 
-    // حماية الاشتراك من التكرار عند انقطاع وعودة الشبكة الحقيقية فقط
     _connectivitySub ??=
         ConnectivityHelper.onConnectivityChanged.listen((hasNet) {
       final wasOffline = !_lastKnownNetworkState;
@@ -5479,16 +5491,11 @@ class RealtimeHub {
     });
   }
 
-  // ── Heartbeat ──────────────────────────────────────────
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
   }
 
-  Future<void> _startForUserLock = Future.value();
-  String? _activeUserId;
-  String? _activeUserRole;
-
-  // ── قنوات تعتمد على userId مع قفل حماية ضد التزامن المزدوج ────────────────
+  // ── قنوات المستخدم مع قفل الحماية ────────────────────────
   Future<void> startForUser(
     String userId, {
     String role = 'merchant',
@@ -5547,10 +5554,7 @@ class RealtimeHub {
     }
   }
 
-  StreamSubscription? _profileSub;
-
   void _startUserChannels(String userId, {required String role}) {
-    // إعادة تفعيل قنوات الكتالوج في حال تم إلغاؤها عند تسجيل خروج سابق
     if (_categoriesSub == null) _watchCategories();
     if (_brandsSub == null) _watchBrands();
 
@@ -5559,9 +5563,9 @@ class RealtimeHub {
       _userSubs.remove(_profileSub);
       _profileSub = null;
     }
+
     _profileSub =
         _db.collection('profiles').doc(userId).snapshots().listen((doc) async {
-      // 🔒 حماية فورية: إيقاف المعالجة إذا قام المستخدم بتسجيل الخروج بالفعل
       if (!_initialized || AppStorage.userId != userId) return;
       if (!doc.exists || doc.data() == null) return;
       final data = doc.data()!;
@@ -5572,6 +5576,7 @@ class RealtimeHub {
 
       await AppStorage.setIsBanned(isBanned);
       await AppStorage.setIsActive(isActive);
+
       if (isBanned || (!isActive && data['account_status'] != 'pending')) {
         final navContext = NotificationService.navigatorKey.currentContext;
         final container = _container;
@@ -5607,6 +5612,7 @@ class RealtimeHub {
         }
         return;
       }
+
       if (wasInactive && isActive) {
         await AppStorage.setIsActive(true);
         await AppStorage.saveUserData(
@@ -5630,6 +5636,7 @@ class RealtimeHub {
         }
         return;
       }
+
       if (newRole != AppStorage.userRole) {
         await AppStorage.saveUserData(
           userId: userId,
@@ -5638,7 +5645,6 @@ class RealtimeHub {
           phone: data['phone_number'] as String?,
         );
         unawaited(NotificationService.instance.saveTokenToFirestore(userId));
-        // 🛡️ تشغيل إعادة بناء القنوات مع التحقق الصارم من بقاء المستخدم مسجلاً
         Future.microtask(() async {
           if (AppStorage.userId == userId && _initialized) {
             await startForUser(userId, role: newRole);
@@ -5660,9 +5666,11 @@ class RealtimeHub {
         return;
       }
     }, onError: (_) {});
+
     if (_profileSub != null) {
       _userSubs.add(_profileSub!);
     }
+
     _watchNotifications(userId);
     if (role == 'admin' ||
         role == 'super_admin' ||
@@ -5678,10 +5686,9 @@ class RealtimeHub {
   }
 
   Future<void> _stopUserChannels() async {
-    _notificationsSub?.cancel();
+    await _notificationsSub?.cancel();
     _notificationsSub = null;
 
-    // 🔒 حماية الكتالوج العام: الحفاظ على قنوات الأصناف والشركات حية للتصفح العام، أو إعادة تشغيلها فوراً
     final subscriptions = List<StreamSubscription>.from(_userSubs);
     _userSubs.clear();
 
@@ -5699,7 +5706,6 @@ class RealtimeHub {
     if (_brandsSub == null) _watchBrands();
   }
 
-  // ── مراقبة طلبات التاجر ──────────────────────────────────
   void _watchOrders(String merchantId) {
     if (merchantId.isEmpty) return;
     final sub = _db
@@ -5715,9 +5721,6 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-// ── مراقبة الإشعارات وإطلاق الصوت والتنبيه فوراً ────────────
-  StreamSubscription? _notificationsSub;
-
   void _watchNotifications(String userId) {
     if (userId.isEmpty) return;
 
@@ -5726,12 +5729,12 @@ class RealtimeHub {
     bool isFirstLoad = true;
     final Set<String> knownNotifIds = {};
 
-    // إلغاء الاشتراك السابق بصورة حتمية ومضمونة
     _notificationsSub?.cancel();
     if (_notificationsSub != null) {
       _userSubs.remove(_notificationsSub);
       _notificationsSub = null;
     }
+
     final sub = _db
         .collection('user_notifications')
         .where('user_id', isEqualTo: userId)
@@ -5773,14 +5776,11 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-  // ── تحميل المنتجات ────────────────────────────────────────
   void watchProducts() {
     if ((_container?.read(realtimeProductsProvider).length ?? 0) == 0) {
       unawaited(_container?.read(realtimeProductsProvider.notifier).reload());
     }
-  } // ── مراقبة الأصناف لحظياً (تختفي فوراً عند حذفها من الإدارة) ──
-
-  StreamSubscription? _categoriesSub;
+  }
 
   void _watchCategories() {
     _categoriesSub?.cancel();
@@ -5807,9 +5807,6 @@ class RealtimeHub {
     );
   }
 
-  // ── مراقبة الشركات لحظياً ──
-  StreamSubscription? _brandsSub;
-
   void _watchBrands() {
     _brandsSub?.cancel();
     _brandsSub = _db
@@ -5835,7 +5832,6 @@ class RealtimeHub {
     );
   }
 
-  // ── Admin: كل الطلبات ────────────────────────────────────
   void _watchAllOrders() {
     final sub = _db
         .collection('orders')
@@ -5849,12 +5845,10 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-// ── Driver: الطلبات المؤكدة غير المسندة ──────────────────
   void _watchConfirmedOrders() {
     bool firstLoad = true;
     Set<String> seenIds = {};
 
-    // تقييد البث المباشر لأحدث 25 طلباً فقط لتقليل الضغط الشبكي واستهلاك القراءات على السائقين
     final sub = _db
         .collection('orders')
         .where('status', isEqualTo: 'confirmed')
@@ -5877,7 +5871,6 @@ class RealtimeHub {
         _container?.read(realtimeConfirmedOrdersProvider.notifier).update(data);
         _setConnected();
 
-        // إشعار السائق بالطلب الجديد مع إطلاق صوت الرنين
         final currentIds = {for (final d in snap.docs) d.id};
         if (!firstLoad) {
           final newIds = currentIds.difference(seenIds);
@@ -5887,7 +5880,6 @@ class RealtimeHub {
             final assignedDriver = order['driver_id'] as String?;
             if (assignedDriver != null && assignedDriver.isNotEmpty) continue;
 
-            // 🚀 تشغيل نغمة الإشعار مع الصوت والتنبيه للسائق
             NotificationService.instance.showLocalNotification(
               title: '🚨 طلب جديد وصلك!',
               body:
@@ -5910,7 +5902,6 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-  // ── Driver: طلباته هو المُسنَدة (shipped) ─────────────────
   void _watchMyShippedOrders(String driverId) {
     if (driverId.isEmpty) return;
     final sub = _db
@@ -5941,7 +5932,6 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-  // ── إدارة الحالة ──────────────────────────────────────────
   void _setConnected() {
     _reconnectTimer?.cancel();
     reconnectAttempts = 0;
@@ -5953,7 +5943,6 @@ class RealtimeHub {
     _container?.read(realtimeStatusProvider.notifier).state =
         RealtimeStatus.disconnected;
 
-    // 🚀 إعادة الاتصال التصاعدي (Exponential Backoff) لإنعاش الـ Streams في حال توقفت نهائياً.
     reconnectAttempts++;
     if (reconnectAttempts < 6) {
       _reconnectTimer?.cancel();
@@ -5962,9 +5951,6 @@ class RealtimeHub {
       });
     }
   }
-
-  // ── إعادة التشغيل ─────────────────────────────────────────
-  bool _isRestarting = false;
 
   void restart() {
     if (_isRestarting) return;
@@ -5976,7 +5962,6 @@ class RealtimeHub {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
 
-    // إلغاء اشتراكات الأصناف والشركات والإشعارات صراحة لمنع تضاعف الذاكرة
     await _categoriesSub?.cancel();
     _categoriesSub = null;
     await _brandsSub?.cancel();
@@ -5999,17 +5984,15 @@ class RealtimeHub {
     }
   }
 
-// ── الإيقاف الكامل وتطهير كافة مراجع الذاكرة والاشتراكات ──
+  // ── الإيقاف الكامل وتطهير كافة مراجع الذاكرة والاشتراكات بحل قطعي ──
   void dispose() {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
 
-    if (_connectivitySub != null) {
-      _connectivitySub?.cancel();
-      _connectivitySub = null;
-    }
+    _connectivitySub?.cancel();
+    _connectivitySub = null;
 
     _profileSub?.cancel();
     _profileSub = null;
@@ -6023,13 +6006,13 @@ class RealtimeHub {
     _brandsSub?.cancel();
     _brandsSub = null;
 
-    final subsToCancel = List<StreamSubscription>.from(_userSubs);
-    _userSubs.clear();
-    for (final s in subsToCancel) {
+    for (final s in _userSubs) {
       try {
         s.cancel();
       } catch (_) {}
     }
+    _userSubs.clear();
+
     final c = _container;
     if (c != null) {
       try {
@@ -6051,16 +6034,17 @@ class RealtimeHub {
     _activeUserRole = null;
     _initialized = false;
     reconnectAttempts = 0;
-    // 🛡️ لا نقوم بمسح _container إلى null للحفاظ على دورة حياة المزودات للتسجيلات القادمة
   }
 }
+
 // ══════════════════════════════════════════════════════════
-//  Notifiers — StateNotifier يدعم .mounted بشكل طبيعي
+//  Notifiers
 // ══════════════════════════════════════════════════════════
 
 class _OrdersNotifier extends StateNotifier<List<Map<String, dynamic>>> {
   _OrdersNotifier() : super([]);
   final _db = FirebaseFirestore.instance;
+
   Future<void> reload(String merchantId) async {
     if (merchantId.isEmpty) return;
     final docs = await _silently(
@@ -6090,7 +6074,6 @@ class _OrdersNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 
   void update(List<Map<String, dynamic>> data) {
     if (!mounted) return;
-    // ✅ إزالة الفحص `identical` الذي لم يكن فعّالاً أبداً (القائمة data دائماً كائن جديد)
     state = data;
   }
 
@@ -6387,6 +6370,7 @@ class _BrandsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
   _BrandsNotifier() : super([]);
   final _db = FirebaseFirestore.instance;
   DateTime? _lastFetch;
+
   Future<void> reload({String? categoryId}) async {
     if (state.isNotEmpty &&
         _lastFetch != null &&
@@ -6401,7 +6385,6 @@ class _BrandsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         }
         final snap =
             await query.get(const GetOptions(source: Source.serverAndCache));
-        // ✅ الفرز في الذاكرة لتجنب اشتراط Composite Index في Firestore
         final list = snap.docs
             .where((d) =>
                 d.data()['is_deleted'] != true &&
@@ -6461,7 +6444,7 @@ class _MyShippedOrdersNotifier
 }
 
 // ══════════════════════════════════════════════════════════
-//  مؤشر الاتصال — ضعه في أي شاشة
+//  مؤشر الاتصال
 // ══════════════════════════════════════════════════════════
 class RealtimeIndicator extends ConsumerWidget {
   const RealtimeIndicator({super.key});
@@ -7463,12 +7446,36 @@ class WalService {
                       .reduce((a, b) => a.isAfter(b) ? a : b)
                   : DateTime.now();
 
+              // 🔒 التحقق الشامل: مطابقة المعرفات والكميات معاً لضمان عدم مسح سلة جديدة لنفس الصنف
+              final matchingItemsList = matchingEntries
+                  .expand((e) => (e.payload['items'] as List? ?? []))
+                  .toList();
+
+              bool isExactCartMatch = cartProductIds.isNotEmpty &&
+                  cartProductIds.length == verifiedProductIds.length &&
+                  cartProductIds.every((id) => verifiedProductIds.contains(id));
+
+              if (isExactCartMatch && decoded is Map) {
+                for (final itemVal in decoded.values) {
+                  final pId = itemVal['product']?['id']?.toString();
+                  final qty = (itemVal['quantity'] as num?)?.toInt() ?? 0;
+                  final matchingOrderQty = matchingItemsList
+                      .where((m) => m['product_id']?.toString() == pId)
+                      .fold<int>(
+                          0,
+                          (sum, m) =>
+                              sum + ((m['quantity'] as num?)?.toInt() ?? 0));
+                  if (matchingOrderQty != qty) {
+                    isExactCartMatch = false;
+                    break;
+                  }
+                }
+              }
+
               final fileModTime = await file.lastModified();
-              final isAssociatedWithPending = cartProductIds.isNotEmpty &&
-                  cartProductIds
-                      .every((id) => verifiedProductIds.contains(id)) &&
+              final isAssociatedWithPending = isExactCartMatch &&
                   fileModTime.isBefore(
-                      latestTimestamp.add(const Duration(minutes: 5)));
+                      latestTimestamp.add(const Duration(minutes: 1)));
 
               if (isAssociatedWithPending) {
                 await file.delete();
@@ -9118,8 +9125,8 @@ final _liveNewOrdersProvider = StreamProvider.autoDispose<int>((ref) {
       .snapshots(includeMetadataChanges: false)
       .map((snap) => snap.docs.length);
 });
-// صافي الربح الدائم من Firestore
-final _permanentProfitProvider = StreamProvider<double>((ref) {
+// صافي الربح الدائم من Firestore (يُفرغ تلقائياً عند إغلاق الشاشة لمنع تسريب الذاكرة)
+final _permanentProfitProvider = StreamProvider.autoDispose<double>((ref) {
   return ref.read(adminServiceProvider).watchPermanentProfit();
 });
 
@@ -28812,15 +28819,36 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../../core/constants/app_colors.dart';
 import '../../../../core/services/app_cache.dart';
 import 'dart:math' as math;
+import 'package:audioplayers/audioplayers.dart';
 
-/// صوت النقر التجاري التنبيهي الفوري المحاكي لأجهزة Zebra و Honeywell
+/// مشغل صوت البيب التجاري الفوري بصوت مرتفع واستجابة فورية بدون تأخير (0ms)
 class SupermarketSoundHelper {
   SupermarketSoundHelper._();
-  static void playSupermarketBeep() {
+  static AudioPlayer? _audioPlayer;
+
+  static AudioPlayer get _player {
+    if (_audioPlayer == null) {
+      _audioPlayer = AudioPlayer();
+      _audioPlayer!.setReleaseMode(ReleaseMode.stop);
+    }
+    return _audioPlayer!;
+  }
+
+  static Future<void> playSupermarketBeep() async {
     HapticFeedback.mediumImpact();
     try {
-      SystemSound.play(SystemSoundType.click);
-    } catch (_) {}
+      final p = _player;
+      await p.stop();
+      await p.setVolume(1.0); // 👈 أعلى درجة صوت 100%
+      await p.play(
+        AssetSource('sounds/beep.mp3'),
+        mode: PlayerMode.lowLatency, // 👈 استجابة فورية 0ms كأجهزة السوبرماركت
+      );
+    } catch (_) {
+      try {
+        SystemSound.play(SystemSoundType.click);
+      } catch (_) {}
+    }
   }
 
   static void playRetryFeedback() {
@@ -30507,54 +30535,51 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
     }
   }
 
-  Future<void> _cartSaveLock = Future.value();
+  Future<void> _cartSaveChain = Future.value();
+
   void _save() {
-    _saveDebounce?.cancel();
-    // 🔒 حفظ فوري بدون تأخير لحماية عناصر السلة من الإغلاق الفجائي للتطبيق
-    unawaited(forceSave());
+    // 🔒 جدولة تسلسلية حتمية (Sequential Mutex Queue) تضمن حفظ أحدث حالة دائماً بدون سباق
+    _cartSaveChain =
+        _cartSaveChain.then((_) => _executeSave()).catchError((_) {});
   }
 
   Future<void> forceSave() async {
+    _cartSaveChain =
+        _cartSaveChain.then((_) => _executeSave()).catchError((_) {});
+    return _cartSaveChain;
+  }
+
+  Future<void> _executeSave() async {
     if (kIsWeb) return;
-    final prev = _cartSaveLock;
-    final completer = Completer<void>();
-    _cartSaveLock = completer.future;
+    if (!AppStorage.isLoggedIn || AppStorage.userId == null) return;
 
     try {
-      await prev;
-    } catch (_) {}
-
-    try {
-      if (!AppStorage.isLoggedIn || AppStorage.userId == null) {
-        return;
-      }
-
       final file = await _cartFile;
       if (file == null) return;
 
-      if (state.isEmpty) {
-        if (await file.exists()) await file.delete();
+      // أخذ لقطة فورية للحالة الحالية داخل القفل
+      final currentState = state;
+      if (currentState.isEmpty) {
+        if (await file.exists()) await file.delete().catchError((_) => file);
         return;
       }
-      final dataMap = state.map((k, v) => MapEntry(k, v.toJson()));
+
+      final dataMap = currentState.map((k, v) => MapEntry(k, v.toJson()));
       final jsonString = jsonEncode(dataMap);
 
       final nonce = DateTime.now().microsecondsSinceEpoch;
-      final tempFile = File('${file.path}_$nonce.tmp.json');
+      final tempFile = File('${file.path}_$nonce.tmp');
       await tempFile.writeAsString(jsonString, flush: true);
-      if (await tempFile.exists()) {
-        try {
-          // استبدال ذري مباشر بنمط POSIX الذري دون حذف مسبق
-          await tempFile.rename(file.path);
-        } catch (_) {
-          await tempFile.copy(file.path);
-          await tempFile.delete().catchError((_) => tempFile);
-        }
+
+      // استبدال ذري بدون حذف
+      try {
+        await tempFile.rename(file.path);
+      } catch (_) {
+        await tempFile.copy(file.path);
+        await tempFile.delete().catchError((_) => tempFile);
       }
     } catch (e, st) {
-      if (kDebugMode) debugPrint('❌ CartNotifier.forceSave failed: $e\n$st');
-    } finally {
-      if (!completer.isCompleted) completer.complete();
+      if (kDebugMode) debugPrint('❌ Cart Sequential Save Error: $e\n$st');
     }
   }
 
@@ -30567,7 +30592,6 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
       try {
         final uid = AppStorage.userId ?? 'guest';
         if (AppStorage.isLoggedIn && AppStorage.userId != null) {
-          final dir = Directory.systemTemp; // fallback سريع إن تعذر الـ async
           final dataMap = state.map((k, v) => MapEntry(k, v.toJson()));
           final jsonString = jsonEncode(dataMap);
           AppStorage.setString('sala_cart_backup_$uid', jsonString);
@@ -31654,28 +31678,48 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
 
     bool isOffline = !(await ConnectivityHelper.hasActiveInternet());
     if (isOffline) {
-      // 🛡️ فحص حتمي محلي بالكاش قبل الحفظ أوفلاين لمنع تسلل سلع محذوفة
-      final cachedProducts = AppCache.instance.getProducts() ?? [];
-      final activeProductIds = cachedProducts
-          .where((p) => p['is_deleted'] != true && p['is_active'] != false)
-          .map((p) => p['id']?.toString())
-          .toSet();
-
-      final invalidItems = itemsList
-          .where(
-            (it) => !activeProductIds.contains(it['product_id']?.toString()),
-          )
-          .toList();
-
-      if (invalidItems.isNotEmpty) {
+      // 🔒 التحقق الصارم المزدوج: مطابقة الكاش الشامل وفحص حداثته (Stale Guard)
+      final allLocalProducts = AppCache.instance.getAllCachedProducts();
+      if (allLocalProducts.isEmpty) {
         safeDismissLoading();
-        for (final badIt in invalidItems) {
-          ref
-              .read(cartProvider.notifier)
-              .removeItem(badIt['product_id'].toString());
+        _showError(
+            'تعذر التحقق من توفر المنتجات في وضع عدم الاتصال، يرجى الاتصال بالإنترنت أولاً');
+        return;
+      }
+
+      final verifiedActiveMap = {
+        for (final p in allLocalProducts)
+          if (p['is_deleted'] != true && p['is_active'] != false)
+            p['id']?.toString(): p
+      };
+
+      final List<String> unverifiedOrStaleKeys = [];
+      for (final item in cart.values) {
+        final pId = item.product.id;
+        final liveP = verifiedActiveMap[pId];
+        if (liveP == null) {
+          unverifiedOrStaleKeys.add(item.cartKey);
+          continue;
+        }
+        // التحقق من توفر الوحدة المحددة وسعرها
+        final unitLabel = item.unitLabel;
+        if (unitLabel != 'كرتون') {
+          final unitsList = liveP['units'] as List<dynamic>? ?? [];
+          final unitExists = unitsList
+              .any((u) => u['label']?.toString().trim() == unitLabel.trim());
+          if (!unitExists) {
+            unverifiedOrStaleKeys.add(item.cartKey);
+          }
+        }
+      }
+
+      if (unverifiedOrStaleKeys.isNotEmpty) {
+        safeDismissLoading();
+        for (final k in unverifiedOrStaleKeys) {
+          ref.read(cartProvider.notifier).removeItem(k);
         }
         _showError(
-            'تم استبعاد أصناف غير متوفرة في الكتالوج المحلي، يرجى إعادة مراجعة الطلب');
+            'تم استبعاد أصناف غير متوفرة أو تغيرت وحداتها في الكتالوج، راجع سلتك');
         return;
       }
 
@@ -34938,17 +34982,34 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             continue;
           } else {
             await WalService.instance.markAborted(orderId);
-            // التحقق المباشر من السيرفر لضمان عدم إعادة أصناف محذوفة إلى السلة
+            // 🔒 الاستعلام الموجه بدقة للأصناف المعنية فقط بدلاً من تحديد حد أقصى عام (500)
             List<Map<String, dynamic>> availableProducts = [];
             try {
-              final snap = await FirebaseFirestore.instance
-                  .collection('products')
-                  .where('is_deleted', isEqualTo: false)
-                  .where('is_active', isEqualTo: true)
-                  .limit(500)
-                  .get(const GetOptions(source: Source.server));
-              availableProducts =
-                  snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+              final pendingItemIds = (pending['items'] as List)
+                  .map((it) => it['product_id']?.toString() ?? '')
+                  .where((id) => id.isNotEmpty)
+                  .toSet()
+                  .toList();
+
+              for (var i = 0; i < pendingItemIds.length; i += 30) {
+                final chunk = pendingItemIds.sublist(
+                  i,
+                  i + 30 > pendingItemIds.length
+                      ? pendingItemIds.length
+                      : i + 30,
+                );
+                final snap = await FirebaseFirestore.instance
+                    .collection('products')
+                    .where(FieldPath.documentId, whereIn: chunk)
+                    .get(const GetOptions(source: Source.server));
+                availableProducts.addAll(
+                  snap.docs
+                      .where((d) =>
+                          d.data()['is_deleted'] != true &&
+                          d.data()['is_active'] != false)
+                      .map((d) => {'id': d.id, ...d.data()}),
+                );
+              }
             } catch (_) {
               availableProducts = AppCache.instance.getProducts() ?? [];
             }
@@ -40562,8 +40623,9 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                             {'id': liveCustDoc.id, ...liveCustDoc.data()!})
                         : _customer;
 
+                // 🔒 تحديد سقف مدروس للتقرير الفوري لتفادي استنزاف ذاكرة جهاز التاجر (OOM Crash)
                 final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(authoritativeCustomer.id, limit: 1000)
+                    .watchCustomerEntries(authoritativeCustomer.id, limit: 250)
                     .first;
                 await LedgerService.instance.shareCustomerStatementPdf(
                   customer: authoritativeCustomer,
@@ -40607,8 +40669,9 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                             {'id': liveCustDoc.id, ...liveCustDoc.data()!})
                         : _customer;
 
+                // 🔒 تحديد سقف مدروس للتقرير الفوري لتفادي استنزاف ذاكرة جهاز التاجر (OOM Crash)
                 final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(authoritativeCustomer.id, limit: 1000)
+                    .watchCustomerEntries(authoritativeCustomer.id, limit: 250)
                     .first;
                 await LedgerService.instance.printOrPreviewStatementPdf(
                   customer: authoritativeCustomer,
@@ -40790,19 +40853,26 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   final isLiveFromServer = !custSnap.data!.metadata.isFromCache;
                   double localAdjustments = 0.0;
                   if (!isLiveFromServer) {
-                    // 🔒 تصحيح رياضي حتمي: احتساب المعاملات غير المنعكسة في السيرفر فقط دون إعادة خصم المشطوب محلياً
                     final pendingTxs =
                         AppStorage.getPendingLedgerTxs(_customer.merchantId)
                             .where((t) => t['customer_id'] == _customer.id);
                     double pendingDelta = 0.0;
                     for (final tx in pendingTxs) {
                       final txType = tx['type']?.toString();
+                      final txId = tx['id']?.toString() ?? '';
+
                       if (txType == 'add_customer' ||
-                          txType == 'void_request' ||
                           txType == 'delete_customer') {
                         continue;
                       }
-                      final txId = tx['id']?.toString() ?? '';
+
+                      // 🔒 احتساب أوامر الشطب المعلقة أوفلاين لعكس أثرها المالي فوراً في الواجهة
+                      if (txType == 'void_request') {
+                        final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+                        final isDebt = tx['is_debt'] != false;
+                        pendingDelta += isDebt ? -amt : amt;
+                        continue;
+                      }
 
                       if (serverAppliedIds.contains(txId)) continue;
                       if (_locallyDismissedEntryIds.contains(txId)) continue;
@@ -40812,7 +40882,6 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       pendingDelta += isDebt ? amt : -amt;
                     }
 
-                    // لا نعيد تطبيق voidDelta لأن الكاش المحلي serverCustomer تم تحديثه مسبقاً في voidTransaction
                     localAdjustments = pendingDelta;
                   }
                   displayedCustomer = LedgerCustomer(
@@ -41256,24 +41325,38 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                                     if (item.items.isNotEmpty)
                                       Padding(
                                         padding: const EdgeInsets.symmetric(
-                                            vertical: 2),
-                                        child: Text(
-                                          item.items.map((it) {
+                                            vertical: 4),
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: item.items.map((it) {
                                             final name = it['name'] ??
                                                 it['product_name'] ??
                                                 'صنف';
                                             final q = it['quantity'] ?? 1;
-                                            final u = it['unit_label'] ?? '';
-                                            return '$name ($q $u)';
-                                          }).join(' ، '),
-                                          style: const TextStyle(
-                                            fontFamily: 'Cairo',
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w700,
-                                            color: AppColors.primary,
-                                          ),
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis,
+                                            final u = it['unit_label'] ?? 'حبة';
+                                            final uPrice =
+                                                (it['unit_price'] as num?)
+                                                        ?.toDouble() ??
+                                                    0.0;
+                                            final subtotal =
+                                                (it['subtotal'] as num?)
+                                                        ?.toDouble() ??
+                                                    (uPrice * (q as num));
+                                            return Padding(
+                                              padding: const EdgeInsets.only(
+                                                  bottom: 2),
+                                              child: Text(
+                                                '• $name: $q $u × ${uPrice.toStringAsFixed(0)} = ${subtotal.toStringAsFixed(0)} ر.ي',
+                                                style: const TextStyle(
+                                                  fontFamily: 'Cairo',
+                                                  fontSize: 11.5,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: AppColors.primary,
+                                                ),
+                                              ),
+                                            );
+                                          }).toList(),
                                         ),
                                       )
                                     else if (item.notes != null &&
@@ -41399,13 +41482,17 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
     setState(() => _isSaving = true);
 
     final merchantId = AppStorage.userId ?? '';
-    // ✅ تثبيت المعرف الحتمي لمنع توليد حركات مزدوجة عند النقر المتكرر أو فقدان الحزم الشبكية
     final safeMId =
         merchantId.length > 5 ? merchantId.substring(0, 5) : merchantId;
-    _assignedTransactionId ??=
-        'tx_${safeMId}_${widget.customer.id}_${DateTime.now().microsecondsSinceEpoch}_${(amt * 100).toInt()}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}';
-    final entryId = _assignedTransactionId!;
 
+    // 🔒 مفتاح حتمي غير قابل للتكرار مرتبط بمحتوى العملية وزمن النقر الأصلي (Idempotent Signature)
+    if (_assignedTransactionId == null) {
+      final clickTime = DateTime.now().millisecondsSinceEpoch;
+      final amountCents = (amt * 100).round();
+      _assignedTransactionId =
+          'tx_${safeMId}_${widget.customer.id}_${amountCents}_${widget.isDebt ? 'D' : 'P'}_$clickTime';
+    }
+    final entryId = _assignedTransactionId!;
     if (widget.isDebt && widget.customer.creditLimit > 0) {
       final projected = widget.customer.currentBalance + amt;
       if (projected > widget.customer.creditLimit) {
@@ -42562,6 +42649,265 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
   }
 
   double get _grandTotal => _items.fold(0.0, (sum, i) => sum + i.total);
+// ── دالة إضافة سلعة يدوياً بدون باركود (بالاسم والسعر والوحدة كتابة حرة) ──
+  Future<void> _addManualItem() async {
+    final nameCtrl = TextEditingController();
+    final priceCtrl = TextEditingController();
+    final qtyCtrl = TextEditingController(text: '1');
+    final unitCtrl = TextEditingController(text: ''); // تبدأ فارغة على "لاشيء"
+
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          backgroundColor: ctx.bgCard,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+          title: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(Icons.edit_note_rounded,
+                    color: AppColors.primary, size: 22),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                'إضافة سلعة بدون باركود ✍️',
+                style: TextStyle(
+                  fontFamily: 'Cairo',
+                  fontSize: 15,
+                  fontWeight: FontWeight.w900,
+                  color: ctx.textPrimary,
+                ),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameCtrl,
+                  autofocus: true,
+                  style: TextStyle(fontFamily: 'Cairo', color: ctx.textPrimary),
+                  decoration: InputDecoration(
+                    hintText: 'اسم السلعة (مثال: روتي، بيض، شاي)...',
+                    hintStyle: TextStyle(
+                        fontFamily: 'Cairo', fontSize: 12, color: ctx.textHint),
+                    filled: true,
+                    fillColor: ctx.bgInput,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: priceCtrl,
+                  keyboardType:
+                      const TextInputType.numberWithOptions(decimal: true),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontFamily: 'Cairo',
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                    color: AppColors.primary,
+                  ),
+                  inputFormatters: [
+                    TextInputFormatter.withFunction((oldVal, newVal) {
+                      const arabic = {
+                        '٠': '0',
+                        '١': '1',
+                        '٢': '2',
+                        '٣': '3',
+                        '٤': '4',
+                        '٥': '5',
+                        '٦': '6',
+                        '٧': '7',
+                        '٨': '8',
+                        '٩': '9'
+                      };
+                      var t = newVal.text;
+                      arabic.forEach((k, v) => t = t.replaceAll(k, v));
+                      t = t.replaceAll(RegExp(r'[^0-9.]'), '');
+                      return TextEditingValue(
+                          text: t,
+                          selection: TextSelection.collapsed(offset: t.length));
+                    }),
+                  ],
+                  decoration: InputDecoration(
+                    hintText: 'السعر ر.ي *',
+                    hintStyle: TextStyle(
+                        fontFamily: 'Cairo', fontSize: 13, color: ctx.textHint),
+                    filled: true,
+                    fillColor: ctx.bgInput,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    // حقل الكمية
+                    Expanded(
+                      flex: 2,
+                      child: TextField(
+                        controller: qtyCtrl,
+                        keyboardType: TextInputType.number,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                            fontFamily: 'Cairo',
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: ctx.textPrimary),
+                        inputFormatters: [
+                          FilteringTextInputFormatter.digitsOnly,
+                        ],
+                        decoration: InputDecoration(
+                          hintText: 'الكمية',
+                          filled: true,
+                          fillColor: ctx.bgInput,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    // حقل كتابة الوحدة بحرية يدوياً (محددة مسبقاً على لا شيء)
+                    Expanded(
+                      flex: 3,
+                      child: TextField(
+                        controller: unitCtrl,
+                        style: TextStyle(
+                            fontFamily: 'Cairo',
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                            color: ctx.textPrimary),
+                        decoration: InputDecoration(
+                          hintText: 'الوحدة (كتابة: كيس، حبة)...',
+                          hintStyle: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 11,
+                              color: ctx.textHint),
+                          filled: true,
+                          fillColor: ctx.bgInput,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 12),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                // أزرار سريعة لاختيار الوحدة بنقرة واحدة وتعبئتها في الحقل كتابياً
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children:
+                        ['حبة', 'كيس', 'كرتون', 'كيلو', 'صحن', 'ربطة'].map((u) {
+                      return Padding(
+                        padding: const EdgeInsetsDirectional.only(end: 5),
+                        child: ActionChip(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          label: Text(u,
+                              style: const TextStyle(
+                                  fontFamily: 'Cairo', fontSize: 11)),
+                          backgroundColor: ctx.bgInput,
+                          onPressed: () {
+                            setDialogState(() => unitCtrl.text = u);
+                          },
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx, false),
+              child: const Text('إلغاء',
+                  style: TextStyle(fontFamily: 'Cairo', color: Colors.grey)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () {
+                final name = nameCtrl.text.trim();
+                const arabic = {
+                  '٠': '0',
+                  '١': '1',
+                  '٢': '2',
+                  '٣': '3',
+                  '٤': '4',
+                  '٥': '5',
+                  '٦': '6',
+                  '٧': '7',
+                  '٨': '8',
+                  '٩': '9'
+                };
+                var priceText = priceCtrl.text.trim();
+                arabic
+                    .forEach((k, v) => priceText = priceText.replaceAll(k, v));
+                final price = double.tryParse(priceText);
+                final qty = int.tryParse(qtyCtrl.text.trim()) ?? 1;
+                final customUnit = unitCtrl.text.trim();
+
+                if (name.isEmpty || price == null || price <= 0) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                        content:
+                            Text('يرجى كتابة اسم السلعة وسعرها بشكل صحيح')),
+                  );
+                  return;
+                }
+
+                setState(() {
+                  _items.add(_PosDebtItem(
+                    productId:
+                        'manual_${DateTime.now().millisecondsSinceEpoch}',
+                    productName: name,
+                    cartonPrice: price,
+                    cartonCapacity: 1,
+                    unitLabel:
+                        customUnit, // الوحدة التي كتبها التاجر بيده أو فارغة
+                    unitPrice: price,
+                    quantity: qty > 0 ? qty : 1,
+                  ));
+                });
+                SupermarketSoundHelper.playSupermarketBeep();
+                Navigator.pop(dialogCtx, true);
+              },
+              child: const Text('إضافة للفاتورة',
+                  style: TextStyle(
+                      fontFamily: 'Cairo', fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
 // ── 1. دالة مسح الباركود للدفتر: إغلاق الكاميرا فوراً وطلب السعر لأول مرة فقط ──
   Future<void> _scanItem() async {
     final matchedProduct =
@@ -43461,26 +43807,61 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              child: SizedBox(
-                width: double.infinity,
-                height: 48,
-                child: ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.primary,
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14)),
+              child: Row(
+                children: [
+                  // ── زر مسح الباركود بالعدسة ──
+                  Expanded(
+                    flex: 3,
+                    child: SizedBox(
+                      height: 48,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primary,
+                          foregroundColor: Colors.white,
+                          elevation: 0,
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                        ),
+                        onPressed: _scanItem,
+                        icon:
+                            const Icon(Icons.qr_code_scanner_rounded, size: 20),
+                        label: const Text(
+                          'مسح باركود [📷]',
+                          style: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 13,
+                              fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ),
                   ),
-                  onPressed: _scanItem,
-                  icon: const Icon(Icons.qr_code_scanner_rounded, size: 22),
-                  label: const Text(
-                    'مسح باركود سلعة جديدة [📷]',
-                    style: TextStyle(
-                        fontFamily: 'Cairo',
-                        fontSize: 14,
-                        fontWeight: FontWeight.w800),
+                  const SizedBox(width: 8),
+                  // ── زر إضافة صنف يدوي بدون باركود ──
+                  Expanded(
+                    flex: 2,
+                    child: SizedBox(
+                      height: 48,
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: AppColors.primary,
+                          side: const BorderSide(
+                              color: AppColors.primary, width: 1.5),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                        ),
+                        onPressed: _addManualItem,
+                        icon: const Icon(Icons.edit_note_rounded, size: 20),
+                        label: const Text(
+                          'بدون باركود ✍️',
+                          style: TextStyle(
+                              fontFamily: 'Cairo',
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ),
                   ),
-                ),
+                ],
               ),
             ),
             Expanded(
@@ -43493,7 +43874,7 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
                               size: 50, color: context.iconSecondary),
                           const SizedBox(height: 10),
                           Text(
-                            'الفاتورة فارغة حالياً.\nامسح باركود أول سلعة للبدء بالبيع.',
+                            'الفاتورة فارغة حالياً.\nامسح باركود السلعة أو أضفها يدوياً بالاسم والسعر.',
                             textAlign: TextAlign.center,
                             style: TextStyle(
                                 fontFamily: 'Cairo',
@@ -44731,6 +45112,9 @@ class LedgerService {
   }
 
 // ─── مزامنة طابور الأوفلاين مع السيرفر بدقة موحدة وبدون فقدان للملف الدائم ───
+// قفل تزامني خاص بملف اليومية الدائم لمنع تضارب القراءة والكتابة
+  static Future<void> _durableFileLock = Future.value();
+
   Future<int> syncPendingLedgerQueue(String merchantId) async {
     final Map<String, Map<String, dynamic>> unifiedQueue = {};
 
@@ -44740,19 +45124,14 @@ class LedgerService {
       if (id.isNotEmpty) unifiedQueue[id] = item;
     }
 
-    // ترتيب المعاملات زمنياً لضمان معالجة الإضافة والسداد قبل أوامر الحذف
+    // 🔒 الترتيب الزمني الفعلي للحركات بناءً على وقت حدوثها الحقيقي لمنع تعارض رقم الهاتف المحذوف
     final sortedQueueList = unifiedQueue.values.toList()
       ..sort((a, b) {
-        final typeOrder = (String t) => switch (t) {
-              'add_customer' => 0,
-              'debt' => 1,
-              'payment' => 2,
-              'void_request' => 3,
-              'delete_customer' => 4,
-              _ => 5,
-            };
-        return typeOrder(a['type']?.toString() ?? '')
-            .compareTo(typeOrder(b['type']?.toString() ?? ''));
+        final aTime = DateTime.tryParse(a['created_at']?.toString() ?? '') ??
+            DateTime(2000);
+        final bTime = DateTime.tryParse(b['created_at']?.toString() ?? '') ??
+            DateTime(2000);
+        return aTime.compareTo(bTime);
       });
 
     // 2. دمج أي قيود مسجلة في ملف القرص الصلب الدائم لمنع فقدانها
@@ -44848,41 +45227,52 @@ class LedgerService {
         synced++;
       } catch (e) {
         final errStr = e.toString().toLowerCase();
-        final isTransient = errStr.contains('network') ||
-            errStr.contains('timeout') ||
-            errStr.contains('unavailable') ||
-            errStr.contains('socket');
+        // 🔒 حظر حذف أي معاملة مالية إلا إذا كان الخطأ تأكيداً صريحاً بأنها سُجلت مسبقاً (Already Recorded)
+        // أو خطأ مدخلات غير قابل للإصلاح نهائياً موثق من السيرفر، مع الاحتفاظ بباقي الحالات
+        final bool isAlreadyProcessed = errStr.contains('alreadyrecorded') ||
+            errStr.contains('alreadyvoided') ||
+            errStr.contains('already-exists');
 
-        // لا نحذف طلبات الشطب أبداً عند خطأ not-found لأن وثيقة الزبون قد تكون في طريقها للإنشاء
-        final isVoidNotFound =
-            type == 'void_request' && errStr.contains('not-found');
-        if (!isTransient && !isVoidNotFound) {
-          if (kDebugMode) debugPrint('⚠️ تم تنظيف قيد غير صالح: $txId');
+        if (isAlreadyProcessed) {
           await AppStorage.removePendingLedgerTx(txId, merchantId);
           successfullySyncedIds.add(txId);
+          synced++;
+        } else {
+          // في جميع الحالات الأخرى، يتم إبقاء المعاملة في الطابور والملف الدائم لمنع ضياع أموال التاجر
+          if (kDebugMode)
+            debugPrint(
+                '⚠️ تم تأجيل مزامنة القيد المالي $txId لحين استقرار الاتصال: $e');
         }
       }
     }
-// 3. إعادة كتابة ملف القرص الدائم ذرياً وآمناً دون مسح العمليات الجديدة المضافة أثناء المزامنة
+// 3. إعادة كتابة ملف القرص الدائم داخل قفل Mutex لقراءة التعديلات اللحظية الطازجة
     if (!kIsWeb && durableFile != null && successfullySyncedIds.isNotEmpty) {
+      final prevLock = _durableFileLock;
+      final completer = Completer<void>();
+      _durableFileLock = completer.future;
+      try {
+        await prevLock;
+      } catch (_) {}
+
       try {
         final syncedSet = successfullySyncedIds.toSet();
-        final currentFileLines = await durableFile.exists()
+        // قراءة الملف مجدداً داخل القفل لالتقاط أي عمليات كُتبت أثناء استجابة الشبكة
+        final freshLines = await durableFile.exists()
             ? await durableFile.readAsLines()
             : <String>[];
         final remainingLines = <String>[];
 
-        for (final line in currentFileLines) {
-          if (line.trim().isEmpty) continue;
+        for (final line in freshLines) {
+          final trimmed = line.trim();
+          if (trimmed.isEmpty) continue;
           try {
-            final entry = jsonDecode(line.trim());
+            final entry = jsonDecode(trimmed);
             final id = entry['id']?.toString() ?? '';
-            // نحتفظ فقط بالقيود التي لم تكن ضمن الدفعة المتزامنة بنجاح
             if (!syncedSet.contains(id)) {
-              remainingLines.add(line.trim());
+              remainingLines.add(trimmed);
             }
           } catch (_) {
-            remainingLines.add(line);
+            remainingLines.add(trimmed);
           }
         }
 
@@ -44900,6 +45290,8 @@ class LedgerService {
         }
       } catch (e) {
         debugPrint('⚠️ فشل التحديث الذري لملف اليومية الدائم: $e');
+      } finally {
+        completer.complete();
       }
     }
 
@@ -44915,11 +45307,12 @@ class LedgerService {
       return const Stream.empty();
     }
 // 🛡️ استعلام مؤمن وفوري بدون اشتراط فهارس مركبة معقدة
+    // 🔒 استعلام يعتمد فقط على شروط المساواة دون إجبار Firestore على فهرس مركب
+    // الفرز يتم في الذاكرة المحلية (In-Memory) مما يمنع خطأ FAILED_PRECONDITION نهائياً
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
         .where('merchant_id', isEqualTo: currentMerchantId.trim())
         .where('customer_id', isEqualTo: cleanCustomerId)
-        .orderBy('created_at', descending: true)
         .limit(limit);
     return query.snapshots(includeMetadataChanges: true).map((snap) {
       final list = snap.docs
@@ -45022,13 +45415,15 @@ class LedgerService {
           '➕ *مبلغ الفاتورة الجديدة:* ${lastEntry.amount.round()} ر.ي');
       buffer.writeln('📅 *التاريخ:* $dateStr ($timeStr)');
       if (lastEntry.items.isNotEmpty) {
-        buffer.writeln('🛒 *الأصناف المسجلة:*');
+        buffer.writeln('🛒 *الأصناف المسجلة بالتفصيل:*');
         for (final item in lastEntry.items) {
-          final name = item['name'] ?? 'صنف';
+          final name = item['name'] ?? item['product_name'] ?? 'صنف';
           final qty = item['quantity'] ?? 1;
           final unit = item['unit_label'] ?? 'حبة';
-          final total = (item['subtotal'] as num?)?.round() ?? 0;
-          buffer.writeln('  • $name (عدد $qty $unit) = $total ر.ي');
+          final price = (item['unit_price'] as num?)?.round() ?? 0;
+          final total = (item['subtotal'] as num?)?.round() ??
+              (price * (qty as num).round());
+          buffer.writeln('  • $name: $qty $unit × $price ر.ي = $total ر.ي');
         }
       } else if (lastEntry.notes != null &&
           lastEntry.notes!.trim().isNotEmpty) {
@@ -45187,7 +45582,6 @@ class LedgerService {
     final double openingBalance = LedgerCustomer.sanitizeAmount(
       customer.currentBalance - (periodTotalDebt - periodTotalPayment),
     );
-
     for (int i = 0; i < sortedEntries.length; i++) {
       final e = sortedEntries[i];
       final eDate =
@@ -45195,64 +45589,82 @@ class LedgerService {
       final eTime = formatTime12H(e.createdAt);
 
       final balanceAfterThisTx = currentRunningBalance;
-      // الرصيد للحركة التي قبلها زمنياً
       if (e.isDebt) {
         currentRunningBalance -= e.amount;
       } else {
         currentRunningBalance += e.amount;
       }
 
-      // ── حل الملاحظة 2: إذا كانت الفاتورة من الكاشير وفيها عدة أصناف ──
+      // ── الحالة 1: فاتورة فيها أصناف متعددة (إظهار كل صنف بكميته وسعره وإجماليه) ──
       if (e.items.isNotEmpty && e.items.length > 1) {
-        // صف رئيسي لإجمالي الفاتورة
         tableRows.add([
           '${i + 1}',
           '$eDate\n$eTime',
-          'فاتورة كاشير (+)',
-          'فاتورة مبيعات مشتريات بالدين (${e.items.length} أصناف)',
-          '${e.amount.toStringAsFixed(0)} ريال',
+          'فاتورة مشتريات بالدين (${e.items.length} أصناف)',
+          '—',
+          '—',
+          '+ ${e.amount.toStringAsFixed(0)} ريال',
           '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
         ]);
 
-        // صف تفصيلي للأصناف دون تكرار خانة المبلغ لمنع لبس الإجمالي
         for (final item in e.items) {
           final pName =
               (item['name'] ?? item['product_name'] ?? 'صنف').toString().trim();
           final q = item['quantity'] ?? 1;
           final u = (item['unit_label'] ?? 'حبة').toString().trim();
           final uPrice = (item['unit_price'] as num?)?.toDouble() ?? 0.0;
+          final subtotal =
+              (item['subtotal'] as num?)?.toDouble() ?? (uPrice * (q as num));
 
           tableRows.add([
-            '—',
             '',
-            '↳ تفصيل',
-            '$pName [عدد: $q $u × ${uPrice.toStringAsFixed(0)} ريال]',
-            '—',
+            '',
+            '  ↳ $pName',
+            '$q $u',
+            '${uPrice.toStringAsFixed(0)} ريال',
+            '${subtotal.toStringAsFixed(0)} ريال',
             '',
           ]);
         }
-      } else {
-        // حركة عادية (صنف واحد أو سداد نقدي أو دين مباشر)
-        String details = '';
-        if (e.items.isNotEmpty) {
-          final it = e.items.first;
-          final pName =
-              (it['name'] ?? it['product_name'] ?? 'صنف').toString().trim();
-          final q = it['quantity'] ?? 1;
-          final u = (it['unit_label'] ?? '').toString().trim();
-          details = '$pName ($q $u)';
-        } else if (e.notes != null && e.notes!.trim().isNotEmpty) {
-          details = e.notes!.trim();
+      }
+      // ── الحالة 2: صنف واحد (يُكتب مباشرة: الكمية والسعر والإجمالي في نفس السطر) ──
+      else if (e.items.length == 1) {
+        final it = e.items.first;
+        final pName =
+            (it['name'] ?? it['product_name'] ?? 'صنف').toString().trim();
+        final q = it['quantity'] ?? 1;
+        final u = (it['unit_label'] ?? 'حبة').toString().trim();
+        final uPrice = (it['unit_price'] as num?)?.toDouble() ?? 0.0;
+        final subtotal =
+            (it['subtotal'] as num?)?.toDouble() ?? (uPrice * (q as num));
+
+        tableRows.add([
+          '${i + 1}',
+          '$eDate\n$eTime',
+          pName,
+          '$q $u',
+          '${uPrice.toStringAsFixed(0)} ريال',
+          '+ ${subtotal.toStringAsFixed(0)} ريال',
+          '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
+        ]);
+      }
+      // ── الحالة 3: سداد نقدي أو دين مباشر بدون أصناف ──
+      else {
+        final isDebt = e.isDebt;
+        String desc = '';
+        if (e.notes != null && e.notes!.trim().isNotEmpty) {
+          desc = e.notes!.trim();
         } else {
-          details = e.isDebt ? 'مشتريات بالآجل' : 'سداد دفعة نقدية';
+          desc = isDebt ? 'مشتريات بالدين' : 'سداد دفعة نقدية';
         }
 
         tableRows.add([
           '${i + 1}',
           '$eDate\n$eTime',
-          e.isDebt ? 'دين (+)' : 'سداد (-)',
-          details,
-          '${e.amount.toStringAsFixed(0)} ريال',
+          desc,
+          '—',
+          '—',
+          '${isDebt ? '+' : '-'} ${e.amount.toStringAsFixed(0)} ريال',
           '${balanceAfterThisTx.toStringAsFixed(0)} ريال',
         ]);
       }
@@ -45262,13 +45674,13 @@ class LedgerService {
       tableRows.add([
         '—',
         '—',
-        'رصيد سابق',
-        'رصيد افتتاحي سابق مُرحّل',
+        'رصيد افتتاحي سابق مرحّل',
+        '—',
+        '—',
         '—',
         '${openingBalance.toStringAsFixed(0)} ريال',
       ]);
     }
-
     final qrPayload =
         'SALA|STORE:$storeName|CUST:${customer.name}|BAL:${customer.currentBalance.toStringAsFixed(0)}|DATE:$dateStr';
 
@@ -45529,20 +45941,29 @@ class LedgerService {
             ),
           ),
           pw.SizedBox(height: 8),
-
-          // ── الجدول كعنصر مباشر حر (يبدأ فوراً بالصفحة الأولى وينقسم بين الصفحات تلقائياً) ──
+// ── جدول الحركات التفصيلي المحاسبي بالأعمدة السبعة المعتمدة ──
           pw.Directionality(
             textDirection: pw.TextDirection.rtl,
             child: pw.TableHelper.fromTextArray(
               headers: [
                 'م',
                 'التاريخ والوقت',
-                'النوع',
-                'البيان والأصناف',
-                'المبلغ',
-                'الرصيد بعد الحركة',
+                'البيان / الصنف',
+                'الكمية',
+                'السعر',
+                'الإجمالي',
+                'الرصيد المتبقي',
               ],
               data: tableRows,
+              columnWidths: {
+                0: const pw.FixedColumnWidth(20),
+                1: const pw.FixedColumnWidth(65),
+                2: const pw.FlexColumnWidth(3.5),
+                3: const pw.FixedColumnWidth(50),
+                4: const pw.FixedColumnWidth(55),
+                5: const pw.FixedColumnWidth(65),
+                6: const pw.FixedColumnWidth(70),
+              },
               headerStyle: pw.TextStyle(
                   font: boldFont, fontSize: 8.5, color: PdfColors.white),
               headerDecoration:
@@ -45552,14 +45973,15 @@ class LedgerService {
               cellAlignments: {
                 0: pw.Alignment.center,
                 1: pw.Alignment.center,
-                2: pw.Alignment.center,
-                3: pw.Alignment.centerRight,
+                2: pw.Alignment.centerRight,
+                3: pw.Alignment.center,
                 4: pw.Alignment.center,
                 5: pw.Alignment.center,
+                6: pw.Alignment.center,
               },
               headerHeight: 22,
               cellPadding:
-                  const pw.EdgeInsets.symmetric(horizontal: 5, vertical: 3.5),
+                  const pw.EdgeInsets.symmetric(horizontal: 4, vertical: 3.5),
               rowDecoration: pw.BoxDecoration(color: PdfColors.white),
               oddRowDecoration:
                   pw.BoxDecoration(color: PdfColor.fromHex('#FAFAFA')),

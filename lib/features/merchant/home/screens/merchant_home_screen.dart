@@ -186,17 +186,34 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             continue;
           } else {
             await WalService.instance.markAborted(orderId);
-            // التحقق المباشر من السيرفر لضمان عدم إعادة أصناف محذوفة إلى السلة
+            // 🔒 الاستعلام الموجه بدقة للأصناف المعنية فقط بدلاً من تحديد حد أقصى عام (500)
             List<Map<String, dynamic>> availableProducts = [];
             try {
-              final snap = await FirebaseFirestore.instance
-                  .collection('products')
-                  .where('is_deleted', isEqualTo: false)
-                  .where('is_active', isEqualTo: true)
-                  .limit(500)
-                  .get(const GetOptions(source: Source.server));
-              availableProducts =
-                  snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+              final pendingItemIds = (pending['items'] as List)
+                  .map((it) => it['product_id']?.toString() ?? '')
+                  .where((id) => id.isNotEmpty)
+                  .toSet()
+                  .toList();
+
+              for (var i = 0; i < pendingItemIds.length; i += 30) {
+                final chunk = pendingItemIds.sublist(
+                  i,
+                  i + 30 > pendingItemIds.length
+                      ? pendingItemIds.length
+                      : i + 30,
+                );
+                final snap = await FirebaseFirestore.instance
+                    .collection('products')
+                    .where(FieldPath.documentId, whereIn: chunk)
+                    .get(const GetOptions(source: Source.server));
+                availableProducts.addAll(
+                  snap.docs
+                      .where((d) =>
+                          d.data()['is_deleted'] != true &&
+                          d.data()['is_active'] != false)
+                      .map((d) => {'id': d.id, ...d.data()}),
+                );
+              }
             } catch (_) {
               availableProducts = AppCache.instance.getProducts() ?? [];
             }
@@ -210,16 +227,24 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             final cartMap = <String, dynamic>{};
             final errorStr = e.toString();
 
+            // 🔒 استخراج معرفات المنتجات المعطلة بدقة Regex محكمة بدلاً من المطابقة النصية الفضفاضة
+            final failedIds = <String>{};
+            final exp =
+                RegExp(r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[(.*?)\]');
+            for (final match in exp.allMatches(errorStr)) {
+              final raw = match.group(1);
+              if (raw != null) {
+                failedIds.add(
+                    raw.contains(':') ? raw.split(':')[0].trim() : raw.trim());
+              }
+            }
+
             for (final item in pending['items']) {
               final productId = item['product_id']?.toString() ?? '';
-              final productName = item['product_name']?.toString() ?? '';
-
-              final isExplicitlyFailed = (productId.isNotEmpty &&
-                      errorStr.contains(productId)) ||
-                  (productName.isNotEmpty && errorStr.contains(productName));
+              final isExplicitlyFailed = failedIds.contains(productId);
               final liveProduct = activeProductMap[productId];
 
-              // إذا كان المنتج محذوفاً أو غير متوفر في الكاتالوج الفعّال لا يُعاد للسلة مطلقاً
+              // لا يُعاد للسلة إلا الصنف السليم الفعّال في قاعدة البيانات
               if (isExplicitlyFailed || liveProduct == null) {
                 continue;
               }

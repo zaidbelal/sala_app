@@ -1,3 +1,7 @@
+// ==================================================
+// FILE: lib/core/services/realtime_hub.dart
+// ==================================================
+
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -14,12 +18,6 @@ import 'package:sala/features/merchant/cart/providers/cart_provider.dart';
 
 // ══════════════════════════════════════════════════════════
 //  RealtimeHub — Production-Grade
-//
-//  ① لا .timeout() — Firestore SDK يدير timeout داخلياً
-//  ② لا for-loop retries — retry واحد فقط مع backoff
-//  ③ _silently() يمسك كل exception بصمت — لا debugger pause
-//  ④ StateNotifier.mounted محفوظ — StateNotifier يدعمه
-//  ⑤ Heartbeat خفيف بدون .timeout() لتجنب freeze
 // ══════════════════════════════════════════════════════════
 
 enum RealtimeStatus { connecting, connected, disconnected }
@@ -131,12 +129,12 @@ class RealtimeHub {
   static final RealtimeHub _instance = RealtimeHub._();
   factory RealtimeHub() => _instance;
   RealtimeHub._();
+
   final _db = FirebaseFirestore.instance;
   final List<StreamSubscription> _userSubs = [];
   StreamSubscription<bool>? _connectivitySub;
   ProviderContainer? _container;
-  ProviderContainer? get container =>
-      _container; // 👈 إتاحة الوصول الآمن للـ Container الجذري
+  ProviderContainer? get container => _container;
   bool _initialized = false;
   Timer? _reconnectTimer;
   Timer? _heartbeatTimer;
@@ -145,7 +143,17 @@ class RealtimeHub {
 
   static const int _productsPageSize = 100;
 
-  // ── التهيئة المحصنة لمنع تكرار المستمعات ───────────────
+  StreamSubscription? _profileSub;
+  StreamSubscription? _notificationsSub;
+  StreamSubscription? _categoriesSub;
+  StreamSubscription? _brandsSub;
+
+  Future<void> _startForUserLock = Future.value();
+  String? _activeUserId;
+  String? _activeUserRole;
+  bool _isRestarting = false;
+
+  // ── التهيئة ──────────────────────────────────────────────
   void init(ProviderContainer container) {
     if (_initialized) return;
     _initialized = true;
@@ -169,7 +177,6 @@ class RealtimeHub {
 
     _startHeartbeat();
 
-    // حماية الاشتراك من التكرار عند انقطاع وعودة الشبكة الحقيقية فقط
     _connectivitySub ??=
         ConnectivityHelper.onConnectivityChanged.listen((hasNet) {
       final wasOffline = !_lastKnownNetworkState;
@@ -181,16 +188,11 @@ class RealtimeHub {
     });
   }
 
-  // ── Heartbeat ──────────────────────────────────────────
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
   }
 
-  Future<void> _startForUserLock = Future.value();
-  String? _activeUserId;
-  String? _activeUserRole;
-
-  // ── قنوات تعتمد على userId مع قفل حماية ضد التزامن المزدوج ────────────────
+  // ── قنوات المستخدم مع قفل الحماية ────────────────────────
   Future<void> startForUser(
     String userId, {
     String role = 'merchant',
@@ -249,10 +251,7 @@ class RealtimeHub {
     }
   }
 
-  StreamSubscription? _profileSub;
-
   void _startUserChannels(String userId, {required String role}) {
-    // إعادة تفعيل قنوات الكتالوج في حال تم إلغاؤها عند تسجيل خروج سابق
     if (_categoriesSub == null) _watchCategories();
     if (_brandsSub == null) _watchBrands();
 
@@ -261,9 +260,9 @@ class RealtimeHub {
       _userSubs.remove(_profileSub);
       _profileSub = null;
     }
+
     _profileSub =
         _db.collection('profiles').doc(userId).snapshots().listen((doc) async {
-      // 🔒 حماية فورية: إيقاف المعالجة إذا قام المستخدم بتسجيل الخروج بالفعل
       if (!_initialized || AppStorage.userId != userId) return;
       if (!doc.exists || doc.data() == null) return;
       final data = doc.data()!;
@@ -274,6 +273,7 @@ class RealtimeHub {
 
       await AppStorage.setIsBanned(isBanned);
       await AppStorage.setIsActive(isActive);
+
       if (isBanned || (!isActive && data['account_status'] != 'pending')) {
         final navContext = NotificationService.navigatorKey.currentContext;
         final container = _container;
@@ -309,6 +309,7 @@ class RealtimeHub {
         }
         return;
       }
+
       if (wasInactive && isActive) {
         await AppStorage.setIsActive(true);
         await AppStorage.saveUserData(
@@ -332,6 +333,7 @@ class RealtimeHub {
         }
         return;
       }
+
       if (newRole != AppStorage.userRole) {
         await AppStorage.saveUserData(
           userId: userId,
@@ -340,7 +342,6 @@ class RealtimeHub {
           phone: data['phone_number'] as String?,
         );
         unawaited(NotificationService.instance.saveTokenToFirestore(userId));
-        // 🛡️ تشغيل إعادة بناء القنوات مع التحقق الصارم من بقاء المستخدم مسجلاً
         Future.microtask(() async {
           if (AppStorage.userId == userId && _initialized) {
             await startForUser(userId, role: newRole);
@@ -362,9 +363,11 @@ class RealtimeHub {
         return;
       }
     }, onError: (_) {});
+
     if (_profileSub != null) {
       _userSubs.add(_profileSub!);
     }
+
     _watchNotifications(userId);
     if (role == 'admin' ||
         role == 'super_admin' ||
@@ -380,10 +383,9 @@ class RealtimeHub {
   }
 
   Future<void> _stopUserChannels() async {
-    _notificationsSub?.cancel();
+    await _notificationsSub?.cancel();
     _notificationsSub = null;
 
-    // 🔒 حماية الكتالوج العام: الحفاظ على قنوات الأصناف والشركات حية للتصفح العام، أو إعادة تشغيلها فوراً
     final subscriptions = List<StreamSubscription>.from(_userSubs);
     _userSubs.clear();
 
@@ -401,7 +403,6 @@ class RealtimeHub {
     if (_brandsSub == null) _watchBrands();
   }
 
-  // ── مراقبة طلبات التاجر ──────────────────────────────────
   void _watchOrders(String merchantId) {
     if (merchantId.isEmpty) return;
     final sub = _db
@@ -417,9 +418,6 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-// ── مراقبة الإشعارات وإطلاق الصوت والتنبيه فوراً ────────────
-  StreamSubscription? _notificationsSub;
-
   void _watchNotifications(String userId) {
     if (userId.isEmpty) return;
 
@@ -428,12 +426,12 @@ class RealtimeHub {
     bool isFirstLoad = true;
     final Set<String> knownNotifIds = {};
 
-    // إلغاء الاشتراك السابق بصورة حتمية ومضمونة
     _notificationsSub?.cancel();
     if (_notificationsSub != null) {
       _userSubs.remove(_notificationsSub);
       _notificationsSub = null;
     }
+
     final sub = _db
         .collection('user_notifications')
         .where('user_id', isEqualTo: userId)
@@ -475,14 +473,11 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-  // ── تحميل المنتجات ────────────────────────────────────────
   void watchProducts() {
     if ((_container?.read(realtimeProductsProvider).length ?? 0) == 0) {
       unawaited(_container?.read(realtimeProductsProvider.notifier).reload());
     }
-  } // ── مراقبة الأصناف لحظياً (تختفي فوراً عند حذفها من الإدارة) ──
-
-  StreamSubscription? _categoriesSub;
+  }
 
   void _watchCategories() {
     _categoriesSub?.cancel();
@@ -509,9 +504,6 @@ class RealtimeHub {
     );
   }
 
-  // ── مراقبة الشركات لحظياً ──
-  StreamSubscription? _brandsSub;
-
   void _watchBrands() {
     _brandsSub?.cancel();
     _brandsSub = _db
@@ -537,7 +529,6 @@ class RealtimeHub {
     );
   }
 
-  // ── Admin: كل الطلبات ────────────────────────────────────
   void _watchAllOrders() {
     final sub = _db
         .collection('orders')
@@ -551,12 +542,10 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-// ── Driver: الطلبات المؤكدة غير المسندة ──────────────────
   void _watchConfirmedOrders() {
     bool firstLoad = true;
     Set<String> seenIds = {};
 
-    // تقييد البث المباشر لأحدث 25 طلباً فقط لتقليل الضغط الشبكي واستهلاك القراءات على السائقين
     final sub = _db
         .collection('orders')
         .where('status', isEqualTo: 'confirmed')
@@ -579,7 +568,6 @@ class RealtimeHub {
         _container?.read(realtimeConfirmedOrdersProvider.notifier).update(data);
         _setConnected();
 
-        // إشعار السائق بالطلب الجديد مع إطلاق صوت الرنين
         final currentIds = {for (final d in snap.docs) d.id};
         if (!firstLoad) {
           final newIds = currentIds.difference(seenIds);
@@ -589,7 +577,6 @@ class RealtimeHub {
             final assignedDriver = order['driver_id'] as String?;
             if (assignedDriver != null && assignedDriver.isNotEmpty) continue;
 
-            // 🚀 تشغيل نغمة الإشعار مع الصوت والتنبيه للسائق
             NotificationService.instance.showLocalNotification(
               title: '🚨 طلب جديد وصلك!',
               body:
@@ -612,7 +599,6 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-  // ── Driver: طلباته هو المُسنَدة (shipped) ─────────────────
   void _watchMyShippedOrders(String driverId) {
     if (driverId.isEmpty) return;
     final sub = _db
@@ -643,7 +629,6 @@ class RealtimeHub {
     _userSubs.add(sub);
   }
 
-  // ── إدارة الحالة ──────────────────────────────────────────
   void _setConnected() {
     _reconnectTimer?.cancel();
     reconnectAttempts = 0;
@@ -655,7 +640,6 @@ class RealtimeHub {
     _container?.read(realtimeStatusProvider.notifier).state =
         RealtimeStatus.disconnected;
 
-    // 🚀 إعادة الاتصال التصاعدي (Exponential Backoff) لإنعاش الـ Streams في حال توقفت نهائياً.
     reconnectAttempts++;
     if (reconnectAttempts < 6) {
       _reconnectTimer?.cancel();
@@ -664,9 +648,6 @@ class RealtimeHub {
       });
     }
   }
-
-  // ── إعادة التشغيل ─────────────────────────────────────────
-  bool _isRestarting = false;
 
   void restart() {
     if (_isRestarting) return;
@@ -678,7 +659,6 @@ class RealtimeHub {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
 
-    // إلغاء اشتراكات الأصناف والشركات والإشعارات صراحة لمنع تضاعف الذاكرة
     await _categoriesSub?.cancel();
     _categoriesSub = null;
     await _brandsSub?.cancel();
@@ -701,17 +681,15 @@ class RealtimeHub {
     }
   }
 
-// ── الإيقاف الكامل وتطهير كافة مراجع الذاكرة والاشتراكات ──
+  // ── الإيقاف الكامل وتطهير كافة مراجع الذاكرة والاشتراكات بحل قطعي ──
   void dispose() {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
 
-    if (_connectivitySub != null) {
-      _connectivitySub?.cancel();
-      _connectivitySub = null;
-    }
+    _connectivitySub?.cancel();
+    _connectivitySub = null;
 
     _profileSub?.cancel();
     _profileSub = null;
@@ -725,13 +703,13 @@ class RealtimeHub {
     _brandsSub?.cancel();
     _brandsSub = null;
 
-    final subsToCancel = List<StreamSubscription>.from(_userSubs);
-    _userSubs.clear();
-    for (final s in subsToCancel) {
+    for (final s in _userSubs) {
       try {
         s.cancel();
       } catch (_) {}
     }
+    _userSubs.clear();
+
     final c = _container;
     if (c != null) {
       try {
@@ -753,16 +731,17 @@ class RealtimeHub {
     _activeUserRole = null;
     _initialized = false;
     reconnectAttempts = 0;
-    // 🛡️ لا نقوم بمسح _container إلى null للحفاظ على دورة حياة المزودات للتسجيلات القادمة
   }
 }
+
 // ══════════════════════════════════════════════════════════
-//  Notifiers — StateNotifier يدعم .mounted بشكل طبيعي
+//  Notifiers
 // ══════════════════════════════════════════════════════════
 
 class _OrdersNotifier extends StateNotifier<List<Map<String, dynamic>>> {
   _OrdersNotifier() : super([]);
   final _db = FirebaseFirestore.instance;
+
   Future<void> reload(String merchantId) async {
     if (merchantId.isEmpty) return;
     final docs = await _silently(
@@ -792,7 +771,6 @@ class _OrdersNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 
   void update(List<Map<String, dynamic>> data) {
     if (!mounted) return;
-    // ✅ إزالة الفحص `identical` الذي لم يكن فعّالاً أبداً (القائمة data دائماً كائن جديد)
     state = data;
   }
 
@@ -1089,6 +1067,7 @@ class _BrandsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
   _BrandsNotifier() : super([]);
   final _db = FirebaseFirestore.instance;
   DateTime? _lastFetch;
+
   Future<void> reload({String? categoryId}) async {
     if (state.isNotEmpty &&
         _lastFetch != null &&
@@ -1103,7 +1082,6 @@ class _BrandsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         }
         final snap =
             await query.get(const GetOptions(source: Source.serverAndCache));
-        // ✅ الفرز في الذاكرة لتجنب اشتراط Composite Index في Firestore
         final list = snap.docs
             .where((d) =>
                 d.data()['is_deleted'] != true &&
@@ -1163,7 +1141,7 @@ class _MyShippedOrdersNotifier
 }
 
 // ══════════════════════════════════════════════════════════
-//  مؤشر الاتصال — ضعه في أي شاشة
+//  مؤشر الاتصال
 // ══════════════════════════════════════════════════════════
 class RealtimeIndicator extends ConsumerWidget {
   const RealtimeIndicator({super.key});

@@ -296,12 +296,36 @@ class WalService {
                       .reduce((a, b) => a.isAfter(b) ? a : b)
                   : DateTime.now();
 
+              // 🔒 التحقق الشامل: مطابقة المعرفات والكميات معاً لضمان عدم مسح سلة جديدة لنفس الصنف
+              final matchingItemsList = matchingEntries
+                  .expand((e) => (e.payload['items'] as List? ?? []))
+                  .toList();
+
+              bool isExactCartMatch = cartProductIds.isNotEmpty &&
+                  cartProductIds.length == verifiedProductIds.length &&
+                  cartProductIds.every((id) => verifiedProductIds.contains(id));
+
+              if (isExactCartMatch && decoded is Map) {
+                for (final itemVal in decoded.values) {
+                  final pId = itemVal['product']?['id']?.toString();
+                  final qty = (itemVal['quantity'] as num?)?.toInt() ?? 0;
+                  final matchingOrderQty = matchingItemsList
+                      .where((m) => m['product_id']?.toString() == pId)
+                      .fold<int>(
+                          0,
+                          (sum, m) =>
+                              sum + ((m['quantity'] as num?)?.toInt() ?? 0));
+                  if (matchingOrderQty != qty) {
+                    isExactCartMatch = false;
+                    break;
+                  }
+                }
+              }
+
               final fileModTime = await file.lastModified();
-              final isAssociatedWithPending = cartProductIds.isNotEmpty &&
-                  cartProductIds
-                      .every((id) => verifiedProductIds.contains(id)) &&
+              final isAssociatedWithPending = isExactCartMatch &&
                   fileModTime.isBefore(
-                      latestTimestamp.add(const Duration(minutes: 5)));
+                      latestTimestamp.add(const Duration(minutes: 1)));
 
               if (isAssociatedWithPending) {
                 await file.delete();
