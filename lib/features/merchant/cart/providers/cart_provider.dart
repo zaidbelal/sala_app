@@ -34,10 +34,27 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
     if (kIsWeb) return;
     try {
       final file = await _cartFile;
-      if (file == null || !await file.exists()) return;
+      String? raw;
+      bool fileFound = false;
 
-      final raw = await file.readAsString();
-      if (raw.isEmpty) return;
+      if (file != null && await file.exists()) {
+        raw = await file.readAsString();
+        fileFound = true;
+      }
+
+      // 🔒 لا نلجأ لكاش الطوارئ إلا إذا كان الملف الأساسي غير موجود تماماً (وليس مفرغاً عمداً)
+      if (!fileFound || raw == null || raw.trim().isEmpty) {
+        final uid = AppStorage.userId ?? 'guest';
+        final fallback = AppStorage.getString('sala_cart_v2_$uid');
+        if (fallback != null &&
+            fallback.trim().isNotEmpty &&
+            fallback.trim() != '{}') {
+          raw = fallback;
+        }
+      }
+
+      if (raw == null || raw.trim().isEmpty || raw.trim() == '{}') return;
+
       final map = jsonDecode(raw) as Map<String, dynamic>;
       final loaded = map.map(
         (k, v) => MapEntry(k, CartItem.fromJson(v as Map<String, dynamic>)),
@@ -74,16 +91,22 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
       final file = await _cartFile;
       if (file == null) return;
 
-      // أخذ لقطة فورية للحالة الحالية داخل القفل
       final currentState = state;
+      final uid = AppStorage.userId ?? 'guest';
+
+      // 🔒 التطهير الذري الكامل لكافة مستويات التخزين (الملف الأساسي + النسخة التزامنية + كاش الطوارئ) لمنع انبعاث السلة
       if (currentState.isEmpty) {
         if (await file.exists()) await file.delete().catchError((_) => file);
+        final dir = await getApplicationDocumentsDirectory();
+        final syncBackup = File('${dir.path}/sala_cart_v2_$uid.json');
+        if (await syncBackup.exists())
+          await syncBackup.delete().catchError((_) => syncBackup);
+        await AppStorage.remove(_key);
         return;
       }
 
       final dataMap = currentState.map((k, v) => MapEntry(k, v.toJson()));
       final jsonString = jsonEncode(dataMap);
-
       final nonce = DateTime.now().microsecondsSinceEpoch;
       final tempFile = File('${file.path}_$nonce.tmp');
       await tempFile.writeAsString(jsonString, flush: true);
@@ -95,6 +118,8 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
         await tempFile.copy(file.path);
         await tempFile.delete().catchError((_) => tempFile);
       }
+      // مزامنة نسخة الطوارئ النصية في SharedPreferences
+      await AppStorage.setString(_key, jsonString);
     } catch (e, st) {
       if (kDebugMode) debugPrint('❌ Cart Sequential Save Error: $e\n$st');
     }
@@ -105,13 +130,12 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
     flushEpoch++;
     _saveDebounce?.cancel();
     if (state.isNotEmpty && !kIsWeb) {
-      // 🔒 كتابة تزامنية فورية متزامنة تضمن ثبات البيانات قبل تحرير الموفر والعملية
       try {
         final uid = AppStorage.userId ?? 'guest';
         if (AppStorage.isLoggedIn && AppStorage.userId != null) {
           final dataMap = state.map((k, v) => MapEntry(k, v.toJson()));
           final jsonString = jsonEncode(dataMap);
-          AppStorage.setString('sala_cart_backup_$uid', jsonString);
+          AppStorage.saveCartBackupSync(uid, jsonString);
         }
       } catch (_) {}
     }

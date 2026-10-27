@@ -568,7 +568,6 @@ class LedgerService {
       type: WalOperationType.ledgerTransaction,
       payload: payload,
     );
-
     final hasInternet = await ConnectivityHelper.hasActiveInternet();
 
     // ── في وضع عدم الاتصال (أوفلاين) ──
@@ -576,6 +575,13 @@ class LedgerService {
       await AppStorage.savePendingLedgerTx(payload);
 
       if (!kIsWeb) {
+        final prevFileLock = _durableFileLock;
+        final fileCompleter = Completer<void>();
+        _durableFileLock = fileCompleter.future;
+        try {
+          await prevFileLock;
+        } catch (_) {}
+
         try {
           final dir = await getApplicationDocumentsDirectory();
           final durableFile =
@@ -583,7 +589,10 @@ class LedgerService {
           final line = '${jsonEncode(payload)}\n';
           await durableFile.writeAsString(line,
               mode: FileMode.append, flush: true);
-        } catch (_) {}
+        } catch (_) {
+        } finally {
+          fileCompleter.complete();
+        }
       }
 
       final cached = await getCachedCustomers(cleanMerchantId);
@@ -605,7 +614,8 @@ class LedgerService {
         );
         await _cacheCustomersLocally(cleanMerchantId, cached);
       }
-      return;
+      // 🔒 رمي استثناء حتمي لمنع دالة syncPendingLedgerQueue من حذف القيد قبل وصوله للسيرفر
+      throw TimeoutException('لا يوجد اتصال بالإنترنت، تم تأمين القيد أوفلاين');
     }
 // ── في وضع الاتصال: استدعاء الدالة السحابية الرسمية مع تحصين كامل ضد انقطاع الشبكة ──
     try {
@@ -667,8 +677,7 @@ class LedgerService {
     final cleanMerchantId = merchantId.trim();
     final cleanCustomerId = customerId.trim();
     final cleanEntryId = entryId.trim();
-
-    // 1. فحص طابور الأوفلاين وتأمينه ضد انبعاث الدين
+// 1. فحص طابور الأوفلاين: إذا كانت العملية محلية فقط ولم ترسل للسيرفر، يتم إلغاؤها دون جدولة void_request
     final pendingQueue = AppStorage.getPendingLedgerTxs(cleanMerchantId);
     final pendingIdx = pendingQueue.indexWhere((t) => t['id'] == cleanEntryId);
     if (pendingIdx != -1) {
@@ -677,21 +686,18 @@ class LedgerService {
       final isDebt = pendingItem['type'] == 'debt';
       final reverseDelta = isDebt ? -amt : amt;
 
+      // إزالة الحركة نهائياً من الطابور دون إرسال طلب شطب وهمي للسيرفر
       await AppStorage.removePendingLedgerTx(cleanEntryId, cleanMerchantId);
 
-      // تأمين مالي: جدولة طلب شطب في السيرفر تحسباً لوصول المعاملة إليه قبل انقطاع الشبكة
-      await AppStorage.savePendingLedgerTx({
-        'id': 'void_$cleanEntryId',
-        'merchant_id': cleanMerchantId,
-        'customer_id': cleanCustomerId,
-        'type': 'void_request',
-        'target_entry_id': cleanEntryId,
-        'amount': amt,
-        'is_debt': isDebt,
-      });
+      final prevFileLock = _durableFileLock;
+      final fileCompleter = Completer<void>();
+      _durableFileLock = fileCompleter.future;
+      try {
+        await prevFileLock;
+      } catch (_) {}
 
-      if (!kIsWeb) {
-        try {
+      try {
+        if (!kIsWeb) {
           final dir = await getApplicationDocumentsDirectory();
           final durableFile =
               File('${dir.path}/ledger_durable_journal_$cleanMerchantId.db');
@@ -705,7 +711,10 @@ class LedgerService {
           });
           await durableFile.writeAsString('$voidMarker\n',
               mode: FileMode.append, flush: true);
-        } catch (_) {}
+        }
+      } catch (_) {
+      } finally {
+        fileCompleter.complete();
       }
 
       final cached = await getCachedCustomers(cleanMerchantId);
@@ -856,24 +865,13 @@ class LedgerService {
 
   Future<int> syncPendingLedgerQueue(String merchantId) async {
     final Map<String, Map<String, dynamic>> unifiedQueue = {};
-
-    // 1. قراءة الطابور المخزن محلياً في SharedPreferences أولاً
+// 1. قراءة الطابور المخزن محلياً في SharedPreferences أولاً
     for (final item in AppStorage.getPendingLedgerTxs(merchantId)) {
       final id = item['id']?.toString() ?? '';
       if (id.isNotEmpty) unifiedQueue[id] = item;
     }
 
-    // 🔒 الترتيب الزمني الفعلي للحركات بناءً على وقت حدوثها الحقيقي لمنع تعارض رقم الهاتف المحذوف
-    final sortedQueueList = unifiedQueue.values.toList()
-      ..sort((a, b) {
-        final aTime = DateTime.tryParse(a['created_at']?.toString() ?? '') ??
-            DateTime(2000);
-        final bTime = DateTime.tryParse(b['created_at']?.toString() ?? '') ??
-            DateTime(2000);
-        return aTime.compareTo(bTime);
-      });
-
-    // 2. دمج أي قيود مسجلة في ملف القرص الصلب الدائم لمنع فقدانها
+    // 2. دمج كافة القيود والعمليات المحفوظة في ملف القرص الصلب الدائم قبل الترتيب والفرز
     File? durableFile;
     if (!kIsWeb) {
       try {
@@ -899,6 +897,16 @@ class LedgerService {
     }
 
     if (unifiedQueue.isEmpty) return 0;
+
+    // 🔒 الترتيب الزمني الفعلي لكامل الطابور الموحد (SharedPreferences + ملف القرص الدائم معاً)
+    final sortedQueueList = unifiedQueue.values.toList()
+      ..sort((a, b) {
+        final aTime = DateTime.tryParse(a['created_at']?.toString() ?? '') ??
+            DateTime(2000);
+        final bTime = DateTime.tryParse(b['created_at']?.toString() ?? '') ??
+            DateTime(2000);
+        return aTime.compareTo(bTime);
+      });
 
     int synced = 0;
     final List<String> successfullySyncedIds = [];
@@ -938,13 +946,25 @@ class LedgerService {
         if (type == 'void_request') {
           final targetEntryId = item['target_entry_id']?.toString() ?? '';
           if (targetEntryId.isNotEmpty) {
-            await voidTransaction(
-              merchantId: merchantId,
-              customerId: custId,
-              entryId: targetEntryId,
-              knownAmount: (item['amount'] as num?)?.toDouble(),
-              knownIsDebt: item['is_debt'] != false,
-            );
+            try {
+              await voidTransaction(
+                merchantId: merchantId,
+                customerId: custId,
+                entryId: targetEntryId,
+                knownAmount: (item['amount'] as num?)?.toDouble(),
+                knownIsDebt: item['is_debt'] != false,
+              );
+            } catch (voidErr) {
+              final errText = voidErr.toString().toLowerCase();
+              // إذا كان القيد غير موجود على السيرفر أصلاً (أُنشئ وحُذف أوفلاين)، نعتبر الإلغاء ناجحاً
+              if (errText.contains('not-found') ||
+                  errText.contains('غير موجود')) {
+                debugPrint(
+                    'Void target $targetEntryId was never on server. Clearing from queue.');
+              } else {
+                rethrow;
+              }
+            }
           }
           await AppStorage.removePendingLedgerTx(txId, merchantId);
           successfullySyncedIds.add(txId);
@@ -966,21 +986,21 @@ class LedgerService {
         synced++;
       } catch (e) {
         final errStr = e.toString().toLowerCase();
-        // 🔒 حظر حذف أي معاملة مالية إلا إذا كان الخطأ تأكيداً صريحاً بأنها سُجلت مسبقاً (Already Recorded)
-        // أو خطأ مدخلات غير قابل للإصلاح نهائياً موثق من السيرفر، مع الاحتفاظ بباقي الحالات
-        final bool isAlreadyProcessed = errStr.contains('alreadyrecorded') ||
+        final bool isTerminalError = errStr.contains('alreadyrecorded') ||
             errStr.contains('alreadyvoided') ||
-            errStr.contains('already-exists');
+            errStr.contains('already-exists') ||
+            errStr.contains('customer_deleted') ||
+            errStr.contains('not-found');
 
-        if (isAlreadyProcessed) {
+        if (isTerminalError) {
+          // إزالة المعاملة التي حُذف زبونها أو سُجلت مسبقاً لمنع حبس وتسميم الطابور للأبد
           await AppStorage.removePendingLedgerTx(txId, merchantId);
           successfullySyncedIds.add(txId);
           synced++;
         } else {
-          // في جميع الحالات الأخرى، يتم إبقاء المعاملة في الطابور والملف الدائم لمنع ضياع أموال التاجر
-          if (kDebugMode)
-            debugPrint(
-                '⚠️ تم تأجيل مزامنة القيد المالي $txId لحين استقرار الاتصال: $e');
+          if (kDebugMode) {
+            debugPrint('⚠️ تأجيل مزامنة القيد $txId لحين استقرار الاتصال: $e');
+          }
         }
       }
     }
@@ -1049,6 +1069,7 @@ class LedgerService {
     // 🔒 استعلام يعتمد فقط على شروط المساواة دون إجبار Firestore على فهرس مركب
     // الفرز يتم في الذاكرة المحلية (In-Memory) مما يمنع خطأ FAILED_PRECONDITION نهائياً
     // 🔒 استعلام مفهرس سحابياً تنازلياً يضمن جلب أحدث الحركات فوراً مهما بلغت آلاف السجلات
+// 🔒 استعلام خفيف لا يتطلب أي Composite Index على السيرفر ويمنع FAILED_PRECONDITION
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
         .where('merchant_id', isEqualTo: currentMerchantId.trim())
@@ -1265,10 +1286,10 @@ class LedgerService {
       throw StateError(
           'خط القاهرة المعتمد غير محمل محلياً، تأكد من وجود ملفات الخط في assets/fonts');
     }
-    final pw.Font regularFont =
-        pw.Font.ttf(fontRegularBytes.buffer.asByteData());
-    final pw.Font boldFont = pw.Font.ttf(fontBoldBytes.buffer.asByteData());
-
+    final pw.Font regularFont = pw.Font.ttf(fontRegularBytes.buffer.asByteData(
+        fontRegularBytes.offsetInBytes, fontRegularBytes.lengthInBytes));
+    final pw.Font boldFont = pw.Font.ttf(fontBoldBytes.buffer
+        .asByteData(fontBoldBytes.offsetInBytes, fontBoldBytes.lengthInBytes));
     final pdf = pw.Document();
     final now = DateTime.now();
 

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
@@ -417,26 +418,34 @@ class ThermalReceiptWidget extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 4),
-                  signatureUrl!.startsWith('data:image')
-                      ? Builder(
-                          builder: (_) {
-                            try {
-                              final raw = signatureUrl!.split(',').last.trim();
-                              final bytes = base64Decode(raw);
-                              return Image.memory(
-                                bytes,
-                                height: 50,
-                                fit: BoxFit.contain,
-                                errorBuilder: (_, __, ___) =>
-                                    const SizedBox.shrink(),
-                              );
-                            } catch (_) {
-                              return const SizedBox.shrink();
-                            }
-                          },
-                        )
-                      : CachedNetworkImage(
-                          imageUrl: signatureUrl!,
+                  Builder(
+                    builder: (_) {
+                      final sig = signatureUrl!;
+                      if (sig.startsWith('file://')) {
+                        final path = sig.replaceFirst('file://', '');
+                        return Image.file(
+                          File(path),
+                          height: 50,
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                        );
+                      } else if (sig.startsWith('data:image')) {
+                        try {
+                          final raw = sig.split(',').last.trim();
+                          final bytes = base64Decode(raw);
+                          return Image.memory(
+                            bytes,
+                            height: 50,
+                            fit: BoxFit.contain,
+                            errorBuilder: (_, __, ___) =>
+                                const SizedBox.shrink(),
+                          );
+                        } catch (_) {
+                          return const SizedBox.shrink();
+                        }
+                      } else {
+                        return CachedNetworkImage(
+                          imageUrl: sig,
                           cacheManager:
                               ImagePrecacheService.instance.cacheManager,
                           height: 50,
@@ -450,7 +459,10 @@ class ThermalReceiptWidget extends StatelessWidget {
                                   CircularProgressIndicator(strokeWidth: 1.5),
                             ),
                           ),
-                        ),
+                        );
+                      }
+                    },
+                  ),
                 ],
               ),
             ),

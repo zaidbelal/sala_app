@@ -101,9 +101,10 @@ class _LedgerTabState extends State<LedgerTab> {
                           CircularProgressIndicator(color: AppColors.primary));
                 }
                 final streamCustomers = snapshot.data ?? [];
+                // دمج ذكي دائم لا يفقد الزبائن المجلوبين عبر البحث السحابي نهائياً أثناء الجلسة
                 final Map<String, LedgerCustomer> unifiedMap = {
-                  for (final c in streamCustomers) c.id: c,
                   for (final c in _remoteSearchResults) c.id: c,
+                  for (final c in streamCustomers) c.id: c,
                 };
                 final allCustomers = unifiedMap.values.toList();
                 String normalize(String text) {

@@ -8,17 +8,30 @@ import '../models/order_model.dart';
 import '../services/orders_service.dart';
 import 'package:sala/core/constants/app_adaptive_colors.dart';
 
-class OrderStatusScreen extends StatelessWidget {
+class OrderStatusScreen extends StatefulWidget {
   final OrderModel order;
   const OrderStatusScreen({super.key, required this.order});
 
   @override
+  State<OrderStatusScreen> createState() => _OrderStatusScreenState();
+}
+
+class _OrderStatusScreenState extends State<OrderStatusScreen> {
+  late final Stream<OrderModel?> _orderStream;
+
+  @override
+  void initState() {
+    super.initState();
+    _orderStream = OrdersService.watchOrder(widget.order.id);
+  }
+
+  @override
   Widget build(BuildContext context) {
     return StreamBuilder<OrderModel?>(
-      stream: OrdersService.watchOrder(order.id),
-      initialData: order,
+      stream: _orderStream,
+      initialData: widget.order,
       builder: (context, snapshot) {
-        final current = snapshot.data ?? order;
+        final current = snapshot.data ?? widget.order;
         return Scaffold(
           backgroundColor: context.bgPage,
           body: SafeArea(

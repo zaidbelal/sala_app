@@ -188,15 +188,14 @@ const otpRef = db.collection("otp_codes").doc(phone);
       uid = db.collection("profiles").doc().id;
     }
  
-// تضمين الصلاحيات داخل التوكن مباشرة؛ مع تحديث claims للمستخدمين المسجلين فقط دون إفشال الحسابات الجديدة
-    if (purpose === "login") {
-      try {
-        await admin.auth().setCustomUserClaims(uid, { role, purpose });
-      } catch (e) {
-        console.warn(`[verifyOtp] setCustomUserClaims skipped for login uid: ${uid}`);
-      }
+// 🔒 ربط رقم الهاتف الموثق بالـ Claims المشفرة لمنع انتحال أي رقم آخر أثناء إنشاء الملف
+    const tokenClaims = { role, purpose, verified_phone: phone };
+    try {
+      await admin.auth().setCustomUserClaims(uid, tokenClaims);
+    } catch (e) {
+      console.warn(`[verifyOtp] setCustomUserClaims skipped for uid: ${uid}`);
     }
-    const customToken = await admin.auth().createCustomToken(uid, { role, purpose });
+    const customToken = await admin.auth().createCustomToken(uid, tokenClaims);
     return { verified: true, message: "تم التحقق بنجاح", customToken };
   }
 );
@@ -340,14 +339,19 @@ exports.createUserProfile = onCall(
       throw new HttpsError("unauthenticated", "يجب تسجيل الدخول وتأكيد رمز التحقق أولاً");
     }
 
-    const uid = request.auth.uid;
+ const uid = request.auth.uid;
+    const tokenPhone = request.auth.token.verified_phone || request.auth.token.phone_number;
     const { fullName, storeName, latitude, longitude, phone } = request.data || {};
-
     const cleanFullName = String(fullName || "").trim();
     const cleanStoreName = String(storeName || "").trim();
     const cleanPhone = String(phone || "").trim();
     const numLat = Number(latitude);
     const numLng = Number(longitude);
+
+    // 🔒 حظر أمني حاسم: مطابقة رقم الهاتف مع التوكن الموثق لمنع انتحال هويات الآخرين
+    if (!tokenPhone || tokenPhone !== cleanPhone) {
+      throw new HttpsError("permission-denied", "رقم الهاتف غير مطابق لرمز التحقق المؤكد أمنياً");
+    }
 
     // 1. تحققات أمنية صارمة على المدخلات
     if (!cleanFullName || cleanFullName.split(/\s+/).length < 4) {
@@ -463,11 +467,17 @@ exports.placeOrder = onCall(
     const orderRef = db.collection("orders").doc(orderId.trim());
 
     // ── المرحلة الأولى: خصم المخزون وإنشاء عناصر الطلب (بدون قفل العداد) ──
-    const phaseOneResult = await db.runTransaction(async (tx) => {
-      // 🛡️ فحص Idempotency: إذا كان مسجلاً بالكامل أعده فوراً دون تكرار
+   const phaseOneResult = await db.runTransaction(async (tx) => {
+      // 🛡️ فحص Idempotency وفحص أمني صارم لملكية الطلب (منع ثغرة IDOR)
       const existingSnap = await tx.get(orderRef);
-      if (existingSnap.exists && existingSnap.data()?.order_number) {
-        return { alreadyCreated: true, order: { id: existingSnap.id, ...existingSnap.data() } };
+      if (existingSnap.exists) {
+        const existingOrderData = existingSnap.data();
+        if (existingOrderData?.merchant_id !== uid) {
+          throw new HttpsError("permission-denied", "غير مصرح لك بالوصول إلى هذا الطلب أو تكراره");
+        }
+        if (existingOrderData?.order_number) {
+          return { alreadyCreated: true, order: { id: existingSnap.id, ...existingOrderData } };
+        }
       }
 
       // 🚀 جلب آمن ومقسم في دفعات متسلسلة داخل المعاملة يمنع اختناق الـ Execution Context
@@ -572,37 +582,39 @@ exports.placeOrder = onCall(
           updated_at: admin.firestore.FieldValue.serverTimestamp(),
         });
       }
-
-      const cleanExtra = { ...(extraData || {}) };
-      delete cleanExtra.merchant_id;
-      delete cleanExtra.total;
-      delete cleanExtra.total_amount;
-      delete cleanExtra.total_profit;
-      delete cleanExtra.status;
-
+// 🔒 القائمة البيضاء الصارمة: قبول الحقول التشغيلية المعتمدة فقط وحظر أي حقن مالي خارجي
+      const rawExtra = extraData || {};
       const orderDataWithNumber = {
-        ...cleanExtra,
+        store_name: String(rawExtra.store_name || profile.store_name || "").trim(),
+        customer_name: String(rawExtra.customer_name || rawExtra.merchant_name || profile.full_name || "").trim(),
+        merchant_name: String(rawExtra.merchant_name || profile.full_name || "").trim(),
+        contact: String(rawExtra.contact || rawExtra.phone_number || profile.phone_number || "").trim(),
+        phone_number: String(rawExtra.phone_number || rawExtra.contact || profile.phone_number || "").trim(),
+        delivery_address: String(rawExtra.delivery_address || rawExtra.store_name || "").trim(),
+        latitude: rawExtra.latitude != null ? Number(rawExtra.latitude) : (profile.latitude || null),
+        longitude: rawExtra.longitude != null ? Number(rawExtra.longitude) : (profile.longitude || null),
+        payment_method: String(rawExtra.payment_method || "cash").trim().toLowerCase() === "deferred" ? "deferred" : "cash",
         merchant_id: uid,
         total: serverTotal,
         total_amount: serverTotal,
         total_profit: serverProfit,
-        delivery_fee: Number(cleanExtra.delivery_fee) || 500.0,
+        delivery_fee: 500.0, // سقف تسعير رسمي ثابت محمي من السيرفر
         notes: notes ? String(notes).trim() : null,
         status: "pending",
+        profit_recorded: false,
         items_count: enrichedItems.length,
         order_number: invoiceNumberString,
         invoice_number: invoiceNumberString,
         created_at: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       };
-
      // 🔒 التحقق الصارم في السيرفر من الحد الأدنى لقيمة الطلب
       const MIN_ORDER_VALUE = 4250.0;
       if (serverTotal < MIN_ORDER_VALUE) {
         throw new HttpsError("failed-precondition", `الحد الأدنى للطلب هو ${MIN_ORDER_VALUE} ريال يمني`);
       }
 
-      // كتابة الطلب وعناصره مباشرة بدون لمس أي عداد مركزي
+      // كتابة الطلب وعناصره مباشرة
       tx.set(orderRef, orderDataWithNumber);
 
       for (const item of enrichedItems) {
@@ -611,6 +623,49 @@ exports.placeOrder = onCall(
 
       return { alreadyCreated: false, orderData: orderDataWithNumber };
     });
+
+    // 🚀 إرسال إشعار Push فوري لقناة السائقين المعتمدة حتى لو كانت هواتفهم مقفلة
+    if (!phaseOneResult.alreadyCreated) {
+      try {
+        await admin.messaging().send({
+          topic: "drivers",
+          notification: {
+            title: "🚨 طلب جديد جاهز للتوصيل!",
+            body: `طلب جديد بقيمة ${Number(phaseOneResult.orderData.total).toFixed(0)} ر.ي جاهز للاستلام والتوصيل`,
+          },
+          data: {
+            order_id: orderRef.id,
+            type: "new_order",
+            route: "/driver",
+            click_action: "FLUTTER_NOTIFICATION_CLICK",
+          },
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "sala_orders_channel",
+              priority: "max",
+              sound: "sala_notification",
+              clickAction: "FLUTTER_NOTIFICATION_CLICK",
+            },
+          },
+          apns: {
+            headers: { "apns-priority": "10", "apns-push-type": "alert" },
+            payload: {
+              aps: {
+                alert: {
+                  title: "🚨 طلب جديد جاهز للتوصيل!",
+                  body: `طلب جديد بقيمة ${Number(phaseOneResult.orderData.total).toFixed(0)} ر.ي جاهز للاستلام`,
+                },
+                sound: "sala_notification.wav",
+                badge: 1,
+              },
+            },
+          },
+        });
+      } catch (pushErr) {
+        console.warn("[placeOrder] Push notification to drivers failed:", pushErr);
+      }
+    }
 
     if (phaseOneResult.alreadyCreated) {
       return { success: true, order: phaseOneResult.order };
@@ -1650,11 +1705,21 @@ exports.adminUpdateOrderStatus = onCall(
 exports.addLedgerCustomer = onCall(
   { region: "us-central1", cors: true },
   async (request) => {
-    if (!request.auth) {
+ if (!request.auth) {
       throw new HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً");
     }
 
     const merchantId = request.auth.uid;
+
+    // 🔒 التحقق الصارم من حالة الحساب ومنع المتاجر المحظورة من أي تلاعب مالي
+    const merchantDoc = await db.collection("profiles").doc(merchantId).get();
+    if (!merchantDoc.exists) {
+      throw new HttpsError("not-found", "حساب التاجر غير مسجل");
+    }
+    const merchantData = merchantDoc.data() || {};
+    if (merchantData.is_banned === true || merchantData.is_active === false) {
+      throw new HttpsError("permission-denied", "حسابك معطل أو محظور من الإدارة، لا يمكن إجراء عمليات مالية");
+    }
     const { name, phone, creditLimit, salaryDay, customerId } = request.data || {};
 
     const cleanName = String(name || "").trim();
@@ -1675,21 +1740,28 @@ exports.addLedgerCustomer = onCall(
 
     const safeCreditLimit = Math.max(0, Math.round(Number(creditLimit) || 0));
     const parsedSalaryDay = salaryDay != null ? Math.min(31, Math.max(1, parseInt(salaryDay, 10))) : null;
-    const docRef = customerId ? db.collection("merchant_customers").doc(String(customerId).trim()) : db.collection("merchant_customers").doc();
+  const docRef = customerId ? db.collection("merchant_customers").doc(String(customerId).trim()) : db.collection("merchant_customers").doc();
+
+    if (cleanPhone) {
+      const dupCheck = await db.collection("merchant_customers")
+        .where("merchant_id", "==", merchantId)
+        .where("phone", "==", cleanPhone)
+        .where("is_deleted", "==", false)
+        .limit(1)
+        .get();
+      if (!dupCheck.empty && dupCheck.docs[0].id !== docRef.id) {
+        throw new HttpsError("already-exists", "يوجد زبون مسجل مسبقاً بنفس رقم الهاتف");
+      }
+    }
 
     return await db.runTransaction(async (tx) => {
       const existingSnap = await tx.get(docRef);
 
-      // 🛡️ منع التكرار: التأكد من عدم وجود زبون مسبق بنفس الاسم أو الهاتف للتاجر نفسه
-      if (!existingSnap.exists && cleanPhone) {
-        const dupCheck = await db.collection("merchant_customers")
-          .where("merchant_id", "==", merchantId)
-          .where("phone", "==", cleanPhone)
-          .where("is_deleted", "==", false)
-          .limit(1)
-          .get();
-        if (!dupCheck.empty && dupCheck.docs[0].id !== docRef.id) {
-          throw new HttpsError("already-exists", "يوجد زبون مسجل مسبقاً بنفس رقم الهاتف");
+      // 🔒 التحقق الصارم من ملكية الوثيقة ومنع التعديل على زبائن يتبعون تجاراً آخرين
+      if (existingSnap.exists) {
+        const existingData = existingSnap.data() || {};
+        if (existingData.merchant_id !== merchantId) {
+          throw new HttpsError("permission-denied", "غير مصرح لك بتعديل بيانات زبون لا يتبع متجرك");
         }
       }
 
@@ -1711,7 +1783,6 @@ exports.addLedgerCustomer = onCall(
       } else {
         tx.set(docRef, customerData, { merge: true });
       }
-
       return {
         success: true,
         customer: {
@@ -1733,6 +1804,12 @@ exports.deleteLedgerCustomer = onCall(
     }
 
     const merchantId = request.auth.uid;
+
+    const callerDoc = await db.collection("profiles").doc(merchantId).get();
+    if (!callerDoc.exists || callerDoc.data()?.is_banned === true || callerDoc.data()?.is_active === false) {
+      throw new HttpsError("permission-denied", "حسابك محظور أو غير مفعّل");
+    }
+
     const { customerId } = request.data || {};
     const cleanCustomerId = String(customerId || "").trim();
 
@@ -1794,8 +1871,18 @@ exports.recordLedgerTransaction = onCall(
     }
 
     const merchantId = request.auth.uid;
-    const { customerId, type, amount, notes, items, transactionId } = request.data || {};
 
+    // 🔒 التحقق الصارم من حالة الحساب ومنع المتاجر المحظورة من أي تلاعب مالي
+    const merchantDoc = await db.collection("profiles").doc(merchantId).get();
+    if (!merchantDoc.exists) {
+      throw new HttpsError("not-found", "حساب التاجر غير مسجل");
+    }
+    const merchantData = merchantDoc.data() || {};
+    if (merchantData.is_banned === true || merchantData.is_active === false) {
+      throw new HttpsError("permission-denied", "حسابك معطل أو محظور من الإدارة، لا يمكن إجراء عمليات مالية");
+    }
+
+    const { customerId, type, amount, notes, items, transactionId } = request.data || {};
     const cleanCustomerId = String(customerId || "").trim();
     const cleanType = String(type || "").trim().toLowerCase();
     const rawAmount = Number(amount) || 0;
@@ -1886,7 +1973,7 @@ const result = await db.runTransaction(async (tx) => {
       // مما يلغي مصفوفة الـ 1500 نهائياً ويسمح بملايين المعاملات للزبون الواحد دون زيادة حجم الوثيقة
       const currentVersion = Number(customerData.ledger_version) || 0;
 
-      tx.set(entryRef, entryData);
+    tx.set(entryRef, entryData);
       tx.update(customerRef, {
         current_balance: newBalance,
         last_transaction_id: entryId,
@@ -1939,8 +2026,18 @@ exports.voidLedgerTransaction = onCall(
     }
 
     const merchantId = request.auth.uid;
-    const { customerId, entryId } = request.data || {};
 
+    // 🔒 حماية مالية: التحقق من أن التاجر غير محظور أو معطل
+    const merchantDoc = await db.collection("profiles").doc(merchantId).get();
+    if (!merchantDoc.exists) {
+      throw new HttpsError("not-found", "حساب التاجر غير مسجل");
+    }
+    const merchantData = merchantDoc.data() || {};
+    if (merchantData.is_banned === true || merchantData.is_active === false) {
+      throw new HttpsError("permission-denied", "حسابك معطل أو محظور، لا يمكنك شطب أو إلغاء قيود");
+    }
+
+    const { customerId, entryId } = request.data || {};
     const cleanCustomerId = String(customerId || "").trim();
     const cleanEntryId = String(entryId || "").trim();
 
@@ -2004,19 +2101,16 @@ exports.voidLedgerTransaction = onCall(
       });
 // 🔒 التخلص نهائياً من مصفوفة الـ 1500 والاعتماد على تسلسل الإصدار الخفيف (Lightweight OCC Ledger Versioning)
       const currentVersion = Number(customerData.ledger_version) || 0;
-
-      if (isNewCustomerDoc) {
+if (isNewCustomerDoc) {
         customerData.current_balance = newBalance;
         customerData.last_transaction_id = `void_${cleanEntryId}`;
         customerData.ledger_version = currentVersion + 1;
-        delete customerData.applied_tx_ids; // تنظيف الحقل المتضخم إن وجد
         tx.set(customerRef, customerData);
       } else {
         tx.update(customerRef, {
           current_balance: newBalance,
           last_transaction_id: `void_${cleanEntryId}`,
           ledger_version: currentVersion + 1,
-          applied_tx_ids: admin.firestore.FieldValue.delete(), // حذف المصفوفة المنتفخة
           updated_at: admin.firestore.FieldValue.serverTimestamp(),
         });
       }
@@ -2056,6 +2150,12 @@ exports.reconcileLedgerBalance = onCall(
     }
 
     const merchantId = request.auth.uid;
+
+    const callerDoc = await db.collection("profiles").doc(merchantId).get();
+    if (!callerDoc.exists || callerDoc.data()?.is_banned === true || callerDoc.data()?.is_active === false) {
+      throw new HttpsError("permission-denied", "حسابك محظور أو غير مفعّل");
+    }
+
     const { customerId } = request.data || {};
     const cleanCustomerId = String(customerId || "").trim();
 
@@ -2335,18 +2435,19 @@ exports.adminUpdateProduct = onCall(
         for (const [ar, en] of Object.entries(arabicDigits)) text = text.replaceAll(ar, en);
         return text.replace(/[^0-9a-zA-Z]/g, "");
       };
-
-      if (updates.barcode !== undefined || updates.units !== undefined) {
+if (updates.barcode !== undefined || updates.units !== undefined) {
         const allBarcodes = new Set();
-        const mainBar = normalizeBarcode(updates.barcode ?? existing.barcode);
-        if (mainBar) {
-          allBarcodes.add(mainBar);
-          safeUpdates.barcode = mainBar;
-        } else if (updates.barcode === null || updates.barcode === "") {
+        if (updates.barcode === null || updates.barcode === "") {
           safeUpdates.barcode = admin.firestore.FieldValue.delete();
+        } else {
+          const mainBar = normalizeBarcode(updates.barcode !== undefined ? updates.barcode : existing.barcode);
+          if (mainBar) {
+            allBarcodes.add(mainBar);
+            safeUpdates.barcode = mainBar;
+          }
         }
 
-        const unitsList = updates.units ?? existing.units ?? [];
+        const unitsList = updates.units !== undefined ? updates.units : (existing.units ?? []);
         if (Array.isArray(unitsList)) {
           for (const u of unitsList) {
             const uBar = normalizeBarcode(u.barcode);
@@ -2355,7 +2456,6 @@ exports.adminUpdateProduct = onCall(
         }
         safeUpdates.all_barcodes = allBarcodes.size > 0 ? Array.from(allBarcodes) : admin.firestore.FieldValue.delete();
       }
-
       // معالجة التواريخ
       if (updates.production_date !== undefined) {
         safeUpdates.production_date = updates.production_date
@@ -2457,12 +2557,17 @@ exports.adminProcessBatchReturn = onCall(
 
     const orderRef = db.collection("orders").doc(cleanOrderId);
 
-    return await db.runTransaction(async (tx) => {
+ return await db.runTransaction(async (tx) => {
       const orderSnap = await tx.get(orderRef);
       if (!orderSnap.exists) {
         throw new HttpsError("not-found", "الطلب غير موجود");
       }
       const orderData = orderSnap.data();
+
+      // 🔒 قفل سلامة العمليات: لا يمكن معالجة مرتجع مالي لطلب لم يتم تسليمه أصلاً
+      if (orderData.status !== "delivered" && orderData.status !== "return_requested") {
+        throw new HttpsError("failed-precondition", `لا يمكن تسجيل إرجاع لطلب بحالة: ${orderData.status}`);
+      }
 
    // جلب جميع عناصر الطلب في المعاملة الذرية لحساب الكميات المتبقية بدقة
       const itemSnaps = await Promise.all(
@@ -2568,7 +2673,7 @@ exports.adminProcessBatchReturn = onCall(
         updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      // تحديث إحصائيات الأرباح المركزية
+    // 🔒 تحديث مستند الأرباح الموحد مباشرة بقيم المرتجع الصحيحة المعرفة في النطاق
       const summaryParentRef = db.collection("stats").doc("profit_summary");
       tx.set(summaryParentRef, {
         accumulated_profit: admin.firestore.FieldValue.increment(-totalDeductedProfit),
@@ -2700,9 +2805,8 @@ exports.saveOrderSignature = onCall(
     const callerUid = request.auth.uid;
     const { orderId, signatureUrl, signerName } = request.data || {};
     const cleanOrderId = String(orderId || "").trim();
-    const cleanUrl = String(signatureUrl || "").trim();
 
-    if (!cleanOrderId || !cleanUrl) {
+    if (!cleanOrderId || !signatureUrl) {
       throw new HttpsError("invalid-argument", "بيانات التوقيع غير مكتملة");
     }
 
@@ -2712,7 +2816,6 @@ exports.saveOrderSignature = onCall(
 
     const orderData = snap.data() || {};
 
-    // 🔒 التحقق الصارم من الصلاحيات: السائق المعين للطلب، التاجر صاحب الطلب، أو الإدارة حصراً
     const callerDoc = await db.collection("profiles").doc(callerUid).get();
     const callerRole = String(callerDoc.data()?.role || "").trim().toLowerCase();
     const isSuperOrAdmin = ["admin", "super_admin"].includes(callerRole);
@@ -2723,8 +2826,31 @@ exports.saveOrderSignature = onCall(
       throw new HttpsError("permission-denied", "غير مصرح لك بتوثيق أو تعديل توقيع هذا الطلب");
     }
 
+    // 🔒 رفع الصورة النقطية لـ Storage لحماية مستند Firestore من نصوص Base64 المتضخمة
+    let finalUrl = String(signatureUrl).trim();
+    if (finalUrl.startsWith("data:image")) {
+      try {
+        const base64Data = finalUrl.replace(/^data:image\/\w+;base64,/, "");
+        const buffer = Buffer.from(base64Data, "base64");
+        const bucket = admin.storage().bucket();
+        const fileName = `signatures/order_${cleanOrderId}_${Date.now()}.png`;
+        const file = bucket.file(fileName);
+        const downloadToken = crypto.randomUUID();
+
+        await file.save(buffer, {
+          metadata: {
+            contentType: "image/png",
+            metadata: { firebaseStorageDownloadTokens: downloadToken },
+          },
+        });
+        finalUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(fileName)}?alt=media&token=${downloadToken}`;
+      } catch (err) {
+        console.error("[saveOrderSignature] Storage upload error:", err);
+      }
+    }
+
     await orderRef.update({
-      signature_url: cleanUrl,
+      signature_url: finalUrl,
       signed_by: String(signerName || "المستلم المعتمد").trim(),
       signed_at: admin.firestore.FieldValue.serverTimestamp(),
       updated_at: admin.firestore.FieldValue.serverTimestamp(),

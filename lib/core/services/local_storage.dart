@@ -81,6 +81,16 @@ class AppStorage {
   // ══════════════════════════════════════════
   static bool get isInitialized => _initialized;
 
+  /// 🔒 كتابة تزامنية مباشرة لقرص الهاتف (Crash-Safe) لمنع ضياع السلة عند الإغلاق الفجائي
+  static void saveCartBackupSync(String uid, String jsonString) {
+    if (!kIsWeb && _appDocsPath != null) {
+      try {
+        final file = File('$_appDocsPath/sala_cart_v2_$uid.json');
+        file.writeAsStringSync(jsonString, flush: true);
+      } catch (_) {}
+    }
+  }
+
   // ╔══════════════════════════════════════════╗
   // ║           بيانات المستخدم               ║
   // ╚══════════════════════════════════════════╝

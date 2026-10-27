@@ -45,7 +45,6 @@ class AdminProductsPaginationNotifier
     try {
       final snap = await FirebaseFirestore.instance
           .collection('products')
-          .where('is_deleted', isEqualTo: false)
           .orderBy('name')
           .limit(_pageSize)
           .get(const GetOptions(source: Source.serverAndCache));
@@ -54,7 +53,10 @@ class AdminProductsPaginationNotifier
       _lastDoc = snap.docs.isNotEmpty ? snap.docs.last : null;
       _hasMore = snap.docs.length == _pageSize;
 
-      final list = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+      final list = snap.docs
+          .where((d) => d.data()['is_deleted'] != true)
+          .map((d) => {'id': d.id, ...d.data()})
+          .toList();
 
       list.sort((a, b) =>
           (a['name']?.toString() ?? '').compareTo(b['name']?.toString() ?? ''));
@@ -76,7 +78,6 @@ class AdminProductsPaginationNotifier
     try {
       final snap = await FirebaseFirestore.instance
           .collection('products')
-          .where('is_deleted', isEqualTo: false)
           .orderBy('name')
           .startAfterDocument(_lastDoc!)
           .limit(_pageSize)

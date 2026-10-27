@@ -672,8 +672,7 @@ class _BarcodeScannerScreenState extends State<BarcodeScannerScreen>
                     ),
                     child: Text(
                       widget.continuousMode
-                          ? '🛒 كاشير سريع ($count ممسوح)'
-                              .replaceAll('$count', '$_continuousScanCount')
+                          ? '🛒 كاشير سريع ($_continuousScanCount ممسوح)'
                           : '⚡ ماسح باركود فائق السرعة',
                       style: const TextStyle(
                         fontFamily: 'Cairo',

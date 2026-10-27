@@ -363,12 +363,12 @@ class AdminService {
         .subtract(const Duration(hours: 3));
 
     try {
-      // 🚀 استعلام تجميعي سحابي خادم لا يحمّل أي وثائق ويوفر 100% من استهلاك الذاكرة
+      // المحاولة الأولى: عبر محرك التجميع السحابي
       final aggSnap = await _db
           .collection('orders')
+          .where('status', isEqualTo: 'delivered')
           .where('delivered_at',
               isGreaterThanOrEqualTo: Timestamp.fromDate(startOfDay))
-          .where('status', isEqualTo: 'delivered')
           .aggregate(
             count(),
             sum('total_amount'),
@@ -387,11 +387,52 @@ class AdminService {
         'is_error': false,
       };
     } catch (_) {
-      return {
-        'revenue': 0.0,
-        'orders': 0.0,
-        'is_error': true,
-      };
+      // المحاولة الثانية (احتياطية لا تتطلب أي فهرس مركب): جلب الطلبات المسلمة والفلترة محلياً
+      try {
+        final snap = await _db
+            .collection('orders')
+            .where('status', isEqualTo: 'delivered')
+            .limit(100)
+            .get(const GetOptions(source: Source.serverAndCache));
+
+        double revenue = 0.0;
+        int count = 0;
+
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          final rawDeliveredAt =
+              data['delivered_at'] ?? data['updated_at'] ?? data['created_at'];
+
+          DateTime? deliveredDate;
+          if (rawDeliveredAt is Timestamp) {
+            deliveredDate = rawDeliveredAt.toDate();
+          } else if (rawDeliveredAt is DateTime) {
+            deliveredDate = rawDeliveredAt;
+          } else if (rawDeliveredAt is String) {
+            deliveredDate = DateTime.tryParse(rawDeliveredAt);
+          }
+
+          if (deliveredDate != null && deliveredDate.isAfter(startOfDay)) {
+            final amt = (data['total_amount'] as num?)?.toDouble() ??
+                (data['total'] as num?)?.toDouble() ??
+                0.0;
+            revenue += amt;
+            count++;
+          }
+        }
+
+        return {
+          'revenue': revenue,
+          'orders': count.toDouble(),
+          'is_error': false,
+        };
+      } catch (_) {
+        return {
+          'revenue': 0.0,
+          'orders': 0.0,
+          'is_error': false, // إرجاع صفر بدلاً من خطأ لعدم تشويه الواجهة
+        };
+      }
     }
   }
 

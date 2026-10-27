@@ -435,12 +435,21 @@ class RealtimeHub {
     final sub = _db
         .collection('user_notifications')
         .where('user_id', isEqualTo: userId)
-        .orderBy('created_at', descending: true)
         .limit(50)
         .snapshots()
         .listen(
       (snap) {
-        final data = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+        final data = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList()
+          ..sort((a, b) {
+            DateTime parse(dynamic v) {
+              if (v is Timestamp) return v.toDate();
+              if (v is DateTime) return v;
+              if (v is String) return DateTime.tryParse(v) ?? DateTime(2000);
+              return DateTime(2000);
+            }
+
+            return parse(b['created_at']).compareTo(parse(a['created_at']));
+          });
         _container?.read(realtimeNotifsProvider.notifier).update(data);
         _setConnected();
         if (knownNotifIds.length > 500) {
@@ -466,7 +475,9 @@ class RealtimeHub {
       },
       onError: (e) {
         if (kDebugMode) debugPrint('❌ _watchNotifications error: $e');
-        _scheduleReconnect();
+        if (_initialized && AppStorage.isLoggedIn) {
+          _scheduleReconnect();
+        }
       },
     );
     _notificationsSub = sub;

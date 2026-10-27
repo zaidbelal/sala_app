@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/constants/app_colors.dart';
+import '../../../../core/constants/app_adaptive_colors.dart';
 import 'catalog/catalog_providers.dart';
 import 'catalog/categories_tab.dart';
 import 'catalog/brands_tab.dart';
@@ -48,39 +49,43 @@ class _AdminCatalogTabState extends ConsumerState<AdminCatalogTab>
     final productsState = ref.watch(adminProductsProvider);
     final prodCount = (productsState.value?.length ?? 0);
     final counts = [catCount, brandCount, prodCount];
+
     return SafeArea(
       bottom: false,
-      child: Column(
-        children: [
-          // ── الهيدر ──
-          _CatalogHeader(currentTab: _tabs[_currentIndex].label),
-          const SizedBox(height: 12),
-
-          // ── شريط التبويبات ──
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: _AnimatedTabBar(
-              controller: _tabController,
-              tabs: _tabs,
-              counts: counts,
-              currentIndex: _currentIndex,
+      child: NestedScrollView(
+        headerSliverBuilder: (context, innerBoxIsScrolled) {
+          return [
+            SliverToBoxAdapter(
+              child: _CatalogHeader(currentTab: _tabs[_currentIndex].label),
             ),
-          ),
-          const SizedBox(height: 12),
-
-          // ── المحتوى ──
-          Expanded(
-            child: TabBarView(
-              controller: _tabController,
-              physics: const BouncingScrollPhysics(),
-              children: const [
-                CategoriesTab(),
-                BrandsTab(),
-                ProductsTab(),
-              ],
+            const SliverToBoxAdapter(child: SizedBox(height: 10)),
+            SliverPersistentHeader(
+              pinned: true,
+              delegate: _SliverTabBarDelegate(
+                height: 56.0,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: _AnimatedTabBar(
+                    controller: _tabController,
+                    tabs: _tabs,
+                    counts: counts,
+                    currentIndex: _currentIndex,
+                  ),
+                ),
+              ),
             ),
-          ),
-        ],
+            const SliverToBoxAdapter(child: SizedBox(height: 6)),
+          ];
+        },
+        body: TabBarView(
+          controller: _tabController,
+          physics: const BouncingScrollPhysics(),
+          children: const [
+            CategoriesTab(),
+            BrandsTab(),
+            ProductsTab(),
+          ],
+        ),
       ),
     );
   }
@@ -282,4 +287,35 @@ class _TabMeta {
   final String label;
   final IconData icon;
   const _TabMeta({required this.label, required this.icon});
+}
+
+class _SliverTabBarDelegate extends SliverPersistentHeaderDelegate {
+  final Widget child;
+  final double height;
+
+  _SliverTabBarDelegate({
+    required this.child,
+    this.height = 56.0,
+  });
+
+  @override
+  double get minExtent => height;
+
+  @override
+  double get maxExtent => height;
+
+  @override
+  Widget build(
+      BuildContext context, double shrinkOffset, bool overlapsContent) {
+    return Container(
+      height: height,
+      color: context.bgPage,
+      alignment: Alignment.center,
+      child: child,
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _SliverTabBarDelegate oldDelegate) =>
+      oldDelegate.child != child || oldDelegate.height != height;
 }

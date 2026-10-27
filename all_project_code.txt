@@ -73,33 +73,29 @@ final appRouterProvider = Provider<GoRouter>((ref) {
       if (path == AppRoutes.splash) {
         return null;
       }
-
       final firebaseUser = FirebaseAuth.instance.currentUser;
 
-      // حماية من التوجيه الخاطئ أثناء تهيئة المستخدم لأول مرة
-      if (firebaseUser == null && AppStorage.userId == null) {
+      // 1. إذا كان المستخدم غير مسجل محلياً، يُمنع دخوله لأي مسار خاص ويُوجّه لتسجيل الدخول فوراً
+      if (AppStorage.userId == null || !AppStorage.isLoggedIn) {
         if (!publicRoutes.contains(path)) {
           return AppRoutes.login;
         }
         return null;
       }
-// ✅ حماية الجلسة أوفلاين: عدم طرد التاجر إذا كان مسجلاً محلياً والجلسة سارية
-      final bool sessionExpiredOrMismatch =
-          (AppStorage.isLoggedIn && AppStorage.isSessionExpired) ||
-              (firebaseUser != null &&
-                  AppStorage.userId != null &&
-                  firebaseUser.uid != AppStorage.userId);
 
-      // لا نعتبر الجلسة ملغاة لمجرد تأخر رد فايربيز أثناء غياب الإنترنت
-      final bool sessionInvalid = sessionExpiredOrMismatch;
+      // 2. إذا انتهت الجلسة المحلية أو تعارض حساب فايربيز النشط مع معرف التخزين المحلي
+      final bool sessionInvalid = AppStorage.isSessionExpired ||
+          (firebaseUser != null && firebaseUser.uid != AppStorage.userId);
 
       if (sessionInvalid) {
+        NotificationService.pendingRoute = null;
         if (!publicRoutes.contains(path)) {
           return AppRoutes.login;
         }
         return null;
       }
-      // السماح الفوري بالبقاء في المسارات العامة بما فيها صفحة إكمال البيانات والسياسة
+
+      // 3. السماح بالمسارات العامة
       if (publicRoutes.contains(path)) {
         if (path == AppRoutes.signupDetails && firebaseUser == null) {
           return AppRoutes.login;
@@ -107,24 +103,30 @@ final appRouterProvider = Provider<GoRouter>((ref) {
         return null;
       }
 
-      // حساب محظور نهائياً — طرد فوري ما لم يكن في صفحة تسجيل الدخول أو السياسة
-      if (AppStorage.isBanned &&
-          path != AppRoutes.login &&
-          path != AppRoutes.privacy) {
+      // 4. الحساب محظور نهائياً
+      if (AppStorage.isBanned) {
         NotificationService.pendingRoute = null;
         return AppRoutes.login;
       }
 
-      // الحساب بانتظار المراجعة والتفعيل من الإدارة
+      // 5. الحساب مسجل ولكنه بانتظار المراجعة والاعتماد
       if (!AppStorage.isActive) {
         NotificationService.pendingRoute = null;
-        if (AppStorage.isBanned) return AppRoutes.login;
         return path == AppRoutes.pending ? null : AppRoutes.pending;
       }
-
       if (pendingPush != null && pendingPush.isNotEmpty) {
+        final target = pendingPush!;
         NotificationService.pendingRoute = null;
-        return pendingPush;
+
+        final isAllowed = (_protectedAdminRoutes.contains(target) &&
+                AppStorage.hasAdminAccess) ||
+            (_protectedMerchantRoutes.contains(target) &&
+                AppStorage.isMerchant) ||
+            (_protectedDriverRoutes.contains(target) && AppStorage.isDriver) ||
+            target == AppRoutes.notifications ||
+            target == AppRoutes.privacy;
+
+        if (isAllowed) return target;
       }
       // إذا كان الحساب مفعّلاً وتواجد في صفحة الانتظار، يتم توجيهه حسب دوره الصحيح
       if (path == AppRoutes.pending && AppStorage.isActive) {
@@ -831,8 +833,9 @@ void main() async {
   try {
     await AppCache.instance.init();
     await WalService.instance.init();
+    // 🔒 منح مهلة متوافقة مع استعلام السيرفر لضمان إتمام تسوية العمليات المالية بعد الانهيار
     await WalService.instance.reconcilePendingEntries().timeout(
-          const Duration(milliseconds: 1200),
+          const Duration(milliseconds: 4500),
           onTimeout: () => null,
         );
   } catch (e) {
@@ -3156,7 +3159,8 @@ class CategoriesNotifier extends AsyncNotifier<List<Map<String, dynamic>>> {
     _realtimeSub = ref.listen<List<Map<String, dynamic>>>(
       realtimeCategoriesProvider,
       (_, next) {
-        if (!_isDisposed) {
+        // 🔒 حظر الكتابة فوق الكاش بالمصفوفات الفارغة الناتجة عن تسجيل الخروج
+        if (!_isDisposed && next.isNotEmpty) {
           state = AsyncData(next);
           unawaited(AppCache.instance.setCategories(next));
         }
@@ -4127,6 +4131,16 @@ class AppStorage {
   // ══════════════════════════════════════════
   static bool get isInitialized => _initialized;
 
+  /// 🔒 كتابة تزامنية مباشرة لقرص الهاتف (Crash-Safe) لمنع ضياع السلة عند الإغلاق الفجائي
+  static void saveCartBackupSync(String uid, String jsonString) {
+    if (!kIsWeb && _appDocsPath != null) {
+      try {
+        final file = File('$_appDocsPath/sala_cart_v2_$uid.json');
+        file.writeAsStringSync(jsonString, flush: true);
+      } catch (_) {}
+    }
+  }
+
   // ╔══════════════════════════════════════════╗
   // ║           بيانات المستخدم               ║
   // ╚══════════════════════════════════════════╝
@@ -4513,7 +4527,18 @@ class AppStorage {
     final targetUid = uid ?? userId;
     if (targetUid == null || targetUid.isEmpty) return [];
     final key = _userPendingLedgerKey(targetUid);
-    final raw = _db.getString(key);
+    var raw = _db.getString(key);
+
+    // 🔒 استعادة ذرية من القرص الصلب فوراً في حال فقدان بيانات SharedPreferences
+    if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
+      try {
+        final backupFile = File('$_appDocsPath/${key}_backup.json');
+        if (backupFile.existsSync()) {
+          raw = backupFile.readAsStringSync();
+        }
+      } catch (_) {}
+    }
+
     if (raw == null || raw.isEmpty) return [];
     try {
       final decoded = jsonDecode(raw);
@@ -5192,10 +5217,21 @@ class NotificationService {
       _onMessageOpenedSub ??=
           FirebaseMessaging.onMessageOpenedApp.listen(_handleFcmTap);
 
+      // على نظام iOS ننتظر تأكيد اتصال الجهاز بسيرفرات Apple APNs أولاً
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        String? apnsToken = await _messaging.getAPNSToken();
+        int attempts = 0;
+        while (apnsToken == null && attempts < 10) {
+          await Future.delayed(const Duration(milliseconds: 500));
+          apnsToken = await _messaging.getAPNSToken();
+          attempts++;
+        }
+      }
+
+      // زيادة المهلة إلى 15 ثانية لتغطية الوقت الذي يقرأ فيه المستخدم نافذة "السماح بالإشعارات"
       final token = await _messaging
           .getToken()
-          .timeout(const Duration(seconds: 4), onTimeout: () => null);
-
+          .timeout(const Duration(seconds: 15), onTimeout: () => null);
       if (token == null || userId.isEmpty) return;
       try {
         await _messaging
@@ -5738,12 +5774,21 @@ class RealtimeHub {
     final sub = _db
         .collection('user_notifications')
         .where('user_id', isEqualTo: userId)
-        .orderBy('created_at', descending: true)
         .limit(50)
         .snapshots()
         .listen(
       (snap) {
-        final data = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+        final data = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList()
+          ..sort((a, b) {
+            DateTime parse(dynamic v) {
+              if (v is Timestamp) return v.toDate();
+              if (v is DateTime) return v;
+              if (v is String) return DateTime.tryParse(v) ?? DateTime(2000);
+              return DateTime(2000);
+            }
+
+            return parse(b['created_at']).compareTo(parse(a['created_at']));
+          });
         _container?.read(realtimeNotifsProvider.notifier).update(data);
         _setConnected();
         if (knownNotifIds.length > 500) {
@@ -5769,7 +5814,9 @@ class RealtimeHub {
       },
       onError: (e) {
         if (kDebugMode) debugPrint('❌ _watchNotifications error: $e');
-        _scheduleReconnect();
+        if (_initialized && AppStorage.isLoggedIn) {
+          _scheduleReconnect();
+        }
       },
     );
     _notificationsSub = sub;
@@ -6566,6 +6613,7 @@ class _StatusDotState extends State<_StatusDot>
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
@@ -6983,26 +7031,34 @@ class ThermalReceiptWidget extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 4),
-                  signatureUrl!.startsWith('data:image')
-                      ? Builder(
-                          builder: (_) {
-                            try {
-                              final raw = signatureUrl!.split(',').last.trim();
-                              final bytes = base64Decode(raw);
-                              return Image.memory(
-                                bytes,
-                                height: 50,
-                                fit: BoxFit.contain,
-                                errorBuilder: (_, __, ___) =>
-                                    const SizedBox.shrink(),
-                              );
-                            } catch (_) {
-                              return const SizedBox.shrink();
-                            }
-                          },
-                        )
-                      : CachedNetworkImage(
-                          imageUrl: signatureUrl!,
+                  Builder(
+                    builder: (_) {
+                      final sig = signatureUrl!;
+                      if (sig.startsWith('file://')) {
+                        final path = sig.replaceFirst('file://', '');
+                        return Image.file(
+                          File(path),
+                          height: 50,
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                        );
+                      } else if (sig.startsWith('data:image')) {
+                        try {
+                          final raw = sig.split(',').last.trim();
+                          final bytes = base64Decode(raw);
+                          return Image.memory(
+                            bytes,
+                            height: 50,
+                            fit: BoxFit.contain,
+                            errorBuilder: (_, __, ___) =>
+                                const SizedBox.shrink(),
+                          );
+                        } catch (_) {
+                          return const SizedBox.shrink();
+                        }
+                      } else {
+                        return CachedNetworkImage(
+                          imageUrl: sig,
                           cacheManager:
                               ImagePrecacheService.instance.cacheManager,
                           height: 50,
@@ -7016,7 +7072,10 @@ class ThermalReceiptWidget extends StatelessWidget {
                                   CircularProgressIndicator(strokeWidth: 1.5),
                             ),
                           ),
-                        ),
+                        );
+                      }
+                    },
+                  ),
                 ],
               ),
             ),
@@ -7374,41 +7433,41 @@ class WalService {
     final db = FirebaseFirestore.instance;
     final verifiedIds = <String>[];
     final verifiedOrderUids = <String>{};
-
-    for (final entry in pending) {
-      try {
-        bool verifiedOnServer = false;
-
-        // 🔒 التحقق الحصري من السيرفر المباشر حصراً لعدم الخلط مع وثائق الكاش المؤقتة
-        if (entry.type == WalOperationType.placeOrder) {
-          final doc = await db
-              .collection('orders')
-              .doc(entry.id)
-              .get(const GetOptions(source: Source.server))
-              .timeout(const Duration(seconds: 4));
-          verifiedOnServer = doc.exists;
-          if (verifiedOnServer) {
-            final uid =
-                entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
-            if (uid != null) verifiedOrderUids.add(uid);
-          }
-        } else if (entry.type == WalOperationType.ledgerTransaction) {
-          final doc = await db
-              .collection('merchant_ledger_entries')
-              .doc(entry.id)
-              .get(const GetOptions(source: Source.server));
-          if (entry.payload['action'] == 'void') {
-            verifiedOnServer = doc.exists && doc.data()?['is_voided'] == true;
-          } else {
+// 🔒 تنفيذ التحقق بالتوازي بمهلة إجمالية واحدة لا تتجاوز 3 ثوانٍ
+    await Future.wait(
+      pending.map((entry) async {
+        try {
+          bool verifiedOnServer = false;
+          if (entry.type == WalOperationType.placeOrder) {
+            final doc = await db
+                .collection('orders')
+                .doc(entry.id)
+                .get(const GetOptions(source: Source.server))
+                .timeout(const Duration(seconds: 3));
             verifiedOnServer = doc.exists;
+            if (verifiedOnServer) {
+              final uid =
+                  entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
+              if (uid != null) verifiedOrderUids.add(uid);
+            }
+          } else if (entry.type == WalOperationType.ledgerTransaction) {
+            final doc = await db
+                .collection('merchant_ledger_entries')
+                .doc(entry.id)
+                .get(const GetOptions(source: Source.server))
+                .timeout(const Duration(seconds: 3));
+            if (entry.payload['action'] == 'void') {
+              verifiedOnServer = doc.exists && doc.data()?['is_voided'] == true;
+            } else {
+              verifiedOnServer = doc.exists;
+            }
           }
-        }
-        if (verifiedOnServer) {
-          verifiedIds.add(entry.id);
-        }
-      } catch (_) {}
-    }
-
+          if (verifiedOnServer) {
+            verifiedIds.add(entry.id);
+          }
+        } catch (_) {}
+      }),
+    );
     // حذف السلة فقط إذا كانت سلتها مطابقة لعناصر الطلب المؤكد بالسيرفر لمنع مسح سلة جديدة
     if (verifiedOrderUids.isNotEmpty) {
       for (final uid in verifiedOrderUids) {
@@ -8806,6 +8865,7 @@ class _AdminHomeScreenState extends ConsumerState<AdminHomeScreen> {
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/constants/app_colors.dart';
+import '../../../../core/constants/app_adaptive_colors.dart';
 import 'catalog/catalog_providers.dart';
 import 'catalog/categories_tab.dart';
 import 'catalog/brands_tab.dart';
@@ -8853,39 +8913,43 @@ class _AdminCatalogTabState extends ConsumerState<AdminCatalogTab>
     final productsState = ref.watch(adminProductsProvider);
     final prodCount = (productsState.value?.length ?? 0);
     final counts = [catCount, brandCount, prodCount];
+
     return SafeArea(
       bottom: false,
-      child: Column(
-        children: [
-          // ── الهيدر ──
-          _CatalogHeader(currentTab: _tabs[_currentIndex].label),
-          const SizedBox(height: 12),
-
-          // ── شريط التبويبات ──
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: _AnimatedTabBar(
-              controller: _tabController,
-              tabs: _tabs,
-              counts: counts,
-              currentIndex: _currentIndex,
+      child: NestedScrollView(
+        headerSliverBuilder: (context, innerBoxIsScrolled) {
+          return [
+            SliverToBoxAdapter(
+              child: _CatalogHeader(currentTab: _tabs[_currentIndex].label),
             ),
-          ),
-          const SizedBox(height: 12),
-
-          // ── المحتوى ──
-          Expanded(
-            child: TabBarView(
-              controller: _tabController,
-              physics: const BouncingScrollPhysics(),
-              children: const [
-                CategoriesTab(),
-                BrandsTab(),
-                ProductsTab(),
-              ],
+            const SliverToBoxAdapter(child: SizedBox(height: 10)),
+            SliverPersistentHeader(
+              pinned: true,
+              delegate: _SliverTabBarDelegate(
+                height: 56.0,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: _AnimatedTabBar(
+                    controller: _tabController,
+                    tabs: _tabs,
+                    counts: counts,
+                    currentIndex: _currentIndex,
+                  ),
+                ),
+              ),
             ),
-          ),
-        ],
+            const SliverToBoxAdapter(child: SizedBox(height: 6)),
+          ];
+        },
+        body: TabBarView(
+          controller: _tabController,
+          physics: const BouncingScrollPhysics(),
+          children: const [
+            CategoriesTab(),
+            BrandsTab(),
+            ProductsTab(),
+          ],
+        ),
       ),
     );
   }
@@ -9087,6 +9151,37 @@ class _TabMeta {
   final String label;
   final IconData icon;
   const _TabMeta({required this.label, required this.icon});
+}
+
+class _SliverTabBarDelegate extends SliverPersistentHeaderDelegate {
+  final Widget child;
+  final double height;
+
+  _SliverTabBarDelegate({
+    required this.child,
+    this.height = 56.0,
+  });
+
+  @override
+  double get minExtent => height;
+
+  @override
+  double get maxExtent => height;
+
+  @override
+  Widget build(
+      BuildContext context, double shrinkOffset, bool overlapsContent) {
+    return Container(
+      height: height,
+      color: context.bgPage,
+      alignment: Alignment.center,
+      child: child,
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _SliverTabBarDelegate oldDelegate) =>
+      oldDelegate.child != child || oldDelegate.height != height;
 }
 
 
@@ -12927,9 +13022,8 @@ import '../../widgets/orders/order_card.dart';
 // مزود استماع سحابي مفلتر ومرتب زمنياً في الخادم لضمان جلب أحدث الطلبات
 final adminOrdersRealtimeProvider = StreamProvider.autoDispose
     .family<List<AdminOrder>, List<String>?>((ref, statuses) {
-  Query<Map<String, dynamic>> query = FirebaseFirestore.instance
-      .collection('orders')
-      .orderBy('created_at', descending: true);
+  Query<Map<String, dynamic>> query =
+      FirebaseFirestore.instance.collection('orders');
 
   if (statuses != null && statuses.isNotEmpty) {
     if (statuses.length == 1) {
@@ -12937,12 +13031,16 @@ final adminOrdersRealtimeProvider = StreamProvider.autoDispose
     } else {
       query = query.where('status', whereIn: statuses);
     }
+  } else {
+    query = query.orderBy('created_at', descending: true);
   }
 
   return query.limit(150).snapshots(includeMetadataChanges: false).map((snap) {
-    return snap.docs
+    final list = snap.docs
         .map((d) => AdminOrder.fromMap({'id': d.id, ...d.data()}))
         .toList();
+    list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return list;
   });
 });
 
@@ -14621,7 +14719,6 @@ class AdminProductsPaginationNotifier
     try {
       final snap = await FirebaseFirestore.instance
           .collection('products')
-          .where('is_deleted', isEqualTo: false)
           .orderBy('name')
           .limit(_pageSize)
           .get(const GetOptions(source: Source.serverAndCache));
@@ -14630,7 +14727,10 @@ class AdminProductsPaginationNotifier
       _lastDoc = snap.docs.isNotEmpty ? snap.docs.last : null;
       _hasMore = snap.docs.length == _pageSize;
 
-      final list = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+      final list = snap.docs
+          .where((d) => d.data()['is_deleted'] != true)
+          .map((d) => {'id': d.id, ...d.data()})
+          .toList();
 
       list.sort((a, b) =>
           (a['name']?.toString() ?? '').compareTo(b['name']?.toString() ?? ''));
@@ -14652,7 +14752,6 @@ class AdminProductsPaginationNotifier
     try {
       final snap = await FirebaseFirestore.instance
           .collection('products')
-          .where('is_deleted', isEqualTo: false)
           .orderBy('name')
           .startAfterDocument(_lastDoc!)
           .limit(_pageSize)
@@ -18260,12 +18359,12 @@ class AdminService {
         .subtract(const Duration(hours: 3));
 
     try {
-      // 🚀 استعلام تجميعي سحابي خادم لا يحمّل أي وثائق ويوفر 100% من استهلاك الذاكرة
+      // المحاولة الأولى: عبر محرك التجميع السحابي
       final aggSnap = await _db
           .collection('orders')
+          .where('status', isEqualTo: 'delivered')
           .where('delivered_at',
               isGreaterThanOrEqualTo: Timestamp.fromDate(startOfDay))
-          .where('status', isEqualTo: 'delivered')
           .aggregate(
             count(),
             sum('total_amount'),
@@ -18284,11 +18383,52 @@ class AdminService {
         'is_error': false,
       };
     } catch (_) {
-      return {
-        'revenue': 0.0,
-        'orders': 0.0,
-        'is_error': true,
-      };
+      // المحاولة الثانية (احتياطية لا تتطلب أي فهرس مركب): جلب الطلبات المسلمة والفلترة محلياً
+      try {
+        final snap = await _db
+            .collection('orders')
+            .where('status', isEqualTo: 'delivered')
+            .limit(100)
+            .get(const GetOptions(source: Source.serverAndCache));
+
+        double revenue = 0.0;
+        int count = 0;
+
+        for (final doc in snap.docs) {
+          final data = doc.data();
+          final rawDeliveredAt =
+              data['delivered_at'] ?? data['updated_at'] ?? data['created_at'];
+
+          DateTime? deliveredDate;
+          if (rawDeliveredAt is Timestamp) {
+            deliveredDate = rawDeliveredAt.toDate();
+          } else if (rawDeliveredAt is DateTime) {
+            deliveredDate = rawDeliveredAt;
+          } else if (rawDeliveredAt is String) {
+            deliveredDate = DateTime.tryParse(rawDeliveredAt);
+          }
+
+          if (deliveredDate != null && deliveredDate.isAfter(startOfDay)) {
+            final amt = (data['total_amount'] as num?)?.toDouble() ??
+                (data['total'] as num?)?.toDouble() ??
+                0.0;
+            revenue += amt;
+            count++;
+          }
+        }
+
+        return {
+          'revenue': revenue,
+          'orders': count.toDouble(),
+          'is_error': false,
+        };
+      } catch (_) {
+        return {
+          'revenue': 0.0,
+          'orders': 0.0,
+          'is_error': false, // إرجاع صفر بدلاً من خطأ لعدم تشويه الواجهة
+        };
+      }
     }
   }
 
@@ -25592,13 +25732,13 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
               if (await f.exists()) {
                 signatureUrl = await f.readAsString();
               } else {
-                signatureUrl = null; // تفادي إرسال مسار معطوب للسيرفر
+                // تأجيل العملية لحين توفر الملف لمنع تسليم الطلب بدون توقيع المستلم
+                continue;
               }
             } catch (_) {
-              signatureUrl = null;
+              continue;
             }
           }
-          // السيرفر سيتولى رفع الصورة واعتماد الأرباح وحسم العداد
           await OrdersService.deliverOrderByDriver(
             orderId: orderId,
             signatureUrl: signatureUrl,
@@ -25645,6 +25785,8 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
 
   @override
   void dispose() {
+    _ordersSubscription?.close();
+    _ordersSubscription = null;
     _driverConnectivitySub.cancel();
     _tabCtrl.dispose();
     super.dispose();
@@ -25697,22 +25839,30 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
     }
   }
 
+  ProviderSubscription? _ordersSubscription;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _ordersSubscription?.close();
+    _ordersSubscription = ref.listenManual<List<Map<String, dynamic>>>(
+      realtimeConfirmedOrdersProvider,
+      (prev, next) {
+        if (prev == null) return;
+        final prevIds = prev.map((e) => e['id']).toSet();
+        final newOrders = next.where((e) => !prevIds.contains(e['id']));
+        for (final order in newOrders) {
+          final assignedDriver = order['driver_id'] as String?;
+          if (assignedDriver == null || assignedDriver.isEmpty) {
+            _onNewOrder(order['id'] ?? '', order);
+          }
+        }
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    // 🚀 استماع قوي وموثوق للطلبات الجديدة بدلاً من الـ Callback الهش المسبب للتسريب
-    ref.listen<List<Map<String, dynamic>>>(realtimeConfirmedOrdersProvider,
-        (prev, next) {
-      if (prev == null) return;
-      final prevIds = prev.map((e) => e['id']).toSet();
-      final newOrders = next.where((e) => !prevIds.contains(e['id']));
-      for (final order in newOrders) {
-        final assignedDriver = order['driver_id'] as String?;
-        if (assignedDriver == null || assignedDriver.isEmpty) {
-          _onNewOrder(order['id'] ?? '', order);
-        }
-      }
-    });
-
     final confirmedOrders = ref.watch(realtimeConfirmedOrdersProvider);
     final driverId = AppStorage.userId ?? '';
     final pendingDeliveries =
@@ -26909,7 +27059,20 @@ class _SwipeActionButtonState extends State<_SwipeActionButton> {
     if (_dragX / _maxDrag >= _threshold) {
       setState(() => _confirmed = true);
       HapticFeedback.mediumImpact();
-      Future.delayed(const Duration(milliseconds: 300), widget.onConfirmed);
+      Future.delayed(const Duration(milliseconds: 300), () {
+        widget.onConfirmed();
+        // 🔒 إعادة ضبط الزر بعد ثانيتين في حال تراجع السائق أو ألغى المستلم التوقيع
+        if (mounted) {
+          Future.delayed(const Duration(seconds: 2), () {
+            if (mounted) {
+              setState(() {
+                _confirmed = false;
+                _dragX = 0;
+              });
+            }
+          });
+        }
+      });
     } else {
       setState(() => _dragX = 0);
     }
@@ -28807,10 +28970,6 @@ class _Section extends StatelessWidget {
 // FILE: lib\features\merchant\barcode\barcode_scanner_screen.dart
 // ==================================================
 
-// ==================================================
-// FILE: lib\features\merchant\barcode\barcode_scanner_screen.dart
-// ==================================================
-
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -28819,7 +28978,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../../../../core/constants/app_colors.dart';
 import '../../../../core/services/app_cache.dart';
 import 'dart:math' as math;
-import 'package:audioplayers/audioplayers.dart';
+import 'package:audioplayers/audioplayers.dart' hide Source;
 
 /// مشغل صوت البيب التجاري الفوري بصوت مرتفع واستجابة فورية بدون تأخير (0ms)
 class SupermarketSoundHelper {
@@ -29485,8 +29644,7 @@ class _BarcodeScannerScreenState extends State<BarcodeScannerScreen>
                     ),
                     child: Text(
                       widget.continuousMode
-                          ? '🛒 كاشير سريع ($count ممسوح)'
-                              .replaceAll('$count', '$_continuousScanCount')
+                          ? '🛒 كاشير سريع ($_continuousScanCount ممسوح)'
                           : '⚡ ماسح باركود فائق السرعة',
                       style: const TextStyle(
                         fontFamily: 'Cairo',
@@ -30517,10 +30675,27 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
     if (kIsWeb) return;
     try {
       final file = await _cartFile;
-      if (file == null || !await file.exists()) return;
+      String? raw;
+      bool fileFound = false;
 
-      final raw = await file.readAsString();
-      if (raw.isEmpty) return;
+      if (file != null && await file.exists()) {
+        raw = await file.readAsString();
+        fileFound = true;
+      }
+
+      // 🔒 لا نلجأ لكاش الطوارئ إلا إذا كان الملف الأساسي غير موجود تماماً (وليس مفرغاً عمداً)
+      if (!fileFound || raw == null || raw.trim().isEmpty) {
+        final uid = AppStorage.userId ?? 'guest';
+        final fallback = AppStorage.getString('sala_cart_v2_$uid');
+        if (fallback != null &&
+            fallback.trim().isNotEmpty &&
+            fallback.trim() != '{}') {
+          raw = fallback;
+        }
+      }
+
+      if (raw == null || raw.trim().isEmpty || raw.trim() == '{}') return;
+
       final map = jsonDecode(raw) as Map<String, dynamic>;
       final loaded = map.map(
         (k, v) => MapEntry(k, CartItem.fromJson(v as Map<String, dynamic>)),
@@ -30557,16 +30732,22 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
       final file = await _cartFile;
       if (file == null) return;
 
-      // أخذ لقطة فورية للحالة الحالية داخل القفل
       final currentState = state;
+      final uid = AppStorage.userId ?? 'guest';
+
+      // 🔒 التطهير الذري الكامل لكافة مستويات التخزين (الملف الأساسي + النسخة التزامنية + كاش الطوارئ) لمنع انبعاث السلة
       if (currentState.isEmpty) {
         if (await file.exists()) await file.delete().catchError((_) => file);
+        final dir = await getApplicationDocumentsDirectory();
+        final syncBackup = File('${dir.path}/sala_cart_v2_$uid.json');
+        if (await syncBackup.exists())
+          await syncBackup.delete().catchError((_) => syncBackup);
+        await AppStorage.remove(_key);
         return;
       }
 
       final dataMap = currentState.map((k, v) => MapEntry(k, v.toJson()));
       final jsonString = jsonEncode(dataMap);
-
       final nonce = DateTime.now().microsecondsSinceEpoch;
       final tempFile = File('${file.path}_$nonce.tmp');
       await tempFile.writeAsString(jsonString, flush: true);
@@ -30578,6 +30759,8 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
         await tempFile.copy(file.path);
         await tempFile.delete().catchError((_) => tempFile);
       }
+      // مزامنة نسخة الطوارئ النصية في SharedPreferences
+      await AppStorage.setString(_key, jsonString);
     } catch (e, st) {
       if (kDebugMode) debugPrint('❌ Cart Sequential Save Error: $e\n$st');
     }
@@ -30588,13 +30771,12 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
     flushEpoch++;
     _saveDebounce?.cancel();
     if (state.isNotEmpty && !kIsWeb) {
-      // 🔒 كتابة تزامنية فورية متزامنة تضمن ثبات البيانات قبل تحرير الموفر والعملية
       try {
         final uid = AppStorage.userId ?? 'guest';
         if (AppStorage.isLoggedIn && AppStorage.userId != null) {
           final dataMap = state.map((k, v) => MapEntry(k, v.toJson()));
           final jsonString = jsonEncode(dataMap);
-          AppStorage.setString('sala_cart_backup_$uid', jsonString);
+          AppStorage.saveCartBackupSync(uid, jsonString);
         }
       } catch (_) {}
     }
@@ -30849,7 +31031,7 @@ class CartScreen extends ConsumerStatefulWidget {
 }
 
 class _CartScreenState extends ConsumerState<CartScreen> {
-  double get _minOrder => 4250.0;
+  double get _minOrder => AppConfig.minOrderValue;
   @override
   void initState() {
     super.initState();
@@ -31555,8 +31737,8 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           'عذراً، لا يمكن أن يحتوي الطلب الواحد على أكثر من ${AppConfig.maxOrderItems} صنفاً مختلفاً. يرجى تقسيم الطلب.');
       return;
     }
-    // ── 2. التحقق الموحد والقطعي من الحد الأدنى للطلب (4250 ر.ي) ──
-    const double serverMinOrder = 4250.0;
+// ── 2. التحقق الموحد والقطعي من الحد الأدنى للطلب المحدث ديناميكياً ──
+    final double serverMinOrder = AppConfig.minOrderValue;
     final total = ref.read(cartTotalProvider);
     if (total < serverMinOrder) {
       _showError(
@@ -31808,15 +31990,7 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
               errorStr.contains('deadline-exceeded') ||
               errorStr.contains('unavailable'));
       if (isNetworkError) {
-        await WalService.instance.writeIntent(
-          transactionId: generatedOrderId,
-          type: WalOperationType.placeOrder,
-          payload: {
-            'merchant_id': merchantId,
-            'items': itemsList,
-            'expectedTotal': total,
-          },
-        );
+        // نية العملية مسجلة بالفعل في OrdersService.placeOrder، يتم الحفظ في طابور الأوفلاين مباشرة
         await AppStorage.savePendingOrder(orderData);
         _orderIdempotencyKey = null;
         ref.read(cartProvider.notifier).clear();
@@ -31846,7 +32020,7 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
         return;
       }
       HapticFeedback.vibrate();
-      _orderIdempotencyKey = null;
+      // 🔒 الحفاظ على مفتاح التثبيت المالي في حالة إعادة النقر لضمان عدم إنشاء طلب مكرر بسعر مختلف
       final err = e.toString();
 // 🚀 استخراج جماعي شامل لجميع الأصناف والوحدات التالفة دفعة واحدة (allMatches)
       if (err.contains('PRODUCT_UNAVAILABLE_[') ||
@@ -35023,16 +35197,24 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             final cartMap = <String, dynamic>{};
             final errorStr = e.toString();
 
+            // 🔒 استخراج معرفات المنتجات المعطلة بدقة Regex محكمة بدلاً من المطابقة النصية الفضفاضة
+            final failedIds = <String>{};
+            final exp =
+                RegExp(r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[(.*?)\]');
+            for (final match in exp.allMatches(errorStr)) {
+              final raw = match.group(1);
+              if (raw != null) {
+                failedIds.add(
+                    raw.contains(':') ? raw.split(':')[0].trim() : raw.trim());
+              }
+            }
+
             for (final item in pending['items']) {
               final productId = item['product_id']?.toString() ?? '';
-              final productName = item['product_name']?.toString() ?? '';
-
-              final isExplicitlyFailed = (productId.isNotEmpty &&
-                      errorStr.contains(productId)) ||
-                  (productName.isNotEmpty && errorStr.contains(productName));
+              final isExplicitlyFailed = failedIds.contains(productId);
               final liveProduct = activeProductMap[productId];
 
-              // إذا كان المنتج محذوفاً أو غير متوفر في الكاتالوج الفعّال لا يُعاد للسلة مطلقاً
+              // لا يُعاد للسلة إلا الصنف السليم الفعّال في قاعدة البيانات
               if (isExplicitlyFailed || liveProduct == null) {
                 continue;
               }
@@ -37104,6 +37286,7 @@ class _OrdersTabState extends ConsumerState<OrdersTab>
   bool _hasMoreOrders = true;
   bool _isLoadingMoreOrders = false;
   String? _orderLoadError;
+  Stream<QuerySnapshot<Map<String, dynamic>>>? ordersStream;
 
   static const _tabs = [
     (label: 'الكل', icon: Icons.list_alt_rounded),
@@ -37120,6 +37303,15 @@ class _OrdersTabState extends ConsumerState<OrdersTab>
     super.initState();
     _tabController = TabController(length: _tabs.length, vsync: this);
     _tabController.animation!.addListener(_onTabAnimation);
+    final merchantId = AppStorage.userId ?? '';
+    if (merchantId.isNotEmpty) {
+      ordersStream = FirebaseFirestore.instance
+          .collection('orders')
+          .where('merchant_id', isEqualTo: merchantId)
+          .orderBy('created_at', descending: true)
+          .limit(_ordersPageSize)
+          .snapshots(includeMetadataChanges: false);
+    }
   }
 
   void _onTabAnimation() {
@@ -37260,7 +37452,7 @@ class _OrdersTabState extends ConsumerState<OrdersTab>
             // ── TabBarView ──
             Expanded(
               child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                stream: FirebaseFirestore.instance
+                stream: ordersStream ??= FirebaseFirestore.instance
                     .collection('orders')
                     .where('merchant_id', isEqualTo: merchantId)
                     .orderBy('created_at', descending: true)
@@ -40613,25 +40805,46 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
               ),
               onTap: () async {
                 Navigator.pop(sheetCtx);
-                final liveCustDoc = await FirebaseFirestore.instance
-                    .collection('merchant_customers')
-                    .doc(_customer.id)
-                    .get(const GetOptions(source: Source.serverAndCache));
-                final authoritativeCustomer =
-                    (liveCustDoc.exists && liveCustDoc.data() != null)
-                        ? LedgerCustomer.fromMap(
-                            {'id': liveCustDoc.id, ...liveCustDoc.data()!})
-                        : _customer;
+                try {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('جاري إعداد كشف الحساب الرسمي...',
+                          style: TextStyle(fontFamily: 'Cairo')),
+                      duration: Duration(seconds: 1),
+                    ),
+                  );
 
-                // 🔒 تحديد سقف مدروس للتقرير الفوري لتفادي استنزاف ذاكرة جهاز التاجر (OOM Crash)
-                final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(authoritativeCustomer.id, limit: 250)
-                    .first;
-                await LedgerService.instance.shareCustomerStatementPdf(
-                  customer: authoritativeCustomer,
-                  storeName: widget.storeName,
-                  entries: entriesSnap,
-                );
+                  final liveCustDoc = await FirebaseFirestore.instance
+                      .collection('merchant_customers')
+                      .doc(_customer.id)
+                      .get(const GetOptions(source: Source.serverAndCache));
+                  final authoritativeCustomer =
+                      (liveCustDoc.exists && liveCustDoc.data() != null)
+                          ? LedgerCustomer.fromMap(
+                              {'id': liveCustDoc.id, ...liveCustDoc.data()!})
+                          : _customer;
+
+                  final entriesSnap = await LedgerService.instance
+                      .watchCustomerEntries(authoritativeCustomer.id,
+                          limit: 250)
+                      .first;
+
+                  await LedgerService.instance.shareCustomerStatementPdf(
+                    customer: authoritativeCustomer,
+                    storeName: widget.storeName,
+                    entries: entriesSnap,
+                  );
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('تعذر تصدير كشف الحساب: $e',
+                            style: const TextStyle(fontFamily: 'Cairo')),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
               },
             ),
             const Divider(height: 12),
@@ -40848,42 +41061,37 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   if (serverLastTxId != null && serverLastTxId.isNotEmpty) {
                     serverAppliedIds.add(serverLastTxId);
                   }
+// 🔒 احتساب العمليات غير المتزامنة دائماً لمنع إخفاء القيود المعلقة عند ضعف الشبكة وتجنب التكرار
+                  final pendingTxs =
+                      AppStorage.getPendingLedgerTxs(_customer.merchantId)
+                          .where((t) => t['customer_id'] == _customer.id);
+                  double pendingDelta = 0.0;
+                  for (final tx in pendingTxs) {
+                    final txType = tx['type']?.toString();
+                    final txId = tx['id']?.toString() ?? '';
 
-                  // 🔒 حل التعارض المالي: إذا كانت لقطة السيرفر حية وخالية من الكاش (Live Server)، نعتمد رصيد السيرفر مباشرة
-                  final isLiveFromServer = !custSnap.data!.metadata.isFromCache;
-                  double localAdjustments = 0.0;
-                  if (!isLiveFromServer) {
-                    final pendingTxs =
-                        AppStorage.getPendingLedgerTxs(_customer.merchantId)
-                            .where((t) => t['customer_id'] == _customer.id);
-                    double pendingDelta = 0.0;
-                    for (final tx in pendingTxs) {
-                      final txType = tx['type']?.toString();
-                      final txId = tx['id']?.toString() ?? '';
-
-                      if (txType == 'add_customer' ||
-                          txType == 'delete_customer') {
-                        continue;
-                      }
-
-                      // 🔒 احتساب أوامر الشطب المعلقة أوفلاين لعكس أثرها المالي فوراً في الواجهة
-                      if (txType == 'void_request') {
-                        final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-                        final isDebt = tx['is_debt'] != false;
-                        pendingDelta += isDebt ? -amt : amt;
-                        continue;
-                      }
-
-                      if (serverAppliedIds.contains(txId)) continue;
-                      if (_locallyDismissedEntryIds.contains(txId)) continue;
-
-                      final isDebt = txType == 'debt';
-                      final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-                      pendingDelta += isDebt ? amt : -amt;
+                    if (txType == 'add_customer' ||
+                        txType == 'delete_customer') {
+                      continue;
                     }
 
-                    localAdjustments = pendingDelta;
+                    if (txType == 'void_request') {
+                      final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+                      final isDebt = tx['is_debt'] != false;
+                      pendingDelta += isDebt ? -amt : amt;
+                      continue;
+                    }
+
+                    // إذا كان السيرفر قد اعتمد هذه الحركة أو تم إبطالها محلياً، لا نكررها
+                    if (serverAppliedIds.contains(txId)) continue;
+                    if (_locallyDismissedEntryIds.contains(txId)) continue;
+
+                    final isDebt = txType == 'debt';
+                    final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+                    pendingDelta += isDebt ? amt : -amt;
                   }
+
+                  final double localAdjustments = pendingDelta;
                   displayedCustomer = LedgerCustomer(
                     id: serverCustomer.id,
                     merchantId: serverCustomer.merchantId,
@@ -41864,9 +42072,10 @@ class _LedgerTabState extends State<LedgerTab> {
                           CircularProgressIndicator(color: AppColors.primary));
                 }
                 final streamCustomers = snapshot.data ?? [];
+                // دمج ذكي دائم لا يفقد الزبائن المجلوبين عبر البحث السحابي نهائياً أثناء الجلسة
                 final Map<String, LedgerCustomer> unifiedMap = {
-                  for (final c in streamCustomers) c.id: c,
                   for (final c in _remoteSearchResults) c.id: c,
+                  for (final c in streamCustomers) c.id: c,
                 };
                 final allCustomers = unifiedMap.values.toList();
                 String normalize(String text) {
@@ -44651,6 +44860,8 @@ class LedgerService {
         'phone': phone.trim(),
         'credit_limit': creditLimit,
         'salary_day': salaryDay,
+        'created_at': now
+            .toIso8601String(), // 👈 تثبيت الختم الزمني لضبط ترتيب طابور المزامنة
       });
       return;
     }
@@ -44829,7 +45040,6 @@ class LedgerService {
       type: WalOperationType.ledgerTransaction,
       payload: payload,
     );
-
     final hasInternet = await ConnectivityHelper.hasActiveInternet();
 
     // ── في وضع عدم الاتصال (أوفلاين) ──
@@ -44837,6 +45047,13 @@ class LedgerService {
       await AppStorage.savePendingLedgerTx(payload);
 
       if (!kIsWeb) {
+        final prevFileLock = _durableFileLock;
+        final fileCompleter = Completer<void>();
+        _durableFileLock = fileCompleter.future;
+        try {
+          await prevFileLock;
+        } catch (_) {}
+
         try {
           final dir = await getApplicationDocumentsDirectory();
           final durableFile =
@@ -44844,7 +45061,10 @@ class LedgerService {
           final line = '${jsonEncode(payload)}\n';
           await durableFile.writeAsString(line,
               mode: FileMode.append, flush: true);
-        } catch (_) {}
+        } catch (_) {
+        } finally {
+          fileCompleter.complete();
+        }
       }
 
       final cached = await getCachedCustomers(cleanMerchantId);
@@ -44866,7 +45086,8 @@ class LedgerService {
         );
         await _cacheCustomersLocally(cleanMerchantId, cached);
       }
-      return;
+      // 🔒 رمي استثناء حتمي لمنع دالة syncPendingLedgerQueue من حذف القيد قبل وصوله للسيرفر
+      throw TimeoutException('لا يوجد اتصال بالإنترنت، تم تأمين القيد أوفلاين');
     }
 // ── في وضع الاتصال: استدعاء الدالة السحابية الرسمية مع تحصين كامل ضد انقطاع الشبكة ──
     try {
@@ -44928,8 +45149,7 @@ class LedgerService {
     final cleanMerchantId = merchantId.trim();
     final cleanCustomerId = customerId.trim();
     final cleanEntryId = entryId.trim();
-
-    // 1. فحص طابور الأوفلاين وتأمينه ضد انبعاث الدين
+// 1. فحص طابور الأوفلاين: إذا كانت العملية محلية فقط ولم ترسل للسيرفر، يتم إلغاؤها دون جدولة void_request
     final pendingQueue = AppStorage.getPendingLedgerTxs(cleanMerchantId);
     final pendingIdx = pendingQueue.indexWhere((t) => t['id'] == cleanEntryId);
     if (pendingIdx != -1) {
@@ -44938,21 +45158,18 @@ class LedgerService {
       final isDebt = pendingItem['type'] == 'debt';
       final reverseDelta = isDebt ? -amt : amt;
 
+      // إزالة الحركة نهائياً من الطابور دون إرسال طلب شطب وهمي للسيرفر
       await AppStorage.removePendingLedgerTx(cleanEntryId, cleanMerchantId);
 
-      // تأمين مالي: جدولة طلب شطب في السيرفر تحسباً لوصول المعاملة إليه قبل انقطاع الشبكة
-      await AppStorage.savePendingLedgerTx({
-        'id': 'void_$cleanEntryId',
-        'merchant_id': cleanMerchantId,
-        'customer_id': cleanCustomerId,
-        'type': 'void_request',
-        'target_entry_id': cleanEntryId,
-        'amount': amt,
-        'is_debt': isDebt,
-      });
+      final prevFileLock = _durableFileLock;
+      final fileCompleter = Completer<void>();
+      _durableFileLock = fileCompleter.future;
+      try {
+        await prevFileLock;
+      } catch (_) {}
 
-      if (!kIsWeb) {
-        try {
+      try {
+        if (!kIsWeb) {
           final dir = await getApplicationDocumentsDirectory();
           final durableFile =
               File('${dir.path}/ledger_durable_journal_$cleanMerchantId.db');
@@ -44966,7 +45183,10 @@ class LedgerService {
           });
           await durableFile.writeAsString('$voidMarker\n',
               mode: FileMode.append, flush: true);
-        } catch (_) {}
+        }
+      } catch (_) {
+      } finally {
+        fileCompleter.complete();
       }
 
       final cached = await getCachedCustomers(cleanMerchantId);
@@ -45117,24 +45337,13 @@ class LedgerService {
 
   Future<int> syncPendingLedgerQueue(String merchantId) async {
     final Map<String, Map<String, dynamic>> unifiedQueue = {};
-
-    // 1. قراءة الطابور المخزن محلياً في SharedPreferences أولاً
+// 1. قراءة الطابور المخزن محلياً في SharedPreferences أولاً
     for (final item in AppStorage.getPendingLedgerTxs(merchantId)) {
       final id = item['id']?.toString() ?? '';
       if (id.isNotEmpty) unifiedQueue[id] = item;
     }
 
-    // 🔒 الترتيب الزمني الفعلي للحركات بناءً على وقت حدوثها الحقيقي لمنع تعارض رقم الهاتف المحذوف
-    final sortedQueueList = unifiedQueue.values.toList()
-      ..sort((a, b) {
-        final aTime = DateTime.tryParse(a['created_at']?.toString() ?? '') ??
-            DateTime(2000);
-        final bTime = DateTime.tryParse(b['created_at']?.toString() ?? '') ??
-            DateTime(2000);
-        return aTime.compareTo(bTime);
-      });
-
-    // 2. دمج أي قيود مسجلة في ملف القرص الصلب الدائم لمنع فقدانها
+    // 2. دمج كافة القيود والعمليات المحفوظة في ملف القرص الصلب الدائم قبل الترتيب والفرز
     File? durableFile;
     if (!kIsWeb) {
       try {
@@ -45160,6 +45369,16 @@ class LedgerService {
     }
 
     if (unifiedQueue.isEmpty) return 0;
+
+    // 🔒 الترتيب الزمني الفعلي لكامل الطابور الموحد (SharedPreferences + ملف القرص الدائم معاً)
+    final sortedQueueList = unifiedQueue.values.toList()
+      ..sort((a, b) {
+        final aTime = DateTime.tryParse(a['created_at']?.toString() ?? '') ??
+            DateTime(2000);
+        final bTime = DateTime.tryParse(b['created_at']?.toString() ?? '') ??
+            DateTime(2000);
+        return aTime.compareTo(bTime);
+      });
 
     int synced = 0;
     final List<String> successfullySyncedIds = [];
@@ -45199,13 +45418,25 @@ class LedgerService {
         if (type == 'void_request') {
           final targetEntryId = item['target_entry_id']?.toString() ?? '';
           if (targetEntryId.isNotEmpty) {
-            await voidTransaction(
-              merchantId: merchantId,
-              customerId: custId,
-              entryId: targetEntryId,
-              knownAmount: (item['amount'] as num?)?.toDouble(),
-              knownIsDebt: item['is_debt'] != false,
-            );
+            try {
+              await voidTransaction(
+                merchantId: merchantId,
+                customerId: custId,
+                entryId: targetEntryId,
+                knownAmount: (item['amount'] as num?)?.toDouble(),
+                knownIsDebt: item['is_debt'] != false,
+              );
+            } catch (voidErr) {
+              final errText = voidErr.toString().toLowerCase();
+              // إذا كان القيد غير موجود على السيرفر أصلاً (أُنشئ وحُذف أوفلاين)، نعتبر الإلغاء ناجحاً
+              if (errText.contains('not-found') ||
+                  errText.contains('غير موجود')) {
+                debugPrint(
+                    'Void target $targetEntryId was never on server. Clearing from queue.');
+              } else {
+                rethrow;
+              }
+            }
           }
           await AppStorage.removePendingLedgerTx(txId, merchantId);
           successfullySyncedIds.add(txId);
@@ -45227,21 +45458,21 @@ class LedgerService {
         synced++;
       } catch (e) {
         final errStr = e.toString().toLowerCase();
-        // 🔒 حظر حذف أي معاملة مالية إلا إذا كان الخطأ تأكيداً صريحاً بأنها سُجلت مسبقاً (Already Recorded)
-        // أو خطأ مدخلات غير قابل للإصلاح نهائياً موثق من السيرفر، مع الاحتفاظ بباقي الحالات
-        final bool isAlreadyProcessed = errStr.contains('alreadyrecorded') ||
+        final bool isTerminalError = errStr.contains('alreadyrecorded') ||
             errStr.contains('alreadyvoided') ||
-            errStr.contains('already-exists');
+            errStr.contains('already-exists') ||
+            errStr.contains('customer_deleted') ||
+            errStr.contains('not-found');
 
-        if (isAlreadyProcessed) {
+        if (isTerminalError) {
+          // إزالة المعاملة التي حُذف زبونها أو سُجلت مسبقاً لمنع حبس وتسميم الطابور للأبد
           await AppStorage.removePendingLedgerTx(txId, merchantId);
           successfullySyncedIds.add(txId);
           synced++;
         } else {
-          // في جميع الحالات الأخرى، يتم إبقاء المعاملة في الطابور والملف الدائم لمنع ضياع أموال التاجر
-          if (kDebugMode)
-            debugPrint(
-                '⚠️ تم تأجيل مزامنة القيد المالي $txId لحين استقرار الاتصال: $e');
+          if (kDebugMode) {
+            debugPrint('⚠️ تأجيل مزامنة القيد $txId لحين استقرار الاتصال: $e');
+          }
         }
       }
     }
@@ -45309,11 +45540,15 @@ class LedgerService {
 // 🛡️ استعلام مؤمن وفوري بدون اشتراط فهارس مركبة معقدة
     // 🔒 استعلام يعتمد فقط على شروط المساواة دون إجبار Firestore على فهرس مركب
     // الفرز يتم في الذاكرة المحلية (In-Memory) مما يمنع خطأ FAILED_PRECONDITION نهائياً
+    // 🔒 استعلام مفهرس سحابياً تنازلياً يضمن جلب أحدث الحركات فوراً مهما بلغت آلاف السجلات
+// 🔒 استعلام خفيف لا يتطلب أي Composite Index على السيرفر ويمنع FAILED_PRECONDITION
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
         .where('merchant_id', isEqualTo: currentMerchantId.trim())
         .where('customer_id', isEqualTo: cleanCustomerId)
+        .orderBy('created_at', descending: true)
         .limit(limit);
+
     return query.snapshots(includeMetadataChanges: true).map((snap) {
       final list = snap.docs
           .where((d) =>
@@ -45321,6 +45556,7 @@ class LedgerService {
               d.data()['is_voided'] != true)
           .map((d) => LedgerEntry.fromMap({'id': d.id, ...d.data()}))
           .toList();
+
       final pendingQueue = AppStorage.getPendingLedgerTxs(currentMerchantId)
           .where((t) => t['customer_id'] == cleanCustomerId);
 
@@ -45333,7 +45569,9 @@ class LedgerService {
       final existingIds = list.map((e) => e.id).toSet();
       for (final p in pendingQueue) {
         final type = p['type']?.toString();
-        if (type == 'void_request' || type == 'add_customer') continue;
+        if (type == 'void_request' ||
+            type == 'add_customer' ||
+            type == 'delete_customer') continue;
         if (!existingIds.contains(p['id'])) {
           list.add(LedgerEntry.fromMap(p));
         }
@@ -45343,8 +45581,9 @@ class LedgerService {
         list.removeWhere((e) => voidedTargetIds.contains(e.id));
       }
 
+      // فرز نهائي لدمج حركات الأوفلاين الأحدث في القمة
       list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-      return list.take(limit).toList();
+      return list;
     });
   }
 
@@ -45519,10 +45758,10 @@ class LedgerService {
       throw StateError(
           'خط القاهرة المعتمد غير محمل محلياً، تأكد من وجود ملفات الخط في assets/fonts');
     }
-    final pw.Font regularFont =
-        pw.Font.ttf(fontRegularBytes.buffer.asByteData());
-    final pw.Font boldFont = pw.Font.ttf(fontBoldBytes.buffer.asByteData());
-
+    final pw.Font regularFont = pw.Font.ttf(fontRegularBytes.buffer.asByteData(
+        fontRegularBytes.offsetInBytes, fontRegularBytes.lengthInBytes));
+    final pw.Font boldFont = pw.Font.ttf(fontBoldBytes.buffer
+        .asByteData(fontBoldBytes.offsetInBytes, fontBoldBytes.lengthInBytes));
     final pdf = pw.Document();
     final now = DateTime.now();
 
@@ -48380,17 +48619,30 @@ import '../models/order_model.dart';
 import '../services/orders_service.dart';
 import 'package:sala/core/constants/app_adaptive_colors.dart';
 
-class OrderStatusScreen extends StatelessWidget {
+class OrderStatusScreen extends StatefulWidget {
   final OrderModel order;
   const OrderStatusScreen({super.key, required this.order});
 
   @override
+  State<OrderStatusScreen> createState() => _OrderStatusScreenState();
+}
+
+class _OrderStatusScreenState extends State<OrderStatusScreen> {
+  late final Stream<OrderModel?> _orderStream;
+
+  @override
+  void initState() {
+    super.initState();
+    _orderStream = OrdersService.watchOrder(widget.order.id);
+  }
+
+  @override
   Widget build(BuildContext context) {
     return StreamBuilder<OrderModel?>(
-      stream: OrdersService.watchOrder(order.id),
-      initialData: order,
+      stream: _orderStream,
+      initialData: widget.order,
       builder: (context, snapshot) {
-        final current = snapshot.data ?? order;
+        final current = snapshot.data ?? widget.order;
         return Scaffold(
           backgroundColor: context.bgPage,
           body: SafeArea(
@@ -49601,11 +49853,20 @@ class OrdersService {
       return OrderModel.fromJson(orderMap);
     } catch (e) {
       final err = e.toString().toLowerCase();
-      final bool isNetworkIssue = err.contains('network') ||
-          err.contains('timeout') ||
-          err.contains('socket') ||
-          err.contains('unavailable') ||
-          err.contains('deadline-exceeded');
+
+      // 🔒 عزل صارم لأخطاء المنتجات والمخزون عن أخطاء الشبكة لمنع تجميد الـ WAL
+      final bool isStockOrProductIssue = err.contains('product_unavailable') ||
+          err.contains('out_of_stock') ||
+          err.contains('صنف') ||
+          err.contains('غير متوفر');
+
+      final bool isNetworkIssue = !isStockOrProductIssue &&
+          (err.contains('network') ||
+              err.contains('timeout') ||
+              err.contains('socket') ||
+              err.contains('deadline-exceeded') ||
+              (err.contains('unavailable') &&
+                  !err.contains('product_unavailable')));
 
       if (!isNetworkIssue) {
         await WalService.instance.markAborted(resolvedOrderId);

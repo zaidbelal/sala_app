@@ -26,6 +26,7 @@ class _OrdersTabState extends ConsumerState<OrdersTab>
   bool _hasMoreOrders = true;
   bool _isLoadingMoreOrders = false;
   String? _orderLoadError;
+  Stream<QuerySnapshot<Map<String, dynamic>>>? ordersStream;
 
   static const _tabs = [
     (label: 'الكل', icon: Icons.list_alt_rounded),
@@ -42,6 +43,15 @@ class _OrdersTabState extends ConsumerState<OrdersTab>
     super.initState();
     _tabController = TabController(length: _tabs.length, vsync: this);
     _tabController.animation!.addListener(_onTabAnimation);
+    final merchantId = AppStorage.userId ?? '';
+    if (merchantId.isNotEmpty) {
+      ordersStream = FirebaseFirestore.instance
+          .collection('orders')
+          .where('merchant_id', isEqualTo: merchantId)
+          .orderBy('created_at', descending: true)
+          .limit(_ordersPageSize)
+          .snapshots(includeMetadataChanges: false);
+    }
   }
 
   void _onTabAnimation() {
@@ -182,7 +192,7 @@ class _OrdersTabState extends ConsumerState<OrdersTab>
             // ── TabBarView ──
             Expanded(
               child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                stream: FirebaseFirestore.instance
+                stream: ordersStream ??= FirebaseFirestore.instance
                     .collection('orders')
                     .where('merchant_id', isEqualTo: merchantId)
                     .orderBy('created_at', descending: true)

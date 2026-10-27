@@ -68,33 +68,29 @@ final appRouterProvider = Provider<GoRouter>((ref) {
       if (path == AppRoutes.splash) {
         return null;
       }
-
       final firebaseUser = FirebaseAuth.instance.currentUser;
 
-      // حماية من التوجيه الخاطئ أثناء تهيئة المستخدم لأول مرة
-      if (firebaseUser == null && AppStorage.userId == null) {
+      // 1. إذا كان المستخدم غير مسجل محلياً، يُمنع دخوله لأي مسار خاص ويُوجّه لتسجيل الدخول فوراً
+      if (AppStorage.userId == null || !AppStorage.isLoggedIn) {
         if (!publicRoutes.contains(path)) {
           return AppRoutes.login;
         }
         return null;
       }
-// ✅ حماية الجلسة أوفلاين: عدم طرد التاجر إذا كان مسجلاً محلياً والجلسة سارية
-      final bool sessionExpiredOrMismatch =
-          (AppStorage.isLoggedIn && AppStorage.isSessionExpired) ||
-              (firebaseUser != null &&
-                  AppStorage.userId != null &&
-                  firebaseUser.uid != AppStorage.userId);
 
-      // لا نعتبر الجلسة ملغاة لمجرد تأخر رد فايربيز أثناء غياب الإنترنت
-      final bool sessionInvalid = sessionExpiredOrMismatch;
+      // 2. إذا انتهت الجلسة المحلية أو تعارض حساب فايربيز النشط مع معرف التخزين المحلي
+      final bool sessionInvalid = AppStorage.isSessionExpired ||
+          (firebaseUser != null && firebaseUser.uid != AppStorage.userId);
 
       if (sessionInvalid) {
+        NotificationService.pendingRoute = null;
         if (!publicRoutes.contains(path)) {
           return AppRoutes.login;
         }
         return null;
       }
-      // السماح الفوري بالبقاء في المسارات العامة بما فيها صفحة إكمال البيانات والسياسة
+
+      // 3. السماح بالمسارات العامة
       if (publicRoutes.contains(path)) {
         if (path == AppRoutes.signupDetails && firebaseUser == null) {
           return AppRoutes.login;
@@ -102,24 +98,30 @@ final appRouterProvider = Provider<GoRouter>((ref) {
         return null;
       }
 
-      // حساب محظور نهائياً — طرد فوري ما لم يكن في صفحة تسجيل الدخول أو السياسة
-      if (AppStorage.isBanned &&
-          path != AppRoutes.login &&
-          path != AppRoutes.privacy) {
+      // 4. الحساب محظور نهائياً
+      if (AppStorage.isBanned) {
         NotificationService.pendingRoute = null;
         return AppRoutes.login;
       }
 
-      // الحساب بانتظار المراجعة والتفعيل من الإدارة
+      // 5. الحساب مسجل ولكنه بانتظار المراجعة والاعتماد
       if (!AppStorage.isActive) {
         NotificationService.pendingRoute = null;
-        if (AppStorage.isBanned) return AppRoutes.login;
         return path == AppRoutes.pending ? null : AppRoutes.pending;
       }
-
       if (pendingPush != null && pendingPush.isNotEmpty) {
+        final target = pendingPush;
         NotificationService.pendingRoute = null;
-        return pendingPush;
+
+        final isAllowed = (_protectedAdminRoutes.contains(target) &&
+                AppStorage.hasAdminAccess) ||
+            (_protectedMerchantRoutes.contains(target) &&
+                AppStorage.isMerchant) ||
+            (_protectedDriverRoutes.contains(target) && AppStorage.isDriver) ||
+            target == AppRoutes.notifications ||
+            target == AppRoutes.privacy;
+
+        if (isAllowed) return target;
       }
       // إذا كان الحساب مفعّلاً وتواجد في صفحة الانتظار، يتم توجيهه حسب دوره الصحيح
       if (path == AppRoutes.pending && AppStorage.isActive) {

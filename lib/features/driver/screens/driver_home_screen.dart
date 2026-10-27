@@ -77,13 +77,13 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
               if (await f.exists()) {
                 signatureUrl = await f.readAsString();
               } else {
-                signatureUrl = null; // تفادي إرسال مسار معطوب للسيرفر
+                // تأجيل العملية لحين توفر الملف لمنع تسليم الطلب بدون توقيع المستلم
+                continue;
               }
             } catch (_) {
-              signatureUrl = null;
+              continue;
             }
           }
-          // السيرفر سيتولى رفع الصورة واعتماد الأرباح وحسم العداد
           await OrdersService.deliverOrderByDriver(
             orderId: orderId,
             signatureUrl: signatureUrl,
@@ -130,6 +130,8 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
 
   @override
   void dispose() {
+    _ordersSubscription?.close();
+    _ordersSubscription = null;
     _driverConnectivitySub.cancel();
     _tabCtrl.dispose();
     super.dispose();
@@ -182,22 +184,30 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
     }
   }
 
+  ProviderSubscription? _ordersSubscription;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _ordersSubscription?.close();
+    _ordersSubscription = ref.listenManual<List<Map<String, dynamic>>>(
+      realtimeConfirmedOrdersProvider,
+      (prev, next) {
+        if (prev == null) return;
+        final prevIds = prev.map((e) => e['id']).toSet();
+        final newOrders = next.where((e) => !prevIds.contains(e['id']));
+        for (final order in newOrders) {
+          final assignedDriver = order['driver_id'] as String?;
+          if (assignedDriver == null || assignedDriver.isEmpty) {
+            _onNewOrder(order['id'] ?? '', order);
+          }
+        }
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    // 🚀 استماع قوي وموثوق للطلبات الجديدة بدلاً من الـ Callback الهش المسبب للتسريب
-    ref.listen<List<Map<String, dynamic>>>(realtimeConfirmedOrdersProvider,
-        (prev, next) {
-      if (prev == null) return;
-      final prevIds = prev.map((e) => e['id']).toSet();
-      final newOrders = next.where((e) => !prevIds.contains(e['id']));
-      for (final order in newOrders) {
-        final assignedDriver = order['driver_id'] as String?;
-        if (assignedDriver == null || assignedDriver.isEmpty) {
-          _onNewOrder(order['id'] ?? '', order);
-        }
-      }
-    });
-
     final confirmedOrders = ref.watch(realtimeConfirmedOrdersProvider);
     final driverId = AppStorage.userId ?? '';
     final pendingDeliveries =
@@ -1394,7 +1404,20 @@ class _SwipeActionButtonState extends State<_SwipeActionButton> {
     if (_dragX / _maxDrag >= _threshold) {
       setState(() => _confirmed = true);
       HapticFeedback.mediumImpact();
-      Future.delayed(const Duration(milliseconds: 300), widget.onConfirmed);
+      Future.delayed(const Duration(milliseconds: 300), () {
+        widget.onConfirmed();
+        // 🔒 إعادة ضبط الزر بعد ثانيتين في حال تراجع السائق أو ألغى المستلم التوقيع
+        if (mounted) {
+          Future.delayed(const Duration(seconds: 2), () {
+            if (mounted) {
+              setState(() {
+                _confirmed = false;
+                _dragX = 0;
+              });
+            }
+          });
+        }
+      });
     } else {
       setState(() => _dragX = 0);
     }

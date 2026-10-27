@@ -22,8 +22,8 @@
 -keepattributes InnerClasses
 -keepattributes SourceFile,LineNumberTable
 -keepclassmembers class * {
-    @com.google.firebase.database.PropertyName <fields>;
-    @com.google.firebase.database.PropertyName <methods>;
+@com.google.firebase.database.PropertyName <fields>;
+@com.google.firebase.database.PropertyName <methods>;
 }
 -keep class com.google.firebase.** { *; }
 -dontwarn com.google.firebase.**
@@ -63,10 +63,10 @@
 # حماية كائنات ونماذج بيانات تطبيق سلة
 -keep class com.zaidsalaapp.sala.** { *; }
 -keepclassmembers class * {
-    *** fromMap(...);
-    *** toMap(...);
-    *** fromJson(...);
-    *** toJson(...);
+*** fromMap(...);
+*** toMap(...);
+*** fromJson(...);
+*** toJson(...);
 }
 # ==========================================
 # 🚀 إضافات الحماية القصوى لـ Google Play
@@ -88,7 +88,7 @@
 -keepattributes Signature
 -keepattributes *Annotation*
 -keepclassmembers class * {
-    @com.google.gson.annotations.SerializedName <fields>;
+@com.google.gson.annotations.SerializedName <fields>;
 }
 
 # كتم تحذيرات التوافق الثانوية للمكتبات الخارجية

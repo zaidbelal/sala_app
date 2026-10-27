@@ -224,41 +224,41 @@ class WalService {
     final db = FirebaseFirestore.instance;
     final verifiedIds = <String>[];
     final verifiedOrderUids = <String>{};
-
-    for (final entry in pending) {
-      try {
-        bool verifiedOnServer = false;
-
-        // 🔒 التحقق الحصري من السيرفر المباشر حصراً لعدم الخلط مع وثائق الكاش المؤقتة
-        if (entry.type == WalOperationType.placeOrder) {
-          final doc = await db
-              .collection('orders')
-              .doc(entry.id)
-              .get(const GetOptions(source: Source.server))
-              .timeout(const Duration(seconds: 4));
-          verifiedOnServer = doc.exists;
-          if (verifiedOnServer) {
-            final uid =
-                entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
-            if (uid != null) verifiedOrderUids.add(uid);
-          }
-        } else if (entry.type == WalOperationType.ledgerTransaction) {
-          final doc = await db
-              .collection('merchant_ledger_entries')
-              .doc(entry.id)
-              .get(const GetOptions(source: Source.server));
-          if (entry.payload['action'] == 'void') {
-            verifiedOnServer = doc.exists && doc.data()?['is_voided'] == true;
-          } else {
+// 🔒 تنفيذ التحقق بالتوازي بمهلة إجمالية واحدة لا تتجاوز 3 ثوانٍ
+    await Future.wait(
+      pending.map((entry) async {
+        try {
+          bool verifiedOnServer = false;
+          if (entry.type == WalOperationType.placeOrder) {
+            final doc = await db
+                .collection('orders')
+                .doc(entry.id)
+                .get(const GetOptions(source: Source.server))
+                .timeout(const Duration(seconds: 3));
             verifiedOnServer = doc.exists;
+            if (verifiedOnServer) {
+              final uid =
+                  entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
+              if (uid != null) verifiedOrderUids.add(uid);
+            }
+          } else if (entry.type == WalOperationType.ledgerTransaction) {
+            final doc = await db
+                .collection('merchant_ledger_entries')
+                .doc(entry.id)
+                .get(const GetOptions(source: Source.server))
+                .timeout(const Duration(seconds: 3));
+            if (entry.payload['action'] == 'void') {
+              verifiedOnServer = doc.exists && doc.data()?['is_voided'] == true;
+            } else {
+              verifiedOnServer = doc.exists;
+            }
           }
-        }
-        if (verifiedOnServer) {
-          verifiedIds.add(entry.id);
-        }
-      } catch (_) {}
-    }
-
+          if (verifiedOnServer) {
+            verifiedIds.add(entry.id);
+          }
+        } catch (_) {}
+      }),
+    );
     // حذف السلة فقط إذا كانت سلتها مطابقة لعناصر الطلب المؤكد بالسيرفر لمنع مسح سلة جديدة
     if (verifiedOrderUids.isNotEmpty) {
       for (final uid in verifiedOrderUids) {

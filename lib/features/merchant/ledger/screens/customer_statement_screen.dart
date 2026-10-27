@@ -386,42 +386,37 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   if (serverLastTxId != null && serverLastTxId.isNotEmpty) {
                     serverAppliedIds.add(serverLastTxId);
                   }
+// 🔒 احتساب العمليات غير المتزامنة دائماً لمنع إخفاء القيود المعلقة عند ضعف الشبكة وتجنب التكرار
+                  final pendingTxs =
+                      AppStorage.getPendingLedgerTxs(_customer.merchantId)
+                          .where((t) => t['customer_id'] == _customer.id);
+                  double pendingDelta = 0.0;
+                  for (final tx in pendingTxs) {
+                    final txType = tx['type']?.toString();
+                    final txId = tx['id']?.toString() ?? '';
 
-                  // 🔒 حل التعارض المالي: إذا كانت لقطة السيرفر حية وخالية من الكاش (Live Server)، نعتمد رصيد السيرفر مباشرة
-                  final isLiveFromServer = !custSnap.data!.metadata.isFromCache;
-                  double localAdjustments = 0.0;
-                  if (!isLiveFromServer) {
-                    final pendingTxs =
-                        AppStorage.getPendingLedgerTxs(_customer.merchantId)
-                            .where((t) => t['customer_id'] == _customer.id);
-                    double pendingDelta = 0.0;
-                    for (final tx in pendingTxs) {
-                      final txType = tx['type']?.toString();
-                      final txId = tx['id']?.toString() ?? '';
-
-                      if (txType == 'add_customer' ||
-                          txType == 'delete_customer') {
-                        continue;
-                      }
-
-                      // 🔒 احتساب أوامر الشطب المعلقة أوفلاين لعكس أثرها المالي فوراً في الواجهة
-                      if (txType == 'void_request') {
-                        final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-                        final isDebt = tx['is_debt'] != false;
-                        pendingDelta += isDebt ? -amt : amt;
-                        continue;
-                      }
-
-                      if (serverAppliedIds.contains(txId)) continue;
-                      if (_locallyDismissedEntryIds.contains(txId)) continue;
-
-                      final isDebt = txType == 'debt';
-                      final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-                      pendingDelta += isDebt ? amt : -amt;
+                    if (txType == 'add_customer' ||
+                        txType == 'delete_customer') {
+                      continue;
                     }
 
-                    localAdjustments = pendingDelta;
+                    if (txType == 'void_request') {
+                      final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+                      final isDebt = tx['is_debt'] != false;
+                      pendingDelta += isDebt ? -amt : amt;
+                      continue;
+                    }
+
+                    // إذا كان السيرفر قد اعتمد هذه الحركة أو تم إبطالها محلياً، لا نكررها
+                    if (serverAppliedIds.contains(txId)) continue;
+                    if (_locallyDismissedEntryIds.contains(txId)) continue;
+
+                    final isDebt = txType == 'debt';
+                    final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
+                    pendingDelta += isDebt ? amt : -amt;
                   }
+
+                  final double localAdjustments = pendingDelta;
                   displayedCustomer = LedgerCustomer(
                     id: serverCustomer.id,
                     merchantId: serverCustomer.merchantId,

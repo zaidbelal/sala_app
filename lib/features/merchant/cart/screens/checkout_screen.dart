@@ -346,8 +346,8 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           'عذراً، لا يمكن أن يحتوي الطلب الواحد على أكثر من ${AppConfig.maxOrderItems} صنفاً مختلفاً. يرجى تقسيم الطلب.');
       return;
     }
-    // ── 2. التحقق الموحد والقطعي من الحد الأدنى للطلب (4250 ر.ي) ──
-    const double serverMinOrder = 4250.0;
+// ── 2. التحقق الموحد والقطعي من الحد الأدنى للطلب المحدث ديناميكياً ──
+    final double serverMinOrder = AppConfig.minOrderValue;
     final total = ref.read(cartTotalProvider);
     if (total < serverMinOrder) {
       _showError(
@@ -629,7 +629,7 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
         return;
       }
       HapticFeedback.vibrate();
-      _orderIdempotencyKey = null;
+      // 🔒 الحفاظ على مفتاح التثبيت المالي في حالة إعادة النقر لضمان عدم إنشاء طلب مكرر بسعر مختلف
       final err = e.toString();
 // 🚀 استخراج جماعي شامل لجميع الأصناف والوحدات التالفة دفعة واحدة (allMatches)
       if (err.contains('PRODUCT_UNAVAILABLE_[') ||

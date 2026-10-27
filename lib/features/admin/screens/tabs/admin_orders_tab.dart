@@ -9,9 +9,8 @@ import '../../widgets/orders/order_card.dart';
 // مزود استماع سحابي مفلتر ومرتب زمنياً في الخادم لضمان جلب أحدث الطلبات
 final adminOrdersRealtimeProvider = StreamProvider.autoDispose
     .family<List<AdminOrder>, List<String>?>((ref, statuses) {
-  Query<Map<String, dynamic>> query = FirebaseFirestore.instance
-      .collection('orders')
-      .orderBy('created_at', descending: true);
+  Query<Map<String, dynamic>> query =
+      FirebaseFirestore.instance.collection('orders');
 
   if (statuses != null && statuses.isNotEmpty) {
     if (statuses.length == 1) {
@@ -19,12 +18,16 @@ final adminOrdersRealtimeProvider = StreamProvider.autoDispose
     } else {
       query = query.where('status', whereIn: statuses);
     }
+  } else {
+    query = query.orderBy('created_at', descending: true);
   }
 
   return query.limit(150).snapshots(includeMetadataChanges: false).map((snap) {
-    return snap.docs
+    final list = snap.docs
         .map((d) => AdminOrder.fromMap({'id': d.id, ...d.data()}))
         .toList();
+    list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return list;
   });
 });
 
