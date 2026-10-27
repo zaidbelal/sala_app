@@ -468,28 +468,50 @@ class _LedgerTabState extends State<LedgerTab> {
                                       );
 
                                       if (confirmed == true && mounted) {
-                                        setState(() {
-                                          _remoteSearchResults
-                                              .removeWhere((r) => r.id == c.id);
-                                        });
-
-                                        await LedgerService.instance
-                                            .deleteCustomer(
-                                          merchantId: merchantId,
-                                          customerId: c.id,
-                                          currentBalance: c.currentBalance,
-                                        );
+                                        String? queuedMessage;
+                                        try {
+                                          await LedgerService.instance
+                                              .deleteCustomer(
+                                            merchantId: merchantId,
+                                            customerId: c.id,
+                                            currentBalance: c.currentBalance,
+                                          );
+                                        } on LedgerQueuedException catch (e) {
+                                          queuedMessage = e.message;
+                                        } catch (e) {
+                                          if (mounted) {
+                                            ScaffoldMessenger.of(context)
+                                                .showSnackBar(
+                                              SnackBar(
+                                                content:
+                                                    Text('تعذر حذف الزبون: $e'),
+                                                backgroundColor: Colors.red,
+                                                behavior:
+                                                    SnackBarBehavior.floating,
+                                              ),
+                                            );
+                                          }
+                                          return;
+                                        }
 
                                         if (mounted) {
+                                          setState(() {
+                                            _remoteSearchResults.removeWhere(
+                                                (r) => r.id == c.id);
+                                          });
                                           ScaffoldMessenger.of(context)
                                               .showSnackBar(
                                             SnackBar(
                                               content: Text(
-                                                  'تم حذف الزبون (${c.name}) بنجاح ✅',
-                                                  style: const TextStyle(
-                                                      fontFamily: 'Cairo')),
+                                                queuedMessage ??
+                                                    'تم حذف الزبون (${c.name}) بنجاح ✅',
+                                                style: const TextStyle(
+                                                    fontFamily: 'Cairo'),
+                                              ),
                                               backgroundColor:
-                                                  Colors.red.shade700,
+                                                  queuedMessage == null
+                                                      ? Colors.red.shade700
+                                                      : Colors.orange.shade700,
                                               behavior:
                                                   SnackBarBehavior.floating,
                                               duration:
@@ -696,6 +718,18 @@ class _AddCustomerDialogState extends State<_AddCustomerDialog> {
       if (mounted) {
         Navigator.pop(context);
       }
+    } on LedgerQueuedException catch (e) {
+      if (mounted) {
+        Navigator.pop(context);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content:
+                Text(e.message, style: const TextStyle(fontFamily: 'Cairo')),
+            backgroundColor: Colors.orange.shade700,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
     } catch (e) {
       if (mounted) {
         setState(() => _isSaving = false);
@@ -894,7 +928,7 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
     final qtyCtrl = TextEditingController(text: '1');
     final unitCtrl = TextEditingController(text: ''); // تبدأ فارغة على "لاشيء"
 
-    final result = await showDialog<bool>(
+    await showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (dialogCtx) => StatefulBuilder(

@@ -117,96 +117,20 @@ class _LoginScreenState extends ConsumerState<LoginScreen>
     final authService = ref.read(authServiceProvider);
 
     try {
-      final response = await authService.checkPhoneNumber(phone);
-
-      if (!mounted) {
-        return;
-      }
-      if (response.result == PhoneCheckResult.notRegistered) {
-        if (!mounted) {
-          return;
-        }
-
-        setState(() {
-          _isLoading = false;
-          _errorMsg = '';
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'الرقم غير مسجل مسبقاً، تم نقلك لإنشاء حساب جديد ✨',
-              style: TextStyle(fontFamily: 'Cairo'),
-              textAlign: TextAlign.center,
-            ),
-            backgroundColor: AppColors.primary,
-            behavior: SnackBarBehavior.floating,
-            duration: Duration(seconds: 2),
-          ),
-        );
-        context.push(AppRoutes.signup, extra: phone);
-        return;
-      }
-      if (response.result == PhoneCheckResult.inactive) {
-        setState(() {
-          _isLoading = false;
-          _errorMsg = response.message ?? 'الحساب معطّل';
-        });
-        return;
-      }
-
-      if (response.result == PhoneCheckResult.error) {
-        setState(() {
-          _isLoading = false;
-          _errorMsg = response.message ?? 'تعذر التحقق من الرقم، حاول مرة أخرى';
-        });
-        return;
-      }
-
-      if (response.result != PhoneCheckResult.registered) {
-        setState(() {
-          _isLoading = false;
-          _errorMsg = 'تعذر التحقق من الحساب';
-        });
-        return;
-      }
-
-      try {
-        final session = await authService.sendOtp(phone);
-
-        if (!mounted) {
-          return;
-        }
-
-        setState(() {
-          _isLoading = false;
-        });
-
-        context.push(
-          AppRoutes.otp,
-          extra: {
-            'phone': phone,
-            'userId': response.userId,
-            'role': response.role,
-            'verificationId': session.verificationId,
-            'resendToken': session.resendToken,
-            'isNewUser': false,
-          },
-        );
-      } catch (error) {
-        if (!mounted) return;
-        final err = error.toString().toLowerCase();
-        final message = (err.contains('network') ||
-                err.contains('socket') ||
-                err.contains('timeout'))
-            ? 'تعذر الاتصال بالخادم، يرجى التحقق من اتصال الإنترنت'
-            : (error is StateError
-                ? error.message
-                : 'تعذر إرسال رمز التحقق، يرجى المحاولة لاحقاً');
-        setState(() {
-          _isLoading = false;
-          _errorMsg = message;
-        });
-      }
+      final session = await authService.sendOtp(phone);
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+      });
+      context.push(
+        AppRoutes.otp,
+        extra: {
+          'phone': phone,
+          'verificationId': session.verificationId,
+          'resendToken': session.resendToken,
+          'isNewUser': false,
+        },
+      );
     } catch (error) {
       if (!mounted) return;
       final err = error.toString().toLowerCase();
@@ -214,7 +138,9 @@ class _LoginScreenState extends ConsumerState<LoginScreen>
               err.contains('socket') ||
               err.contains('timeout'))
           ? 'تعذر الاتصال بالخادم، يرجى التحقق من اتصال الإنترنت'
-          : 'تعذر التحقق من رقم الهاتف، يرجى المحاولة لاحقاً';
+          : (error is StateError
+              ? error.message
+              : 'تعذر إرسال رمز التحقق، يرجى المحاولة لاحقاً');
       setState(() {
         _isLoading = false;
         _errorMsg = message;

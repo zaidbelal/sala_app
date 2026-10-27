@@ -43,6 +43,8 @@ class AdminProductsPaginationNotifier
       state = const AsyncValue.loading();
     }
     try {
+      final adminService = _ref.read(adminServiceProvider);
+      await adminService.ensureFinancialFieldsMigrated();
       final snap = await FirebaseFirestore.instance
           .collection('products')
           .orderBy('name')
@@ -61,7 +63,7 @@ class AdminProductsPaginationNotifier
       list.sort((a, b) =>
           (a['name']?.toString() ?? '').compareTo(b['name']?.toString() ?? ''));
 
-      state = AsyncValue.data(list);
+      state = AsyncValue.data(await adminService.attachProductFinancials(list));
     } catch (e, st) {
       if (!mounted) return;
       if (!silent) state = AsyncValue.error(e, st);
@@ -76,6 +78,8 @@ class AdminProductsPaginationNotifier
     }
     _ref.read(productsLoadingMoreProvider.notifier).state = true;
     try {
+      final adminService = _ref.read(adminServiceProvider);
+      await adminService.ensureFinancialFieldsMigrated();
       final snap = await FirebaseFirestore.instance
           .collection('products')
           .orderBy('name')
@@ -88,7 +92,9 @@ class AdminProductsPaginationNotifier
       _hasMore = snap.docs.length == _pageSize;
 
       final current = state.value ?? [];
-      final more = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
+      final more = await adminService.attachProductFinancials(
+        snap.docs.map((d) => {'id': d.id, ...d.data()}).toList(),
+      );
       final map = <String, Map<String, dynamic>>{
         for (final item in current) item['id'].toString(): item,
       };

@@ -145,15 +145,26 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             notes: pending['notes'],
             extraData: pending['extraData'],
             orderId: orderId,
+            cartRevision: pending['cart_revision']?.toString(),
           );
 
           await WalService.instance.markCommitted(orderId);
+          final cartRevision = pending['cart_revision']?.toString();
+          if (cartRevision != null && cartRevision.isNotEmpty) {
+            await ref.read(cartProvider.notifier).clearIfRevision(cartRevision);
+          }
           await AppStorage.removePendingOrder(orderId, currentUserId);
           successCount++;
         } catch (e) {
           // إذا كان الطلب مسجلاً بالفعل في السيرفر (Idempotent Success) نحذفه بنجاح
           if (e.toString().contains('already-exists') ||
               e.toString().contains('تم إنشاء الطلب مسبقاً')) {
+            final cartRevision = pending['cart_revision']?.toString();
+            if (cartRevision != null && cartRevision.isNotEmpty) {
+              await ref
+                  .read(cartProvider.notifier)
+                  .clearIfRevision(cartRevision);
+            }
             await AppStorage.removePendingOrder(orderId, currentUserId);
             successCount++;
             continue;
@@ -421,22 +432,32 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
 
     _isSyncingLedger = true;
     try {
-      final syncedCount =
+      final result =
           await LedgerService.instance.syncPendingLedgerQueue(currentUserId);
 
-      if (syncedCount > 0 && mounted) {
+      if ((result.syncedCount > 0 || result.unresolvedCount > 0) && mounted) {
+        final hasUnresolved = result.unresolvedCount > 0;
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Row(children: [
-            const Icon(Icons.cloud_done_rounded, color: Colors.white, size: 20),
+            Icon(
+              hasUnresolved
+                  ? Icons.warning_amber_rounded
+                  : Icons.cloud_done_rounded,
+              color: Colors.white,
+              size: 20,
+            ),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                'تمت مزامنة $syncedCount حركات ديون مع السيرفر بنجاح 📒✅',
+                hasUnresolved
+                    ? 'تمت مزامنة ${result.syncedCount} حركة، وتحتاج ${result.unresolvedCount} عملية إلى مراجعة. بقيت محفوظة ولم تُحذف.'
+                    : 'تمت مزامنة ${result.syncedCount} حركات ديون مع السيرفر بنجاح 📒✅',
                 style: const TextStyle(fontFamily: 'Cairo'),
               ),
             ),
           ]),
-          backgroundColor: AppColors.primary,
+          backgroundColor:
+              hasUnresolved ? Colors.deepOrange.shade700 : AppColors.primary,
           behavior: SnackBarBehavior.floating,
         ));
       }

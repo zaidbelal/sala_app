@@ -47,11 +47,12 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
         });
       },
       onError: (error) {
-        // اعتراض أخطاء الصلاحيات بأمان لمنع الانهيار عند تسجيل الخروج
+        _orderSubscription?.cancel();
+        _orderSubscription = null;
         debugPrint(
             '[OrderDetailScreen] Live order stream cancelled safely: $error');
       },
-      cancelOnError: false,
+      cancelOnError: true,
     );
   }
 

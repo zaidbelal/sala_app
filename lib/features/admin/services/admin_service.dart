@@ -124,6 +124,78 @@ class AdminOrder {
 // ══ Service ══
 class AdminService {
   final _db = FirebaseFirestore.instance;
+  Future<void>? _financialMigrationFuture;
+
+  Future<void> ensureFinancialFieldsMigrated() async {
+    _financialMigrationFuture ??= _runFinancialFieldsMigration();
+    try {
+      await _financialMigrationFuture;
+    } catch (_) {
+      _financialMigrationFuture = null;
+      rethrow;
+    }
+  }
+
+  Future<void> _runFinancialFieldsMigration() async {
+    final callable =
+        FirebaseFunctions.instanceFor(region: 'us-central1').httpsCallable(
+      'migrateFinancialFields',
+      options: HttpsCallableOptions(timeout: const Duration(seconds: 30)),
+    );
+    String? previousProgress;
+    while (true) {
+      final response = await callable.call();
+      final data = Map<String, dynamic>.from(response.data as Map);
+      if (data['done'] == true) return;
+      final progress = '${data['stage']}|${data['cursor'] ?? ''}';
+      if (progress == previousProgress) {
+        throw StateError('ترحيل البيانات المالية لم يتقدم');
+      }
+      previousProgress = progress;
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> attachProductFinancials(
+    List<Map<String, dynamic>> products,
+  ) async {
+    final financialsById = <String, Map<String, dynamic>>{};
+    final ids = products.map((product) => product['id'].toString()).toList();
+    for (var i = 0; i < ids.length; i += 30) {
+      final chunk = ids.sublist(i, i + 30 > ids.length ? ids.length : i + 30);
+      final snapshots = await _db
+          .collection('product_financials')
+          .where(FieldPath.documentId, whereIn: chunk)
+          .get(const GetOptions(source: Source.server));
+      for (final doc in snapshots.docs) {
+        financialsById[doc.id] = doc.data();
+      }
+    }
+
+    return products.map((product) {
+      final financials = financialsById[product['id'].toString()] ?? {};
+      final unitCosts = <String, num>{};
+      final financialUnits = financials['units'];
+      if (financialUnits is List) {
+        for (final unit in financialUnits.whereType<Map>()) {
+          final label = unit['label']?.toString();
+          final cost = unit['cost_price'];
+          if (label != null && cost is num) unitCosts[label] = cost;
+        }
+      }
+      final units = (product['units'] as List? ?? const [])
+          .whereType<Map>()
+          .map((unit) => {
+                ...Map<String, dynamic>.from(unit),
+                'cost_price': unitCosts[unit['label']?.toString()] ?? 0,
+              })
+          .toList();
+      return {
+        ...product,
+        'cost_price': financials['cost_price'] ?? 0,
+        'units': units,
+      };
+    }).toList();
+  }
 
   /// إعادة محاولة ذكية مع Exponential Backoff.
   /// تُعيد المحاولة فقط على الأخطاء العابرة القابلة للاسترجاع.
@@ -264,14 +336,18 @@ class AdminService {
             .aggregate(
               sum('total_amount'),
               sum('total'),
-              sum('total_profit'),
             )
+            .get();
+        final profitSnap = await _db
+            .collection('order_financials')
+            .where('profit_recorded', isEqualTo: true)
+            .aggregate(sum('total_profit'))
             .get();
 
         final sumTotalAmount = aggSnap.getSum('total_amount') ?? 0.0;
         final sumTotal = aggSnap.getSum('total') ?? 0.0;
         grossRevenue = sumTotalAmount > 0 ? sumTotalAmount : sumTotal;
-        totalProfit = aggSnap.getSum('total_profit') ?? 0.0;
+        totalProfit = profitSnap.getSum('total_profit') ?? 0.0;
       } catch (_) {
         // في حال تعذر التجميع السحابي (غياب فهرس أو اختلاف نوع الحقول)، جلب الوثائق وحسابها مباشرة
         try {
@@ -280,16 +356,24 @@ class AdminService {
               .where('status', isEqualTo: 'delivered')
               .limit(50)
               .get(const GetOptions(source: Source.cache));
+          final financialDocsSnap = await _db
+              .collection('order_financials')
+              .where('profit_recorded', isEqualTo: true)
+              .limit(50)
+              .get(const GetOptions(source: Source.cache));
           double calcRevenue = 0.0;
-          double calcProfit = 0.0;
           for (final doc in deliveredDocsSnap.docs) {
             final data = doc.data();
             final amt = (data['total_amount'] as num?)?.toDouble() ??
                 (data['total'] as num?)?.toDouble() ??
                 0.0;
             calcRevenue += amt;
-            calcProfit += (data['total_profit'] as num?)?.toDouble() ?? 0.0;
           }
+          final calcProfit = financialDocsSnap.docs.fold<double>(
+            0,
+            (total, doc) =>
+                total + ((doc.data()['total_profit'] as num?)?.toDouble() ?? 0),
+          );
           grossRevenue = calcRevenue;
           totalProfit = calcProfit;
         } catch (_) {
@@ -851,6 +935,7 @@ class AdminService {
 // ── المنتجات (مع فرز بالذاكرة لتفادي FAILED_PRECONDITION) ──
   Future<List<Map<String, dynamic>>> getProducts({String? brandId}) async {
     try {
+      await ensureFinancialFieldsMigrated();
       final query = brandId != null
           ? _db.collection('products').where('brand_id', isEqualTo: brandId)
           : _db.collection('products');
@@ -863,13 +948,13 @@ class AdminService {
           .toList();
       list.sort((a, b) =>
           (a['name']?.toString() ?? '').compareTo(b['name']?.toString() ?? ''));
-      return list;
+      return attachProductFinancials(list);
     } catch (e, st) {
       if (kDebugMode) {
         debugPrint('[AdminService] getProducts error: $e');
         debugPrintStack(stackTrace: st);
       }
-      return [];
+      rethrow;
     }
   }
 

@@ -58,15 +58,15 @@ class WalService {
   static const String _logFileName = 'sala_transactions_wal.log';
   static const int _maxLogSizeBytes = 120 * 1024; // 120 KB
   File? _logFile;
-  Completer<void>? _initCompleter;
+  Future<void>? _initFuture;
   bool _isInitialized = false;
 
-  Future<void> init() async {
-    if (kIsWeb) return;
-    if (_isInitialized) return;
-    if (_initCompleter != null) return _initCompleter!.future;
+  Future<void> init() {
+    if (kIsWeb || _isInitialized) return Future.value();
+    return _initFuture ??= _initialize();
+  }
 
-    _initCompleter = Completer<void>();
+  Future<void> _initialize() async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       _logFile = File('${dir.path}/$_logFileName');
@@ -74,17 +74,15 @@ class WalService {
         await _logFile!.create(recursive: true);
       }
       _isInitialized = true;
-      _initCompleter!.complete();
     } catch (e, st) {
       if (kDebugMode) debugPrint('❌ WAL Init Error: $e');
       if (!kIsWeb) {
         FirebaseCrashlytics.instance
             .recordError(e, st, reason: 'WAL Init failed');
       }
-      _isInitialized = true;
-      _initCompleter!.complete();
+      _initFuture = null;
+      rethrow;
     }
-    return _initCompleter!.future;
   }
 
   Future<void> _walFileLock = Future.value();
@@ -112,7 +110,9 @@ class WalService {
   }) async {
     if (kIsWeb) return;
     await init();
-    if (_logFile == null) return;
+    if (_logFile == null) {
+      throw StateError('WAL file is unavailable after initialization');
+    }
 
     return _withLock(() async {
       final entry = WalEntry(
@@ -201,6 +201,7 @@ class WalService {
         FirebaseCrashlytics.instance.recordError(e, st,
             reason: 'WAL _readUncommittedInternal read failure');
       }
+      rethrow;
     }
     return entries.values.toList();
   }
@@ -221,8 +222,71 @@ class WalService {
       await compactLog();
       return;
     }
+
+    for (final entry in pending) {
+      try {
+        final merchantId =
+            entry.payload['merchant_id']?.toString() ?? AppStorage.userId ?? '';
+        if (merchantId.isEmpty) {
+          throw StateError('WAL entry has no merchant identity');
+        }
+
+        if (entry.type == WalOperationType.placeOrder) {
+          final items = entry.payload['items'];
+          final expectedTotal =
+              entry.payload['expectedTotal'] ?? entry.payload['expected_total'];
+          if (items is! List || items.isEmpty || expectedTotal is! num) {
+            throw FormatException('WAL order payload is incomplete');
+          }
+          await AppStorage.savePendingOrder({
+            'orderId': entry.id,
+            'merchantId': merchantId,
+            'items': items
+                .map((item) => Map<String, dynamic>.from(item as Map))
+                .toList(),
+            'expectedTotal': expectedTotal,
+            if (entry.payload['notes'] != null) 'notes': entry.payload['notes'],
+            if (entry.payload['extraData'] is Map)
+              'extraData':
+                  Map<String, dynamic>.from(entry.payload['extraData'] as Map),
+            if (entry.payload['cart_revision'] != null)
+              'cart_revision': entry.payload['cart_revision'],
+          });
+        } else {
+          final payload = Map<String, dynamic>.from(entry.payload);
+          if (payload['action'] == 'void') {
+            await AppStorage.savePendingLedgerTx({
+              'id': 'void_${entry.id}',
+              'merchant_id': merchantId,
+              'customer_id': payload['customer_id'],
+              'type': 'void_request',
+              'target_entry_id': entry.id,
+              'amount': payload['amount'],
+              'is_debt': payload['is_debt'],
+              'created_at': entry.timestamp.toIso8601String(),
+            });
+          } else {
+            payload['id'] = entry.id;
+            await AppStorage.savePendingLedgerTx(payload);
+          }
+        }
+      } catch (e, st) {
+        if (kDebugMode) {
+          debugPrint('WAL recovery could not restore ${entry.id}: $e');
+        }
+        if (!kIsWeb) {
+          FirebaseCrashlytics.instance.recordError(
+            e,
+            st,
+            reason: 'WAL intent recovery failed for ${entry.id}',
+          );
+        }
+      }
+    }
+
     final db = FirebaseFirestore.instance;
     final verifiedIds = <String>[];
+    final verifiedVoidedLedgerIds = <String>{};
     final verifiedOrderUids = <String>{};
 // 🔒 تنفيذ التحقق بالتوازي بمهلة إجمالية واحدة لا تتجاوز 3 ثوانٍ
     await Future.wait(
@@ -235,11 +299,14 @@ class WalService {
                 .doc(entry.id)
                 .get(const GetOptions(source: Source.server))
                 .timeout(const Duration(seconds: 3));
-            verifiedOnServer = doc.exists;
+            final merchantId =
+                entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
+            final orderNumber = doc.data()?['order_number']?.toString() ?? '';
+            verifiedOnServer = doc.exists &&
+                doc.data()?['merchant_id'] == merchantId &&
+                orderNumber.isNotEmpty;
             if (verifiedOnServer) {
-              final uid =
-                  entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
-              if (uid != null) verifiedOrderUids.add(uid);
+              if (merchantId != null) verifiedOrderUids.add(merchantId);
             }
           } else if (entry.type == WalOperationType.ledgerTransaction) {
             final doc = await db
@@ -247,10 +314,20 @@ class WalService {
                 .doc(entry.id)
                 .get(const GetOptions(source: Source.server))
                 .timeout(const Duration(seconds: 3));
+            final data = doc.data();
+            final matchesIntent = doc.exists &&
+                data?['merchant_id'] == entry.payload['merchant_id'] &&
+                data?['customer_id'] == entry.payload['customer_id'];
+            if (matchesIntent && data?['is_voided'] == true) {
+              verifiedVoidedLedgerIds.add(entry.id);
+            }
             if (entry.payload['action'] == 'void') {
-              verifiedOnServer = doc.exists && doc.data()?['is_voided'] == true;
+              verifiedOnServer = matchesIntent && data?['is_voided'] == true;
             } else {
-              verifiedOnServer = doc.exists;
+              verifiedOnServer = matchesIntent &&
+                  data?['type'] == entry.payload['type'] &&
+                  (data?['amount'] as num?)?.toDouble() ==
+                      (entry.payload['amount'] as num?)?.toDouble();
             }
           }
           if (verifiedOnServer) {
@@ -279,22 +356,22 @@ class WalService {
                       .whereType<String>()
                       .toSet()
                   : <String>{};
+              final revisionFile =
+                  File('${dir.path}/sala_cart_v2_$uid.revision');
+              final cartRevision = await revisionFile.exists()
+                  ? (await revisionFile.readAsString()).trim()
+                  : '';
               final matchingEntries = pending.where((e) =>
                   verifiedIds.contains(e.id) &&
                   (e.payload['merchant_id']?.toString() ?? AppStorage.userId) ==
-                      uid);
+                      uid &&
+                  e.payload['cart_revision']?.toString() == cartRevision);
 
               final verifiedProductIds = matchingEntries
                   .expand((e) => (e.payload['items'] as List? ?? []))
                   .map((it) => (it['product_id'])?.toString())
                   .whereType<String>()
                   .toSet();
-
-              final latestTimestamp = matchingEntries.isNotEmpty
-                  ? matchingEntries
-                      .map((e) => e.timestamp)
-                      .reduce((a, b) => a.isAfter(b) ? a : b)
-                  : DateTime.now();
 
               // 🔒 التحقق الشامل: مطابقة المعرفات والكميات معاً لضمان عدم مسح سلة جديدة لنفس الصنف
               final matchingItemsList = matchingEntries
@@ -322,13 +399,13 @@ class WalService {
                 }
               }
 
-              final fileModTime = await file.lastModified();
-              final isAssociatedWithPending = isExactCartMatch &&
-                  fileModTime.isBefore(
-                      latestTimestamp.add(const Duration(minutes: 1)));
+              final isAssociatedWithPending = cartRevision.isNotEmpty &&
+                  matchingEntries.isNotEmpty &&
+                  isExactCartMatch;
 
               if (isAssociatedWithPending) {
                 await file.delete();
+                await AppStorage.remove('sala_cart_v2_$uid');
               }
             }
           } catch (_) {}
@@ -346,14 +423,15 @@ class WalService {
         final targetMerchantId =
             entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
         if (entry.type == WalOperationType.placeOrder) {
-          for (final uid in verifiedOrderUids) {
-            await AppStorage.removePendingOrder(entry.id, uid);
+          if (targetMerchantId != null) {
+            await AppStorage.removePendingOrder(entry.id, targetMerchantId);
           }
         } else if (entry.type == WalOperationType.ledgerTransaction) {
           await AppStorage.removePendingLedgerTx(entry.id, targetMerchantId);
-          // 🛡️ حذف القيد أيضاً بالبادئة void_ في حال كان قيد شطب ملغي
-          await AppStorage.removePendingLedgerTx(
-              'void_${entry.id}', targetMerchantId);
+          if (verifiedVoidedLedgerIds.contains(entry.id)) {
+            await AppStorage.removePendingLedgerTx(
+                'void_${entry.id}', targetMerchantId);
+          }
         }
       }
     }

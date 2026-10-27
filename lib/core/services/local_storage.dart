@@ -82,9 +82,14 @@ class AppStorage {
   static bool get isInitialized => _initialized;
 
   /// 🔒 كتابة تزامنية مباشرة لقرص الهاتف (Crash-Safe) لمنع ضياع السلة عند الإغلاق الفجائي
-  static void saveCartBackupSync(String uid, String jsonString) {
+  static void saveCartBackupSync(String uid, String jsonString,
+      {String? revision}) {
     if (!kIsWeb && _appDocsPath != null) {
       try {
+        if (revision != null) {
+          final revisionFile = File('$_appDocsPath/sala_cart_v2_$uid.revision');
+          revisionFile.writeAsStringSync(revision, flush: true);
+        }
         final file = File('$_appDocsPath/sala_cart_v2_$uid.json');
         file.writeAsStringSync(jsonString, flush: true);
       } catch (_) {}
@@ -107,6 +112,8 @@ class AppStorage {
           final dir = await getApplicationDocumentsDirectory();
           final file = File('${dir.path}/sala_cart_v2_$uid.json');
           if (await file.exists()) await file.delete();
+          final revisionFile = File('${dir.path}/sala_cart_v2_$uid.revision');
+          if (await revisionFile.exists()) await revisionFile.delete();
         } catch (_) {}
       }
     });
@@ -587,7 +594,15 @@ class AppStorage {
     final targetUid = uid ?? userId;
     if (targetUid == null || targetUid.isEmpty) return [];
     final key = _userPendingReturnKey(targetUid);
-    final raw = _db.getString(key);
+    var raw = _db.getString(key);
+    if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
+      try {
+        final file = File('$_appDocsPath/${key}_backup.json');
+        if (file.existsSync()) {
+          raw = file.readAsStringSync();
+        }
+      } catch (_) {}
+    }
     if (raw == null || raw.isEmpty) return [];
     try {
       final decoded = jsonDecode(raw);
@@ -630,7 +645,10 @@ class AppStorage {
         if (!kIsWeb && _appDocsPath != null) {
           try {
             final backupFile = File('$_appDocsPath/${key}_backup.json');
-            await backupFile.writeAsString(json, flush: true);
+            final nonce = DateTime.now().microsecondsSinceEpoch;
+            final tmpFile = File('$_appDocsPath/${key}_backup_$nonce.tmp');
+            await tmpFile.writeAsString(json, flush: true);
+            await tmpFile.rename(backupFile.path);
           } catch (_) {}
         }
       }

@@ -1,0 +1,34 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isCatalogAdmin() {
+      return isSignedIn() &&
+        firestore.exists(/databases/(default)/documents/profiles/$(request.auth.uid)) &&
+        firestore.get(/databases/(default)/documents/profiles/$(request.auth.uid)).data.role
+          in ['admin', 'super_admin', 'warehouse_manager'] &&
+        firestore.get(/databases/(default)/documents/profiles/$(request.auth.uid)).data.is_banned != true &&
+        firestore.get(/databases/(default)/documents/profiles/$(request.auth.uid)).data.is_active == true;
+    }
+
+    match /images/{fileName} {
+      allow read: if true;
+      allow create, update: if isCatalogAdmin() &&
+        request.resource.size <= 3 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/(jpeg|png|webp)');
+      allow delete: if isCatalogAdmin();
+    }
+
+    // Cloud Functions use the Admin SDK for signatures; client uploads are denied.
+    match /signatures/{fileName} {
+      allow read, write: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -79,6 +79,8 @@ class OrdersService {
     String? notes,
     Map<String, dynamic>? extraData,
     String? orderId,
+    String? cartRevision,
+    bool markWalCommitted = true,
   }) async {
     final cleanMerchantId = merchantId.trim();
     _assertMerchantSession(cleanMerchantId);
@@ -95,6 +97,9 @@ class OrdersService {
         'merchant_id': cleanMerchantId,
         'items': items,
         'expectedTotal': expectedTotal,
+        if (notes != null) 'notes': notes.trim(),
+        if (extraData != null) 'extraData': extraData,
+        if (cartRevision != null) 'cart_revision': cartRevision,
       },
     );
 
@@ -114,7 +119,9 @@ class OrdersService {
       final data = Map<String, dynamic>.from(response.data as Map);
       final orderMap = Map<String, dynamic>.from(data['order'] as Map);
 
-      await WalService.instance.markCommitted(resolvedOrderId);
+      if (markWalCommitted) {
+        await WalService.instance.markCommitted(resolvedOrderId);
+      }
       await AppCache.instance.invalidateProducts();
 
       return OrderModel.fromJson(orderMap);

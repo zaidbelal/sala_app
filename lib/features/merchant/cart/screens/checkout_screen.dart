@@ -411,6 +411,24 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       return;
     }
 
+    final cartNotifier = ref.read(cartProvider.notifier);
+    final cartRevision = cartNotifier.cartRevision;
+    await cartNotifier.forceSave();
+    if (!identical(ref.read(cartProvider), cart) ||
+        cartNotifier.cartRevision != cartRevision) {
+      _showError(
+          'تغيرت السلة أثناء إتمام الطلب، يرجى مراجعتها والمحاولة مجدداً');
+      return;
+    }
+    final hasPendingOrderForCart =
+        AppStorage.getPendingOrders(widget.merchantId)
+            .any((order) => order['cart_revision']?.toString() == cartRevision);
+    if (hasPendingOrderForCart) {
+      _showError(
+          'هذا الطلب محفوظ بالفعل بانتظار الإرسال. لن يتم إنشاء طلب مكرر.');
+      return;
+    }
+
     // ── 5. إغلاق لوحة المفاتيح وبدء حالة التحميل ──
     FocusScope.of(context).unfocus();
     setState(() => _isLoading = true);
@@ -455,6 +473,7 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       'merchantId': merchantId,
       'expectedTotal': total,
       'items': itemsList,
+      'cart_revision': cartRevision,
       'notes': notesString,
       'extraData': extraDataMap,
     };
@@ -515,6 +534,7 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       }
 
       try {
+        await AppStorage.savePendingOrder(orderData);
         await WalService.instance.writeIntent(
           transactionId: generatedOrderId,
           type: WalOperationType.placeOrder,
@@ -522,10 +542,12 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
             'merchant_id': merchantId,
             'items': itemsList,
             'expectedTotal': total,
+            'notes': notesString,
+            'extraData': extraDataMap,
+            'cart_revision': cartRevision,
           },
         );
-        await AppStorage.savePendingOrder(orderData);
-        await ref.read(cartProvider.notifier).clearAsync();
+        await cartNotifier.clearIfRevision(cartRevision);
       } catch (storageErr) {
         safeDismissLoading();
         _showError('تعذر حفظ الطلب محلياً في الذاكرة، حاول ثانية');
@@ -564,9 +586,12 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
         notes: notesString,
         extraData: extraDataMap,
         orderId: generatedOrderId,
+        cartRevision: cartRevision,
+        markWalCommitted: false,
       ).timeout(const Duration(seconds: 30));
       _orderIdempotencyKey = null;
-      ref.read(cartProvider.notifier).clear();
+      await cartNotifier.clearIfRevision(cartRevision);
+      await WalService.instance.markCommitted(generatedOrderId);
 
       if (!mounted) return;
       safeDismissLoading();
@@ -602,7 +627,7 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
         // نية العملية مسجلة بالفعل في OrdersService.placeOrder، يتم الحفظ في طابور الأوفلاين مباشرة
         await AppStorage.savePendingOrder(orderData);
         _orderIdempotencyKey = null;
-        ref.read(cartProvider.notifier).clear();
+        await cartNotifier.clearIfRevision(cartRevision);
 
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -664,10 +689,10 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
               }
             }
           }
-
           for (final k in keysToRemove) {
             cartNotifier.removeItem(k);
           }
+          _orderIdempotencyKey = null;
 
           _showError(
               'نعتذر، تم استبعاد (${keysToRemove.length}) من الأصناف غير المتوفرة حالياً في المستودع من سلتك.');

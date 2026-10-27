@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sala/core/services/local_storage.dart';
@@ -11,9 +12,13 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 
 class CartNotifier extends StateNotifier<Map<String, CartItem>> {
+  static int _revisionCounter = 0;
+
   CartNotifier() : super({}) {
-    _load();
+    _loadFuture = _load();
   }
+
+  late final Future<void> _loadFuture;
 
   static String get _key {
     final uid = AppStorage.userId ?? 'guest';
@@ -24,15 +29,35 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
   Timer? _saveDebounce;
   static const int _maxQuantity = 999;
   int flushEpoch = 0;
+  String? _cartRevision;
+  bool _ignoreLoadedCart = false;
+  String get cartRevision => _cartRevision ??= _newCartRevision();
+
+  String _newCartRevision() =>
+      '${DateTime.now().microsecondsSinceEpoch}_${++_revisionCounter}';
+
   Future<File?> get _cartFile async {
     if (kIsWeb) return null;
     final dir = await getApplicationDocumentsDirectory();
     return File('${dir.path}/$_key.json');
   }
 
+  Future<File?> get _cartRevisionFile async {
+    if (kIsWeb) return null;
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/$_key.revision');
+  }
+
   Future<void> _load() async {
     if (kIsWeb) return;
     try {
+      final revisionFile = await _cartRevisionFile;
+      if (revisionFile != null && await revisionFile.exists()) {
+        final savedRevision = (await revisionFile.readAsString()).trim();
+        if (savedRevision.isNotEmpty) _cartRevision = savedRevision;
+      }
+      _cartRevision ??= _newCartRevision();
+
       final file = await _cartFile;
       String? raw;
       bool fileFound = false;
@@ -59,10 +84,13 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
       final loaded = map.map(
         (k, v) => MapEntry(k, CartItem.fromJson(v as Map<String, dynamic>)),
       );
-      final merged = Map<String, CartItem>.from(loaded);
+      final merged = _ignoreLoadedCart
+          ? <String, CartItem>{}
+          : Map<String, CartItem>.from(loaded);
       state.forEach((key, value) {
         merged[key] = value;
       });
+      _ignoreLoadedCart = false;
       state = merged;
     } catch (e, st) {
       if (kDebugMode) debugPrint('❌ CartNotifier._load failed: $e\n$st');
@@ -72,57 +100,84 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
   Future<void> _cartSaveChain = Future.value();
 
   void _save() {
+    _cartRevision = _newCartRevision();
     // 🔒 جدولة تسلسلية حتمية (Sequential Mutex Queue) تضمن حفظ أحدث حالة دائماً بدون سباق
-    _cartSaveChain =
-        _cartSaveChain.then((_) => _executeSave()).catchError((_) {});
+    _cartSaveChain = _cartSaveChain.then((_) async {
+      await _loadFuture;
+      await _executeSave();
+    }).catchError((Object error, StackTrace stackTrace) {
+      _reportSaveError(error, stackTrace);
+    });
   }
 
   Future<void> forceSave() async {
-    _cartSaveChain =
-        _cartSaveChain.then((_) => _executeSave()).catchError((_) {});
-    return _cartSaveChain;
+    await _loadFuture;
+    final save = _cartSaveChain.then((_) => _executeSave());
+    _cartSaveChain = save.catchError((Object error, StackTrace stackTrace) {
+      _reportSaveError(error, stackTrace);
+    });
+    return save;
+  }
+
+  void _reportSaveError(Object error, StackTrace stackTrace) {
+    if (kDebugMode) {
+      debugPrint('Cart persistence failed: $error\n$stackTrace');
+    }
+    if (!kIsWeb) {
+      unawaited(
+        FirebaseCrashlytics.instance
+            .recordError(error, stackTrace, reason: 'Cart persistence failed')
+            .catchError((Object telemetryError, StackTrace telemetryStack) {
+          if (kDebugMode) {
+            debugPrint(
+                'Failed to report cart persistence error: $telemetryError');
+          }
+        }),
+      );
+    }
   }
 
   Future<void> _executeSave() async {
     if (kIsWeb) return;
     if (!AppStorage.isLoggedIn || AppStorage.userId == null) return;
 
-    try {
-      final file = await _cartFile;
-      if (file == null) return;
+    final file = await _cartFile;
+    if (file == null) return;
 
-      final currentState = state;
-      final uid = AppStorage.userId ?? 'guest';
+    final currentState = state;
+    final uid = AppStorage.userId ?? 'guest';
+    final revision = cartRevision;
 
-      // 🔒 التطهير الذري الكامل لكافة مستويات التخزين (الملف الأساسي + النسخة التزامنية + كاش الطوارئ) لمنع انبعاث السلة
-      if (currentState.isEmpty) {
-        if (await file.exists()) await file.delete().catchError((_) => file);
-        final dir = await getApplicationDocumentsDirectory();
-        final syncBackup = File('${dir.path}/sala_cart_v2_$uid.json');
-        if (await syncBackup.exists())
-          await syncBackup.delete().catchError((_) => syncBackup);
-        await AppStorage.remove(_key);
-        return;
-      }
-
-      final dataMap = currentState.map((k, v) => MapEntry(k, v.toJson()));
-      final jsonString = jsonEncode(dataMap);
-      final nonce = DateTime.now().microsecondsSinceEpoch;
-      final tempFile = File('${file.path}_$nonce.tmp');
-      await tempFile.writeAsString(jsonString, flush: true);
-
-      // استبدال ذري بدون حذف
-      try {
-        await tempFile.rename(file.path);
-      } catch (_) {
-        await tempFile.copy(file.path);
-        await tempFile.delete().catchError((_) => tempFile);
-      }
-      // مزامنة نسخة الطوارئ النصية في SharedPreferences
-      await AppStorage.setString(_key, jsonString);
-    } catch (e, st) {
-      if (kDebugMode) debugPrint('❌ Cart Sequential Save Error: $e\n$st');
+    // 🔒 التطهير الذري الكامل لكافة مستويات التخزين (الملف الأساسي + النسخة التزامنية + كاش الطوارئ) لمنع انبعاث السلة
+    if (currentState.isEmpty) {
+      if (await file.exists()) await file.delete();
+      final dir = await getApplicationDocumentsDirectory();
+      final syncBackup = File('${dir.path}/sala_cart_v2_$uid.json');
+      if (await syncBackup.exists()) await syncBackup.delete();
+      await AppStorage.remove(_key);
+      return;
     }
+
+    final revisionFile = await _cartRevisionFile;
+    if (revisionFile != null) {
+      await revisionFile.writeAsString(revision, flush: true);
+    }
+
+    final dataMap = currentState.map((k, v) => MapEntry(k, v.toJson()));
+    final jsonString = jsonEncode(dataMap);
+    final nonce = DateTime.now().microsecondsSinceEpoch;
+    final tempFile = File('${file.path}_$nonce.tmp');
+    await tempFile.writeAsString(jsonString, flush: true);
+
+    // استبدال ذري بدون حذف
+    try {
+      await tempFile.rename(file.path);
+    } catch (_) {
+      await tempFile.copy(file.path);
+      await tempFile.delete();
+    }
+    // مزامنة نسخة الطوارئ النصية في SharedPreferences
+    await AppStorage.setString(_key, jsonString);
   }
 
   @override
@@ -135,7 +190,11 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
         if (AppStorage.isLoggedIn && AppStorage.userId != null) {
           final dataMap = state.map((k, v) => MapEntry(k, v.toJson()));
           final jsonString = jsonEncode(dataMap);
-          AppStorage.saveCartBackupSync(uid, jsonString);
+          AppStorage.saveCartBackupSync(
+            uid,
+            jsonString,
+            revision: cartRevision,
+          );
         }
       } catch (_) {}
     }
@@ -240,23 +299,36 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
   }
 
   Future<void> clearAsync() async {
+    await _loadFuture;
     _saveDebounce?.cancel();
+    _ignoreLoadedCart = false;
     state = {};
     await forceSave();
   }
 
+  Future<void> clearIfRevision(String expectedRevision) async {
+    await _loadFuture;
+    await _cartSaveChain;
+    if (_cartRevision != expectedRevision) return;
+    await clearAsync();
+  }
+
   void clear() {
     _saveDebounce?.cancel();
+    _ignoreLoadedCart = true;
     state = {};
-    unawaited(forceSave());
+    _save();
   }
 
   /// استعادة السلة مباشرة إلى الذاكرة وملف التخزين عند فشل إرسال طلب أوفلاين
   Future<void> restoreCart(Map<String, dynamic> cartMap) async {
+    await _loadFuture;
     final loaded = cartMap.map(
       (k, v) => MapEntry(k, CartItem.fromJson(v as Map<String, dynamic>)),
     );
     state = Map<String, CartItem>.from(loaded);
+    _ignoreLoadedCart = false;
+    _cartRevision = _newCartRevision();
     await forceSave();
   }
 

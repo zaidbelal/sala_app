@@ -415,7 +415,7 @@ class _OtpScreenState extends ConsumerState<OtpScreen>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: const Text(
-            'تم إرسال رمز جديد ✅',
+            'إذا كان الرقم مؤهلاً، فسيصلك رمز تحقق جديد',
             textAlign: TextAlign.center,
             style: TextStyle(fontFamily: 'Cairo'),
           ),

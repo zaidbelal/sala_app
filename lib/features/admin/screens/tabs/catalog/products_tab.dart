@@ -1601,8 +1601,7 @@ class _ProductEditSheetState extends ConsumerState<_ProductEditSheet> {
         'price': double.tryParse(priceCtrl.text) ?? 0,
         if (costCtrl.text.isNotEmpty)
           'cost_price': double.tryParse(costCtrl.text),
-        if (stockWasManuallyChanged)
-          'stock_delta': (newStockInput - initialStockValue),
+        if (stockWasManuallyChanged) 'stock': newStockInput,
         if (itemsCtrl.text.isNotEmpty)
           'items_per_carton': int.tryParse(itemsCtrl.text),
         'size_text': customSizeText,

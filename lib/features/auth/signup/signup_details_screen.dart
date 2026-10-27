@@ -267,6 +267,20 @@ class _SignupDetailsScreenState extends ConsumerState<SignupDetailsScreen>
       // التوجيه المباشر إلى شاشة انتظار التفعيل
       context.go('/pending');
     } on FirebaseFunctionsException catch (e) {
+      if (e.code == 'already-exists') {
+        await FirebaseAuth.instance.signOut();
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'هذا الرقم مسجل بالفعل. سجّل الدخول للمتابعة.',
+              style: TextStyle(fontFamily: 'Cairo'),
+            ),
+          ),
+        );
+        context.go('/login', extra: widget.phone);
+        return;
+      }
       if (!mounted) return;
       final message = (e.code == 'unavailable' || e.code == 'deadline-exceeded')
           ? 'تعذر الاتصال بالخادم، يرجى التحقق من اتصالك بالإنترنت'

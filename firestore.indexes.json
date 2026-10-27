@@ -4,8 +4,45 @@
       "collectionGroup": "merchant_ledger_entries",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "merchant_id", "order": "ASCENDING" },
         { "fieldPath": "customer_id", "order": "ASCENDING" },
         { "fieldPath": "created_at", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "merchant_ledger_entries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "merchant_id", "order": "ASCENDING" },
+        { "fieldPath": "customer_id", "order": "ASCENDING" },
+        { "fieldPath": "is_voided", "order": "ASCENDING" },
+        { "fieldPath": "type", "order": "ASCENDING" },
+        { "fieldPath": "amount", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "merchant_customers",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "merchant_id", "order": "ASCENDING" },
+        { "fieldPath": "phone", "order": "ASCENDING" },
+        { "fieldPath": "is_deleted", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "merchant_customers",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "merchant_id", "order": "ASCENDING" },
+        { "fieldPath": "name", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "merchant_customers",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "merchant_id", "order": "ASCENDING" },
+        { "fieldPath": "is_deleted", "order": "ASCENDING" }
       ]
     },
     {

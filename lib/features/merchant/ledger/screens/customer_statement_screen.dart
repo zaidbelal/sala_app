@@ -197,25 +197,37 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
               ),
               onTap: () async {
                 Navigator.pop(sheetCtx);
-                final liveCustDoc = await FirebaseFirestore.instance
-                    .collection('merchant_customers')
-                    .doc(_customer.id)
-                    .get(const GetOptions(source: Source.serverAndCache));
-                final authoritativeCustomer =
-                    (liveCustDoc.exists && liveCustDoc.data() != null)
-                        ? LedgerCustomer.fromMap(
-                            {'id': liveCustDoc.id, ...liveCustDoc.data()!})
-                        : _customer;
+                try {
+                  final liveCustDoc = await FirebaseFirestore.instance
+                      .collection('merchant_customers')
+                      .doc(_customer.id)
+                      .get(const GetOptions(source: Source.serverAndCache));
+                  final authoritativeCustomer =
+                      (liveCustDoc.exists && liveCustDoc.data() != null)
+                          ? LedgerCustomer.fromMap(
+                              {'id': liveCustDoc.id, ...liveCustDoc.data()!})
+                          : _customer;
 
-                // 🔒 تحديد سقف مدروس للتقرير الفوري لتفادي استنزاف ذاكرة جهاز التاجر (OOM Crash)
-                final entriesSnap = await LedgerService.instance
-                    .watchCustomerEntries(authoritativeCustomer.id, limit: 250)
-                    .first;
-                await LedgerService.instance.printOrPreviewStatementPdf(
-                  customer: authoritativeCustomer,
-                  storeName: widget.storeName,
-                  entries: entriesSnap,
-                );
+                  final entriesSnap = await LedgerService.instance
+                      .watchCustomerEntries(authoritativeCustomer.id,
+                          limit: 250)
+                      .first;
+                  await LedgerService.instance.printOrPreviewStatementPdf(
+                    customer: authoritativeCustomer,
+                    storeName: widget.storeName,
+                    entries: entriesSnap,
+                  );
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('تعذر إنشاء أو طباعة كشف الحساب: $e',
+                            style: const TextStyle(fontFamily: 'Cairo')),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
               },
             ),
           ],
@@ -302,18 +314,38 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
 
               if (confirmed == true && context.mounted) {
                 final mId = AppStorage.userId ?? '';
-                await LedgerService.instance.deleteCustomer(
-                  merchantId: mId,
-                  customerId: _customer.id,
-                  currentBalance: _customer.currentBalance,
-                );
+                String? queuedMessage;
+                try {
+                  await LedgerService.instance.deleteCustomer(
+                    merchantId: mId,
+                    customerId: _customer.id,
+                    currentBalance: _customer.currentBalance,
+                  );
+                } on LedgerQueuedException catch (e) {
+                  queuedMessage = e.message;
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('تعذر حذف الزبون: $e'),
+                        backgroundColor: Colors.red.shade700,
+                      ),
+                    );
+                  }
+                  return;
+                }
                 if (context.mounted) {
                   Navigator.pop(context);
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
-                      content: Text('تم حذف الزبون (${_customer.name}) بنجاح ✅',
-                          style: const TextStyle(fontFamily: 'Cairo')),
-                      backgroundColor: Colors.red,
+                      content: Text(
+                        queuedMessage ??
+                            'تم حذف الزبون (${_customer.name}) بنجاح ✅',
+                        style: const TextStyle(fontFamily: 'Cairo'),
+                      ),
+                      backgroundColor: queuedMessage == null
+                          ? Colors.red
+                          : Colors.orange.shade700,
                     ),
                   );
                 }
@@ -1015,15 +1047,14 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
     setState(() => _isSaving = true);
 
     final merchantId = AppStorage.userId ?? '';
-    final safeMId =
-        merchantId.length > 5 ? merchantId.substring(0, 5) : merchantId;
 
-    // 🔒 مفتاح حتمي غير قابل للتكرار مرتبط بمحتوى العملية وزمن النقر الأصلي (Idempotent Signature)
+    // Keep one Firestore-generated id across retries of this submission.
     if (_assignedTransactionId == null) {
-      final clickTime = DateTime.now().millisecondsSinceEpoch;
-      final amountCents = (amt * 100).round();
-      _assignedTransactionId =
-          'tx_${safeMId}_${widget.customer.id}_${amountCents}_${widget.isDebt ? 'D' : 'P'}_$clickTime';
+      final generatedId = FirebaseFirestore.instance
+          .collection('merchant_ledger_entries')
+          .doc()
+          .id;
+      _assignedTransactionId = 'ledger_$generatedId';
     }
     final entryId = _assignedTransactionId!;
     if (widget.isDebt && widget.customer.creditLimit > 0) {
@@ -1057,6 +1088,7 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
           ),
         );
         if (proceed != true) {
+          _assignedTransactionId = null;
           if (mounted) setState(() => _isSaving = false);
           return;
         }
@@ -1131,17 +1163,28 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
           ),
         );
       }
-    } catch (e) {
-      // 🔒 الحفاظ على _assignedTransactionId في حالة إعادة المحاولة، لمنع توليد قيد مالي مكرر
+    } on LedgerQueuedException catch (e) {
+      _assignedTransactionId = null;
       if (!mounted) return;
       Navigator.pop(context, updatedCustomer);
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           content: Text(
-              '📡 تم حفظ القيد أوفلاين وسيتزامن تلقائياً فور توفر الشبكة',
-              style:
-                  TextStyle(fontFamily: 'Cairo', fontWeight: FontWeight.bold)),
+            '📡 ${e.message}',
+            style: const TextStyle(
+                fontFamily: 'Cairo', fontWeight: FontWeight.bold),
+          ),
           backgroundColor: Colors.orange,
+        ),
+      );
+    } catch (e) {
+      debugPrint('Ledger transaction submission failed: $e');
+      if (!mounted) return;
+      setState(() => _isSaving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('تعذر تسجيل القيد: $e'),
+          backgroundColor: Colors.red.shade700,
         ),
       );
     }

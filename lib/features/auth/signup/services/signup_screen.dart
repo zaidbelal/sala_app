@@ -33,7 +33,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen>
   bool _isPhoneValid = false;
   bool _isLoading = false;
   String _errorMsg = '';
-  String? _lastAutoCheckedPhone;
+  String? _lastAutoRequestedPhone;
   @override
   void initState() {
     super.initState();
@@ -41,7 +41,7 @@ class _SignupScreenState extends ConsumerState<SignupScreen>
     // إذا جاء برقم مُدخل مسبقاً
     if (widget.prefilledPhone != null) {
       _phoneController.text = widget.prefilledPhone!;
-      _lastAutoCheckedPhone = widget.prefilledPhone!;
+      _lastAutoRequestedPhone = widget.prefilledPhone!;
     }
     _animController = AnimationController(
       vsync: this,
@@ -90,80 +90,33 @@ class _SignupScreenState extends ConsumerState<SignupScreen>
     });
 
     try {
-      final signupService = ref.read(signupServiceProvider);
-      final alreadyCheckedFromLogin = widget.prefilledPhone != null &&
-          widget.prefilledPhone!.trim() == phone;
-
-      final response = alreadyCheckedFromLogin
-          ? const SignupPhoneResponse(
-              result: SignupPhoneCheck.available,
-            )
-          : await signupService.checkPhoneAvailability(phone);
+      final session = await ref.read(signupServiceProvider).sendOtp(phone);
       if (!mounted) return;
-
-      switch (response.result) {
-        case SignupPhoneCheck.available:
-          try {
-            final session = await signupService.sendOtp(phone);
-            if (!mounted) return;
-            setState(() => _isLoading = false);
-            context.push(
-              AppRoutes.otp,
-              extra: {
-                'phone': phone,
-                'verificationId': session.verificationId,
-                'resendToken': session.resendToken,
-                'isNewUser': true,
-              },
-            );
-          } catch (error) {
-            if (mounted) {
-              final err = error.toString().toLowerCase();
-              final message = (err.contains('network') ||
-                      err.contains('socket') ||
-                      err.contains('timeout'))
-                  ? 'تعذر الاتصال بالخادم، يرجى التحقق من اتصال الإنترنت'
-                  : (error is StateError
-                      ? error.message
-                      : 'تعذر إرسال رمز التحقق، يرجى المحاولة لاحقاً');
-              setState(() {
-                _isLoading = false;
-                _errorMsg = message;
-              });
-            }
-          }
-          break;
-
-        case SignupPhoneCheck.alreadyExists:
-          setState(() {
-            _isLoading = false;
-            _errorMsg = '';
-          });
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text(
-                  'هذا الرقم مسجل مسبقاً، تم نقلك لتسجيل الدخول مباشرة ✅',
-                  style: TextStyle(fontFamily: 'Cairo'),
-                  textAlign: TextAlign.center,
-                ),
-                backgroundColor: AppColors.primary,
-                behavior: SnackBarBehavior.floating,
-                duration: Duration(seconds: 2),
-              ),
-            );
-            context.go(AppRoutes.login, extra: phone);
-          }
-          break;
-        case SignupPhoneCheck.error:
-          setState(() {
-            _isLoading = false;
-            _errorMsg = response.message ?? 'حدث خطأ، حاول مجدداً';
-          });
-          break;
+      setState(() => _isLoading = false);
+      context.push(
+        AppRoutes.otp,
+        extra: {
+          'phone': phone,
+          'verificationId': session.verificationId,
+          'resendToken': session.resendToken,
+          'isNewUser': true,
+        },
+      );
+    } catch (error) {
+      if (mounted) {
+        final err = error.toString().toLowerCase();
+        final message = (err.contains('network') ||
+                err.contains('socket') ||
+                err.contains('timeout'))
+            ? 'تعذر الاتصال بالخادم، يرجى التحقق من اتصال الإنترنت'
+            : (error is StateError
+                ? error.message
+                : 'تعذر إرسال رمز التحقق، يرجى المحاولة لاحقاً');
+        setState(() {
+          _isLoading = false;
+          _errorMsg = message;
+        });
       }
-    } catch (_) {
-      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -250,14 +203,14 @@ class _SignupScreenState extends ConsumerState<SignupScreen>
 
                             final currentPhone = _phoneController.text.trim();
                             if (currentPhone.length < 9) {
-                              _lastAutoCheckedPhone = null;
+                              _lastAutoRequestedPhone = null;
                             }
 
                             // فحص تلقائي فوري بمجرد اكتمال الرقم التاسع
                             if (valid &&
                                 !_isLoading &&
-                                _lastAutoCheckedPhone != currentPhone) {
-                              _lastAutoCheckedPhone = currentPhone;
+                                _lastAutoRequestedPhone != currentPhone) {
+                              _lastAutoRequestedPhone = currentPhone;
                               _onNext();
                             }
                           },

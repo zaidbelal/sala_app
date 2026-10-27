@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -15,27 +14,6 @@ import 'package:sala/core/services/catalog_service.dart';
 import 'package:sala/core/services/prefetch_service.dart';
 import 'package:sala/features/merchant/cart/providers/cart_provider.dart';
 import 'package:sala/features/merchant/search/services/search_service.dart';
-
-enum PhoneCheckResult {
-  registered,
-  notRegistered,
-  inactive,
-  error,
-}
-
-class PhoneCheckResponse {
-  final PhoneCheckResult result;
-  final String? userId;
-  final String? role;
-  final String? message;
-
-  const PhoneCheckResponse({
-    required this.result,
-    this.userId,
-    this.role,
-    this.message,
-  });
-}
 
 class OtpVerifyResponse {
   final bool success;
@@ -121,92 +99,6 @@ class AuthService {
 
     throw FormatException(
         'رقم الهاتف يجب أن يكون $requiredLength أرقام ويبدأ بالرقم $validStartDigit');
-  }
-
-  Future<PhoneCheckResponse> checkPhoneNumber(String phone) async {
-    try {
-      final formattedPhone = formatPhone(phone);
-      try {
-        final snap = await _db
-            .collection('profiles')
-            .where('phone_number', isEqualTo: formattedPhone)
-            .limit(1)
-            .get(const GetOptions(source: Source.serverAndCache))
-            .timeout(const Duration(seconds: 6));
-
-        if (snap.docs.isEmpty) {
-          return const PhoneCheckResponse(
-            result: PhoneCheckResult.notRegistered,
-            message: 'يرجى المتابعة لإتمام إنشاء الحساب',
-          );
-        }
-
-        final doc = snap.docs.first;
-        final data = doc.data();
-
-        final isBanned = data['is_banned'] == true;
-        final isActive = data['is_active'] == true;
-        final accountStatus = data['account_status']?.toString() ?? 'pending';
-
-        if (isBanned || (!isActive && accountStatus != 'pending')) {
-          return const PhoneCheckResponse(
-            result: PhoneCheckResult.inactive,
-            message: 'تعذر الدخول، يرجى التواصل مع الدعم الفني',
-          );
-        }
-
-        return PhoneCheckResponse(
-          result: PhoneCheckResult.registered,
-          userId: doc.id,
-          role: data['role']?.toString() ?? 'merchant',
-          message: 'يرجى المتابعة لإتمام التحقق',
-        );
-      } on FirebaseException catch (e) {
-        // إذا رُفض الاستعلام بسبب قواعد حماية بيانات المستخدمين لغير المسجلين
-        if (e.code == 'permission-denied') {
-          final callable =
-              FirebaseFunctions.instance.httpsCallable('checkPhoneNumber');
-          final res = await callable.call({'phone': formattedPhone});
-          final data = Map<String, dynamic>.from(res.data as Map);
-          if (data['exists'] != true) {
-            return const PhoneCheckResponse(
-              result: PhoneCheckResult.notRegistered,
-              message: 'يرجى المتابعة لإتمام إنشاء الحساب',
-            );
-          }
-          if (data['is_banned'] == true ||
-              (data['is_active'] == false &&
-                  data['account_status'] != 'pending')) {
-            return const PhoneCheckResponse(
-              result: PhoneCheckResult.inactive,
-              message: 'تعذر الدخول، يرجى التواصل مع الدعم الفني',
-            );
-          }
-          return PhoneCheckResponse(
-            result: PhoneCheckResult.registered,
-            userId: data['userId']?.toString(),
-            role: data['role']?.toString() ?? 'merchant',
-            message: 'يرجى المتابعة لإتمام التحقق',
-          );
-        }
-        rethrow;
-      }
-    } on FormatException catch (error) {
-      return PhoneCheckResponse(
-        result: PhoneCheckResult.error,
-        message: error.message,
-      );
-    } on TimeoutException {
-      return const PhoneCheckResponse(
-        result: PhoneCheckResult.error,
-        message: 'انتهت مهلة الاتصال، تحقق من جودة الإنترنت',
-      );
-    } catch (error) {
-      return const PhoneCheckResponse(
-        result: PhoneCheckResult.error,
-        message: 'خطأ أثناء الاتصال بالخادم، تحقق من اتصال الإنترنت',
-      );
-    }
   }
 
   Future<PhoneVerificationSession> sendOtp(
