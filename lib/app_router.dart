@@ -77,27 +77,22 @@ final appRouterProvider = Provider<GoRouter>((ref) {
         }
         return null;
       }
-
-      // 2. إذا انتهت الجلسة المحلية أو تعارض حساب فايربيز النشط مع معرف التخزين المحلي
-      final bool sessionInvalid = AppStorage.isSessionExpired ||
-          (firebaseUser != null && firebaseUser.uid != AppStorage.userId);
-
-      if (sessionInvalid) {
-        NotificationService.pendingRoute = null;
-        if (!publicRoutes.contains(path)) {
-          return AppRoutes.login;
-        }
-        return null;
+// 2. إذا كان المستخدم مسجلاً محلياً بالفعل وحاول فتح صفحة تسجيل الدخول، وجّهه لشاشته فوراً
+      if (AppStorage.isLoggedIn &&
+          (path == AppRoutes.login || path == AppRoutes.signup)) {
+        if (!AppStorage.isActive) return AppRoutes.pending;
+        if (AppStorage.hasAdminAccess) return AppRoutes.adminHome;
+        if (AppStorage.isDriver) return AppRoutes.driverHome;
+        return AppRoutes.merchantHome;
       }
 
-      // 3. السماح بالمسارات العامة
+      // 3. السماح بالمسارات العامة للزوار فقط
       if (publicRoutes.contains(path)) {
         if (path == AppRoutes.signupDetails && firebaseUser == null) {
           return AppRoutes.login;
         }
         return null;
       }
-
       // 4. الحساب محظور نهائياً
       if (AppStorage.isBanned) {
         NotificationService.pendingRoute = null;

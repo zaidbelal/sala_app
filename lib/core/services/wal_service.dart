@@ -144,7 +144,10 @@ class WalService {
 
   Future<void> _appendStateTransition(String transactionId, WalStatus status,
       {bool autoCompact = true}) async {
-    if (_logFile == null || !await _logFile!.exists()) return;
+    final logFile = _logFile;
+    if (logFile == null || !await logFile.exists()) {
+      throw StateError('WAL file is unavailable for state transition');
+    }
     try {
       final transition = {
         'id': transactionId,
@@ -152,22 +155,35 @@ class WalService {
         'transition': true,
         'timestamp': DateTime.now().toIso8601String(),
       };
-      await _logFile!.writeAsString('${jsonEncode(transition)}\n',
+      await logFile.writeAsString('${jsonEncode(transition)}\n',
           mode: FileMode.append, flush: true);
 
       if (autoCompact) {
-        final fileLength = await _logFile!.length();
+        final fileLength = await logFile.length();
         if (fileLength > _maxLogSizeBytes) {
-          // 🔒 تجنب Deadlock: فك الحجز أولاً وجدولة الـ compactLog بعد اكتمال القفل الحالي
-          Timer.run(() => compactLog());
+          Future.microtask(() async {
+            try {
+              await compactLog();
+            } catch (e) {
+              if (kDebugMode) debugPrint('WAL Auto-compaction failed: $e');
+            }
+          });
         }
       }
     } catch (e, st) {
       if (kDebugMode) debugPrint('WAL State Transition Failed: $e');
       if (!kIsWeb) {
-        FirebaseCrashlytics.instance
-            .recordError(e, st, reason: 'WAL append transition failed');
+        try {
+          await FirebaseCrashlytics.instance
+              .recordError(e, st, reason: 'WAL append transition failed');
+        } catch (reportingError) {
+          if (kDebugMode) {
+            debugPrint(
+                'WAL transition error reporting failed: $reportingError');
+          }
+        }
       }
+      Error.throwWithStackTrace(e, st);
     }
   }
 
@@ -324,10 +340,22 @@ class WalService {
             if (entry.payload['action'] == 'void') {
               verifiedOnServer = matchesIntent && data?['is_voided'] == true;
             } else {
+              final docAmtCents =
+                  (((data?['amount'] as num?)?.toDouble() ?? 0.0) * 100)
+                      .round();
+              final intentAmtCents =
+                  (((entry.payload['amount'] as num?)?.toDouble() ?? 0.0) * 100)
+                      .round();
+              final persistedNotes = data?['notes'] ?? '';
+              final intentNotes = entry.payload['notes'] ?? '';
+              final persistedItems = data?['items'] ?? const [];
+              final intentItems = entry.payload['items'] ?? const [];
+
               verifiedOnServer = matchesIntent &&
                   data?['type'] == entry.payload['type'] &&
-                  (data?['amount'] as num?)?.toDouble() ==
-                      (entry.payload['amount'] as num?)?.toDouble();
+                  docAmtCents == intentAmtCents &&
+                  _matchesJsonValue(persistedNotes, intentNotes) &&
+                  _matchesJsonValue(persistedItems, intentItems);
             }
           }
           if (verifiedOnServer) {
@@ -399,8 +427,13 @@ class WalService {
                 }
               }
 
+              // لا نحذف السلة إلا إذا كانت تطابق مراجعة السلة الدقيقة لنفس العملية المعلقة المؤكدة
+              final hasMatchingRevision = matchingEntries.any(
+                (e) => e.payload['cart_revision']?.toString() == cartRevision,
+              );
+
               final isAssociatedWithPending = cartRevision.isNotEmpty &&
-                  matchingEntries.isNotEmpty &&
+                  hasMatchingRevision &&
                   isExactCartMatch;
 
               if (isAssociatedWithPending) {
@@ -436,6 +469,28 @@ class WalService {
       }
     }
     await compactLog();
+  }
+
+  bool _matchesJsonValue(Object? first, Object? second) {
+    if (first is num && second is num) return first == second;
+    if (first is List && second is List) {
+      if (first.length != second.length) return false;
+      for (var i = 0; i < first.length; i++) {
+        if (!_matchesJsonValue(first[i], second[i])) return false;
+      }
+      return true;
+    }
+    if (first is Map && second is Map) {
+      if (first.length != second.length) return false;
+      for (final key in first.keys) {
+        if (!second.containsKey(key) ||
+            !_matchesJsonValue(first[key], second[key])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return first == second;
   }
 
   Future<void> compactLog() async {

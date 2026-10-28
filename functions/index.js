@@ -1,12 +1,25 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
-const admin = require("firebase-admin");
-const { AggregateField, FieldPath, FieldValue } = require("firebase-admin/firestore");
+const { initializeApp } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+const {
+  AggregateField,
+  FieldPath,
+  FieldValue,
+  Timestamp,
+  getFirestore,
+} = require("firebase-admin/firestore");
+const { getMessaging } = require("firebase-admin/messaging");
+const { getStorage } = require("firebase-admin/storage");
+const { isDeepStrictEqual } = require("node:util");
 const crypto = require("crypto");
  
-admin.initializeApp();
-const db = admin.firestore();
+initializeApp();
+const auth = getAuth();
+const db = getFirestore();
+const messaging = getMessaging();
+const storage = getStorage();
 // ─── الأسرار (Secrets) ───
 const smsSenderId = defineSecret("SMS_SENDER_ID");
 const smsApiKey = defineSecret("SMS_API_KEY");
@@ -59,8 +72,7 @@ async function sendWhatsAppMessage({ phone, text, idInstance, apiTokenInstance }
   }
   return data;
 }
- 
-// ─── requestOtp ───
+ // ─── requestOtp (محصنة 100% ضد استنزاف الرصيد وهجمات التخمين) ───
 exports.requestOtp = onCall(
   { region: "us-central1", cors: true, secrets: [smsSenderId, smsApiKey] },
   async (request) => {
@@ -73,26 +85,62 @@ exports.requestOtp = onCall(
     if (purpose !== "login" && purpose !== "signup") {
       throw new HttpsError("invalid-argument", "نوع الطلب غير صحيح");
     }
+
+    // 🔒 التحقق المسبق الصارم: منع إرسال أي رسالة مدفوعة إلا للأرقام المؤهلة فعلياً
+    const profileSnap = await db.collection("profiles")
+      .where("phone_number", "==", phone)
+      .limit(1)
+      .get();
+    
+    const userExists = !profileSnap.empty;
+    const userData = userExists ? profileSnap.docs[0].data() : null;
+
+    if (purpose === "login") {
+      // إذا كان تسجيل دخول والرقم غير مسجل أصلاً، أو محظور: ننسحب فوراً دون إرسال أي رسالة واتساب
+      if (!userExists || userData?.is_banned === true || userData?.is_deleted === true) {
+        return { success: true, message: "إذا كان الرقم مؤهلاً، فسيتم إرسال رمز التحقق" };
+      }
+    } else if (purpose === "signup") {
+      // إذا كان إنشاء حساب والرقم مسجل مسبقاً وغير محذوف: نمنع استنزاف الرصيد
+      if (userExists && userData?.is_deleted !== true) {
+        return { success: true, message: "إذا كان الرقم مؤهلاً، فسيتم إرسال رمز التحقق" };
+      }
+    }
+
     const otpRef = db.collection("otp_codes").doc(phone);
     const code = generateCode();
     const codeHash = hashCode(code);
+
     const reserved = await db.runTransaction(async (tx) => {
       const existing = await tx.get(otpRef);
-      const lastSentAt = existing.exists
-        ? existing.data().lastSentAt?.toMillis?.() ?? 0
-        : 0;
+      const data = existing.data() || {};
+      const lastSentAt = existing.exists ? (data.lastSentAt?.toMillis?.() ?? 0) : 0;
+      
+      // كبح التكرار: دقيقة كاملة بين كل طلب لنفس الرقم
       if (Date.now() - lastSentAt < RESEND_COOLDOWN_MS) return false;
+
+      // سقف أمان ساعي: منع طلب أكثر من 5 رموز لنفس الرقم خلال ساعة واحدة
+      const hourlyRequests = Number(data.hourlyRequests || 0);
+      const hourStart = data.hourStart?.toMillis?.() ?? 0;
+      const isNewHour = Date.now() - hourStart > 3600 * 1000;
+      
+      if (!isNewHour && hourlyRequests >= 5) {
+        return false;
+      }
 
       tx.set(otpRef, {
         codeHash,
         purpose,
         attempts: 0,
+        hourlyRequests: isNewHour ? 1 : hourlyRequests + 1,
+        hourStart: isNewHour ? FieldValue.serverTimestamp() : (data.hourStart || FieldValue.serverTimestamp()),
         createdAt: FieldValue.serverTimestamp(),
         lastSentAt: FieldValue.serverTimestamp(),
-        expiresAt: admin.firestore.Timestamp.fromMillis(Date.now() + OTP_TTL_MS),
+        expiresAt: Timestamp.fromMillis(Date.now() + OTP_TTL_MS),
       });
       return true;
     });
+
     if (!reserved) {
       return { success: true, message: "إذا كان الرقم مؤهلاً، فسيتم إرسال رمز التحقق" };
     }
@@ -100,7 +148,7 @@ exports.requestOtp = onCall(
     try {
       await sendWhatsAppMessage({
         phone,
-        text: `رمز التحقق الخاص بك هو: ${code}\nصالح لمدة 5 دقائق ولا تشاركه مع أحد.`,
+        text: `رمز التحقق الخاص بك في سَلة هو: ${code}\nصالح لمدة 5 دقائق ولا تشاركه مع أي شخص.`,
         idInstance: smsSenderId.value(),
         apiTokenInstance: smsApiKey.value(),
       });
@@ -118,7 +166,6 @@ exports.requestOtp = onCall(
     return { success: true, message: "إذا كان الرقم مؤهلاً، فسيتم إرسال رمز التحقق" };
   }
 );
- 
 // ─── verifyOtp ───
 exports.verifyOtp = onCall(
   { region: "us-central1", cors: true, secrets: [smsSenderId, smsApiKey] },
@@ -219,11 +266,11 @@ const otpRef = db.collection("otp_codes").doc(phone);
 // 🔒 ربط رقم الهاتف الموثق بالـ Claims المشفرة لمنع انتحال أي رقم آخر أثناء إنشاء الملف
     const tokenClaims = { role, purpose, verified_phone: phone };
     try {
-      await admin.auth().setCustomUserClaims(uid, tokenClaims);
+      await auth.setCustomUserClaims(uid, tokenClaims);
     } catch (e) {
       console.warn(`[verifyOtp] setCustomUserClaims skipped for uid: ${uid}`);
     }
-    const customToken = await admin.auth().createCustomToken(uid, tokenClaims);
+    const customToken = await auth.createCustomToken(uid, tokenClaims);
     return { verified: true, message: "تم التحقق بنجاح", customToken };
   }
 );
@@ -296,7 +343,7 @@ exports.sendPushNotification = onDocumentCreated(
     };
 
     try {
-      await admin.messaging().send(message);
+      await messaging.send(message);
     } catch (error) {
       if (error.code === 'messaging/invalid-registration-token' || 
           error.code === 'messaging/registration-token-not-registered') {
@@ -307,7 +354,9 @@ exports.sendPushNotification = onDocumentCreated(
     }
   }
 );
-// ─── البحث الآمن عن الأماكن في الخريطة ───
+// ذاكرة كاش ومحدد معدل استهلاك بحث الأماكن المؤقت
+const placesRateLimiter = new Map();
+
 exports.searchPlaces = onCall(
   { region: "us-central1", cors: true, secrets: [googlePlacesApiKey] },
   async (request) => {
@@ -315,21 +364,37 @@ exports.searchPlaces = onCall(
       throw new HttpsError("unauthenticated", "يجب تسجيل الدخول لاستخدام البحث الجغرافي");
     }
 
-    const query = String(request.data?.query || "").trim();
+    const uid = request.auth.uid;
+    const now = Date.now();
+    const userLimit = placesRateLimiter.get(uid) || { count: 0, resetAt: now + 60000 };
+
+    if (now > userLimit.resetAt) {
+      userLimit.count = 1;
+      userLimit.resetAt = now + 60000;
+    } else {
+      userLimit.count++;
+      // سقف أمان: 20 عملية بحث كحد أقصى في الدقيقة الواحدة لكل مستخدم
+      if (userLimit.count > 20) {
+        throw new HttpsError("resource-exhausted", "تجاوزت الحد المسموح من عمليات البحث، انتظر دقيقة");
+      }
+    }
+    placesRateLimiter.set(uid, userLimit);
+
+    const query = String(request.data?.query || "").trim().slice(0, 80);
     if (!query) return [];
 
     const apiKey = googlePlacesApiKey.value();
     const url = new URL("https://maps.googleapis.com/maps/api/place/textsearch/json");
     url.searchParams.append("query", `${query} صنعاء`);
     url.searchParams.append("location", "15.3550,44.2000");
-    url.searchParams.append("radius", "30000");
+    url.searchParams.append("radius", "25000");
     url.searchParams.append("language", "ar");
     url.searchParams.append("key", apiKey);
 
     try {
       const res = await fetch(url.toString());
       const data = await res.json();
-      return data.results || [];
+      return (data.results || []).slice(0, 10);
     } catch (error) {
       console.error("[searchPlaces] Error:", error);
       return [];
@@ -549,7 +614,7 @@ exports.createUserProfile = onCall(
         });
       });
 
-      await admin.auth().setCustomUserClaims(uid, { role: "merchant", purpose: "registered" });
+      await auth.setCustomUserClaims(uid, { role: "merchant", purpose: "registered" });
 
       return {
         success: true,
@@ -563,38 +628,52 @@ exports.createUserProfile = onCall(
     }
   }
 );
-// ─── حذف الحساب لجوجل بلاي مع حماية حسابات الإدارة العليا ───
-exports.deleteUserAccount = onCall(async (request) => {
+// ─── حذف الحساب الآمن المكتمل مع إبطال التوكنات وتطهير FCM ───
+exports.deleteUserAccount = onCall(
+  { region: "us-central1", cors: true },
+  async (request) => {
     if (!request.auth) {
-        throw new HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
+      throw new HttpsError('unauthenticated', 'يجب تسجيل الدخول أولاً');
     }
 
     const targetUid = request.auth.uid;
-
-    const userProfile = await db.collection('profiles').doc(targetUid).get();
+    const profileRef = db.collection('profiles').doc(targetUid);
+    const userProfile = await profileRef.get();
+    
     if (userProfile.exists) {
-        const role = String(userProfile.data()?.role || "").toLowerCase().trim();
-        if (role === "super_admin" || role === "admin") {
-            throw new HttpsError('failed-precondition', 'لا يمكن حذف حسابات مدراء النظام من التطبيق');
-        }
+      const role = String(userProfile.data()?.role || "").toLowerCase().trim();
+      if (role === "super_admin" || role === "admin") {
+        throw new HttpsError('failed-precondition', 'لا يمكن حذف حسابات مدراء النظام من التطبيق');
+      }
     }
 
     try {
-        await db.collection('profiles').doc(targetUid).update({
-            is_active: false,
-            is_banned: true, 
-            is_deleted: true,
-            phone_number: FieldValue.delete(),
-            full_name: "مستخدم محذوف",
-            updated_at: FieldValue.serverTimestamp()
-        });
-        await admin.auth().deleteUser(targetUid);
-        return { success: true };
+      // 1. إبطال كافة الجلسات النشطة على كل أجهزة المستخدم فوراً
+      await auth.revokeRefreshTokens(targetUid);
+
+      // 2. تطهير البيانات التعريفية ورمز الإشعارات لمنع وصول أي إشعار بعد الحذف
+      await profileRef.update({
+        is_active: false,
+        is_banned: true,
+        is_deleted: true,
+        fcm_token: FieldValue.delete(),
+        phone_number: FieldValue.delete(),
+        full_name: "مستخدم محذوف",
+        deleted_at: FieldValue.serverTimestamp(),
+        updated_at: FieldValue.serverTimestamp(),
+      });
+
+      // 3. حذف الحساب من سجلات Firebase Authentication
+      await auth.deleteUser(targetUid);
+
+      return { success: true };
     } catch (error) {
-        if (error instanceof HttpsError) throw error;
-        throw new HttpsError('internal', 'فشل حذف الحساب: ' + error.message);
+      if (error instanceof HttpsError) throw error;
+      console.error("[deleteUserAccount] Error:", error);
+      throw new HttpsError('internal', 'فشل حذف الحساب: ' + error.message);
     }
-});
+  }
+);
 // ══════════════════════════════════════════════════════════════
 // 2. دالة إنشاء الطلب واعتماد المخزون والترقيم الذري القطعي
 // ══════════════════════════════════════════════════════════════
@@ -668,18 +747,22 @@ exports.placeOrder = onCall(
       const enrichedItems = [];
       const itemFinancials = [];
 
+   const unavailableItems = [];
+    const outOfStockItems = [];
+
     for (const item of items) {
         const pId = String(item.product_id).trim();
         const product = productMap.get(pId);
 
         if (!product || product.is_deleted === true || product.is_active === false) {
           const pName = product?.name || item.product_name || "الصنف";
-          throw new HttpsError("failed-precondition", `PRODUCT_UNAVAILABLE_[${pId}]: نعتذر، (${pName}) لم يعد متوفراً في المستودع حالياً`);
+          unavailableItems.push({ id: pId, name: pName });
+          continue;
         }
 
         const qty = Number(item.quantity);
         if (!Number.isSafeInteger(qty) || qty <= 0) {
-          throw new HttpsError("invalid-argument", "كمية الصنف غير صحيحة");
+          throw new HttpsError("invalid-argument", `كمية الصنف (${product.name || pId}) غير صحيحة`);
         }
 
         const configuredCartonItems = Number(product.items_per_carton);
@@ -724,8 +807,9 @@ exports.placeOrder = onCall(
         if (!Number.isFinite(currentStock) || currentStock < 0) {
           throw new HttpsError("failed-precondition", `بيانات المخزون للصنف ${pId} غير صالحة`);
         }
-        if (currentStock < totalDeduction) {
-          throw new HttpsError("resource-exhausted", `OUT_OF_STOCK_[${pId}]: الكمية المطلوبة تتجاوز المخزون المتاح`);
+       if (currentStock < totalDeduction) {
+          outOfStockItems.push({ id: pId, name: product.name || pId });
+          continue;
         }
         stockDeductions.set(pId, totalDeduction);
 
@@ -810,10 +894,22 @@ exports.placeOrder = onCall(
         created_at: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
       };
-     // 🔒 التحقق الصارم في السيرفر من الحد الأدنى لقيمة الطلب
-      const MIN_ORDER_VALUE = 4250.0;
-      if (serverTotal < MIN_ORDER_VALUE) {
-        throw new HttpsError("failed-precondition", `الحد الأدنى للطلب هو ${MIN_ORDER_VALUE} ريال يمني`);
+     // ✅ التحقق الديناميكي الموحد مع مستند الإعدادات الرسمي لمنع تعارض الحد الأدنى
+      let minOrderValue = 4250.0;
+      try {
+        const configDoc = await tx.get(db.collection("system_config").doc("app_config"));
+        if (configDoc.exists) {
+          const fetchedMin = Number(configDoc.data()?.min_order_value);
+          if (Number.isFinite(fetchedMin) && fetchedMin > 0) {
+            minOrderValue = fetchedMin;
+          }
+        }
+      } catch (_) {
+        minOrderValue = 4250.0;
+      }
+
+      if (serverTotal < minOrderValue) {
+        throw new HttpsError("failed-precondition", `الحد الأدنى للطلب هو ${minOrderValue} ريال يمني`);
       }
 
       // كتابة الطلب وعناصره مباشرة
@@ -842,7 +938,7 @@ exports.placeOrder = onCall(
     // 🚀 إرسال إشعار Push فوري لقناة السائقين المعتمدة حتى لو كانت هواتفهم مقفلة
     if (!phaseOneResult.alreadyCreated) {
       try {
-        await admin.messaging().send({
+        await messaging.send({
           topic: "drivers",
           notification: {
             title: "🚨 طلب جديد جاهز للتوصيل!",
@@ -1246,7 +1342,7 @@ exports.deliverOrderByDriver = onCall(
       }
 
       try {
-        const bucket = admin.storage().bucket();
+        const bucket = storage.bucket();
         const fileName = `signatures/order_${cleanOrderId}_${Date.now()}.png`;
         const file = bucket.file(fileName);
         const downloadToken = crypto.randomUUID();
@@ -1571,7 +1667,7 @@ exports.manageUserAccount = onCall(
 
         // تحديث الرتبة في الـ Custom Claims لتفعيل الصلاحيات في التوكن
         try {
-          await admin.auth().setCustomUserClaims(cleanTargetId, {
+          await auth.setCustomUserClaims(cleanTargetId, {
             role: cleanRole,
             purpose: "registered",
           });
@@ -1592,7 +1688,7 @@ exports.manageUserAccount = onCall(
         });
         // إبطال جلسة المستخدم وطرده فوراً
         try {
-          await admin.auth().revokeRefreshTokens(cleanTargetId);
+          await auth.revokeRefreshTokens(cleanTargetId);
         } catch (_) {}
         return { success: true, message: "تم حظر الحساب بنجاح" };
       }
@@ -1620,7 +1716,7 @@ exports.manageUserAccount = onCall(
         });
         if (!activeBool) {
           try {
-            await admin.auth().revokeRefreshTokens(cleanTargetId);
+            await auth.revokeRefreshTokens(cleanTargetId);
           } catch (_) {}
         }
         return { success: true, message: activeBool ? "تم تفعيل الحساب" : "تم تعطيل الحساب" };
@@ -1670,7 +1766,7 @@ exports.sendBroadcastNotification = onCall(
     });
 // 2. بث الإشعار لجميع التجار عبر FCM Topic (مدعوم لنظامي iOS وأندرويد)
     try {
-      await admin.messaging().send({
+      await messaging.send({
         topic: "merchants",
         notification: {
           title: cleanTitle,
@@ -2211,8 +2307,44 @@ exports.recordLedgerTransaction = onCall(
     const entryId = requestedEntryId || `ledger_${merchantId.substring(0, 5)}_${Date.now()}_${db.collection("merchant_ledger_entries").doc().id}`;
     const entryRef = db.collection("merchant_ledger_entries").doc(entryId);
     const customerRef = db.collection("merchant_customers").doc(cleanCustomerId);
+    if (items != null && !Array.isArray(items)) {
+      throw new HttpsError("invalid-argument", "قائمة أصناف القيد غير صالحة");
+    }
+    const sanitizedItems = (items || []).map((it) => {
+      if (!it || typeof it !== "object" || Array.isArray(it)) {
+        throw new HttpsError("invalid-argument", "بيانات صنف القيد غير صالحة");
+      }
+
+      const productId = String(it.product_id || "").trim();
+      const name = String(it.name || it.product_name || "").trim();
+      const unitLabel = String(it.unit_label || "").trim();
+      const quantity = Number(it.quantity);
+      const unitPrice = Number(it.unit_price);
+      const subtotal = Number(it.subtotal);
+      const cartonCapacity = Number(it.carton_capacity);
+      if (!productId || !name || !unitLabel ||
+          !Number.isSafeInteger(quantity) || quantity <= 0 ||
+          !Number.isFinite(unitPrice) || unitPrice < 0 ||
+          !Number.isFinite(subtotal) || subtotal < 0 ||
+          !Number.isFinite(cartonCapacity) || cartonCapacity <= 0 ||
+          !Number.isSafeInteger(Math.round(unitPrice * quantity * 100)) ||
+          Math.round(unitPrice * quantity * 100) !== Math.round(subtotal * 100)) {
+        throw new HttpsError("invalid-argument", "بيانات صنف القيد أو إجماليه غير صالحة");
+      }
+
+      return {
+        product_id: productId,
+        name,
+        quantity,
+        unit_label: unitLabel,
+        unit_price: unitPrice,
+        subtotal,
+        carton_capacity: cartonCapacity,
+      };
+    });
+    const normalizedNotes = notes ? String(notes).trim() : null;
 const result = await db.runTransaction(async (tx) => {
-      // 🛡️ فحص Idempotency: إذا كان القيد مسجلاً مسبقاً (عبر مزامنة الأوفلاين)
+    // 🛡️ فحص Idempotency: إذا كان القيد مسجلاً مسبقاً نرجع الرصيد الحقيقي المعتمد بالسيرفر
       const existingEntry = await tx.get(entryRef);
       if (existingEntry.exists) {
         const existingData = existingEntry.data() || {};
@@ -2221,10 +2353,14 @@ const result = await db.runTransaction(async (tx) => {
           throw new HttpsError("permission-denied", "معرف القيد المالي مستخدم لحساب آخر");
         }
         if (existingData.type !== cleanType ||
-            Math.round(Number(existingData.amount) * 100) !== amountCents) {
+            Math.round(Number(existingData.amount) * 100) !== amountCents ||
+            (existingData.notes || null) !== normalizedNotes ||
+            !isDeepStrictEqual(existingData.items || [], sanitizedItems)) {
           throw new HttpsError("already-exists", "معرف القيد مستخدم لعملية مالية مختلفة");
         }
-        return { success: true, alreadyRecorded: true, entryId };
+        const custSnap = await tx.get(customerRef);
+        const currentBal = Number(custSnap.data()?.current_balance) || 0;
+        return { success: true, alreadyRecorded: true, entryId, newBalance: currentBal };
       }
 
       const customerSnap = await tx.get(customerRef);
@@ -2256,17 +2392,20 @@ const result = await db.runTransaction(async (tx) => {
       if (isDebt && creditLimit > 0 && newBalance > creditLimit) {
         console.warn(`[Ledger Warning] Customer ${cleanCustomerId} exceeded credit limit: ${newBalance} > ${creditLimit}`);
       }
-      const sanitizedItems = Array.isArray(items)
-        ? items.map((it) => ({
-            product_id: String(it.product_id || "").trim(),
-            name: String(it.name || it.product_name || "صنف").trim(),
-            quantity: Number(it.quantity) || 1,
-            unit_label: String(it.unit_label || "حبة").trim(),
-            unit_price: Number(it.unit_price) || 0,
-            subtotal: Number(it.subtotal) || 0,
-            carton_capacity: Number(it.carton_capacity) || 1,
-          }))
-        : [];
+      // ✅ التحقق الجنائي والمحاسبي الصارم: منع قيد أي فاتورة بنود لا يتطابق مجموعها مع المبلغ المطلوب
+      if (sanitizedItems.length > 0) {
+        const itemsSumCents = sanitizedItems.reduce(
+          (acc, it) => acc + Math.round((Number(it.subtotal) || 0) * 100),
+          0
+        );
+        if (itemsSumCents !== amountCents) {
+          throw new HttpsError(
+            "invalid-argument",
+            "إجمالي مبالغ الأصناف لا يتطابق مع إجمالي الفاتورة المقيد"
+          );
+        }
+      }
+
       const entryData = {
         id: entryId,
         merchant_id: merchantId,
@@ -2274,7 +2413,7 @@ const result = await db.runTransaction(async (tx) => {
         type: cleanType,
         amount: safeAmount,
         is_voided: false,
-        notes: notes ? String(notes).trim() : null,
+        notes: normalizedNotes,
         items: sanitizedItems,
         created_at: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
@@ -2283,11 +2422,16 @@ const result = await db.runTransaction(async (tx) => {
       // مما يلغي مصفوفة الـ 1500 نهائياً ويسمح بملايين المعاملات للزبون الواحد دون زيادة حجم الوثيقة
       const currentVersion = Number(customerData.ledger_version) || 0;
 
-  tx.set(entryRef, entryData);
+ tx.set(entryRef, entryData);
+
+      // 🔒 نافذة منزلقة (Sliding Window): الاحتفاظ بآخر 40 معرّفاً فقط لمنع تجاوز سقف الـ 1MB نهائياً
+      const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
+      const boundedApplied = [...existingApplied.slice(-39), entryId];
+
       tx.update(customerRef, {
         current_balance: newBalance,
         last_transaction_id: entryId,
-        applied_tx_ids: FieldValue.arrayUnion(entryId),
+        applied_tx_ids: boundedApplied,
         ledger_version: currentVersion + 1,
         last_applied_timestamp: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
@@ -2401,14 +2545,18 @@ exports.voidLedgerTransaction = onCall(
         updated_at: FieldValue.serverTimestamp(),
       });
 // 🔒 التخلص نهائياً من مصفوفة الـ 1500 والاعتماد على تسلسل الإصدار الخفيف (Lightweight OCC Ledger Versioning)
-      const currentVersion = Number(customerData.ledger_version) || 0;
-     tx.update(customerRef, {
-       current_balance: newBalance,
-       last_transaction_id: `void_${cleanEntryId}`,
-       applied_tx_ids: FieldValue.arrayUnion(`void_${cleanEntryId}`),
-       ledger_version: currentVersion + 1,
-       updated_at: FieldValue.serverTimestamp(),
-     });
+   const currentVersion = Number(customerData.ledger_version) || 0;
+      const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
+      const boundedApplied = [...existingApplied.slice(-39), `void_${cleanEntryId}`];
+
+      tx.update(customerRef, {
+        current_balance: newBalance,
+        last_transaction_id: `void_${cleanEntryId}`,
+        applied_tx_ids: boundedApplied,
+        ledger_version: currentVersion + 1,
+        last_applied_timestamp: FieldValue.serverTimestamp(),
+        updated_at: FieldValue.serverTimestamp(),
+      });
     // 3. التحديث الذري الشامل داخل نفس المعاملة (Atomic OCC)
       const oldDebtPortion = Math.max(0, currentBalance);
       const newDebtPortion = Math.max(0, newBalance);
@@ -2418,7 +2566,8 @@ exports.voidLedgerTransaction = onCall(
       const willBeDebt = newBalance > 0;
       const debtorsCountChange = (!wasDebt && willBeDebt) ? 1 : ((wasDebt && !willBeDebt) ? -1 : 0);
 
-      if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
+      if (customerData.is_deleted !== true &&
+          (debtPortionDelta !== 0 || debtorsCountChange !== 0)) {
         tx.set(summaryRef, {
           merchant_id: merchantId,
           total_market_debt: FieldValue.increment(debtPortionDelta),
@@ -2675,10 +2824,10 @@ exports.adminAddProduct = onCall(
       size_text: data.sizeText ? String(data.sizeText).trim() : null,
       image_url: data.imageUrl ? String(data.imageUrl).trim() : null,
      production_date: (data.productionDate && !isNaN(new Date(data.productionDate).getTime())) 
-          ? admin.firestore.Timestamp.fromDate(new Date(data.productionDate)) 
+          ? Timestamp.fromDate(new Date(data.productionDate))
           : null,
       expiry_date: (data.expiryDate && !isNaN(new Date(data.expiryDate).getTime())) 
-          ? admin.firestore.Timestamp.fromDate(new Date(data.expiryDate)) 
+          ? Timestamp.fromDate(new Date(data.expiryDate))
           : null,
       barcode: cleanMainBarcode || null,
       all_barcodes: Array.from(allBarcodes),
@@ -2838,13 +2987,13 @@ if (updates.barcode !== undefined || updates.units !== undefined) {
       if (updates.production_date !== undefined) {
         const pDate = new Date(updates.production_date);
         safeUpdates.production_date = (updates.production_date && !isNaN(pDate.getTime()))
-          ? admin.firestore.Timestamp.fromDate(pDate)
+          ? Timestamp.fromDate(pDate)
           : FieldValue.delete();
       }
       if (updates.expiry_date !== undefined) {
         const eDate = new Date(updates.expiry_date);
         safeUpdates.expiry_date = (updates.expiry_date && !isNaN(eDate.getTime()))
-          ? admin.firestore.Timestamp.fromDate(eDate)
+          ? Timestamp.fromDate(eDate)
           : FieldValue.delete();
       }
 // تعديل المخزون الذري المباشر أو النسبي مع الحماية والتدقيق
@@ -3292,7 +3441,7 @@ exports.saveOrderSignature = onCall(
           throw new HttpsError("invalid-argument", "ملف التوقيع غير صالح أو يتجاوز الحجم المسموح");
         }
 
-        const bucket = admin.storage().bucket();
+        const bucket = storage.bucket();
         const fileName = `signatures/order_${cleanOrderId}_${Date.now()}.png`;
         const file = bucket.file(fileName);
         const downloadToken = crypto.randomUUID();

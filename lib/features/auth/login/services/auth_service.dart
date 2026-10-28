@@ -14,6 +14,7 @@ import 'package:sala/core/services/catalog_service.dart';
 import 'package:sala/core/services/prefetch_service.dart';
 import 'package:sala/features/merchant/cart/providers/cart_provider.dart';
 import 'package:sala/features/merchant/search/services/search_service.dart';
+import 'package:sala/features/merchant/barcode/barcode_scanner_screen.dart';
 
 class OtpVerifyResponse {
   final bool success;
@@ -347,10 +348,11 @@ class AuthService {
     final targetContainer = container ?? RealtimeHub().container;
 
     try {
-      RealtimeHub().dispose();
+      // ✅ تصفير اشتراكات المستخدم وقنواته الحية مع بقاء محرك التطبيق جاهزاً للدخول التالي فوراً
+      await RealtimeHub().resetOnSignOut();
     } catch (error, stackTrace) {
       if (kDebugMode) {
-        debugPrint('[AuthService] RealtimeHub dispose failed: $error');
+        debugPrint('[AuthService] RealtimeHub resetOnSignOut failed: $error');
         debugPrintStack(stackTrace: stackTrace);
       }
     }
@@ -394,19 +396,21 @@ class AuthService {
     FirebaseService.clearCache();
     SearchService.clearCache();
     PrefetchService.instance.clear();
+    BarcodeIndexManager.instance
+        .rebuildIndex(); // 🔒 تصفير فهرس الباركود وإعادة تهيئته فارغاً
     if (targetContainer != null) {
-      targetContainer.invalidate(categoriesProvider);
-      targetContainer.invalidate(productsProvider);
-      targetContainer.invalidate(realtimeNotifsProvider);
-      targetContainer.invalidate(merchantOrdersProvider);
-      targetContainer.invalidate(cartProvider);
-      targetContainer.invalidate(realtimeCategoriesProvider);
-      targetContainer.invalidate(realtimeBrandsProvider);
-      // ✅ تصفير شامل لموفري السائق والإدارة لتفادي تسريب بيانات المستخدم السابق
-      targetContainer.invalidate(realtimeConfirmedOrdersProvider);
-      targetContainer.invalidate(realtimeMyShippedOrdersProvider);
-      targetContainer.invalidate(realtimeAllOrdersProvider);
-      targetContainer.invalidate(driverNewOrderCallbackProvider);
+      // 🔒 إعادة تعيين قسري فوري للحاويات لإلغاء أي اشتراكات حية وتطهير الذاكرة
+      targetContainer.refresh(categoriesProvider);
+      targetContainer.refresh(productsProvider(null));
+      targetContainer.refresh(realtimeNotifsProvider);
+      targetContainer.refresh(merchantOrdersProvider);
+      targetContainer.refresh(cartProvider);
+      targetContainer.refresh(realtimeCategoriesProvider);
+      targetContainer.refresh(realtimeBrandsProvider);
+      targetContainer.refresh(realtimeConfirmedOrdersProvider);
+      targetContainer.refresh(realtimeMyShippedOrdersProvider);
+      targetContainer.refresh(realtimeAllOrdersProvider);
+      targetContainer.refresh(driverNewOrderCallbackProvider);
     }
   }
 
@@ -418,7 +422,8 @@ class AuthService {
     try {
       // 🚀 استخدام Cloud Function لحذف الحساب ذرياً وبشكل آمن من الخادم
       // (يجب أن تتأكد من كتابة دالة 'deleteUserAccount' في ملف index.js في Firebase)
-      final callable = FirebaseFunctions.instance.httpsCallable(
+      final callable =
+          FirebaseFunctions.instanceFor(region: 'us-central1').httpsCallable(
         'deleteUserAccount',
         options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
       );

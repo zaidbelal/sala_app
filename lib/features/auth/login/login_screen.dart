@@ -11,11 +11,8 @@ import '../../../core/constants/app_adaptive_colors.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:sala/app_router.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:sala/core/services/notification_service.dart';
 import 'package:sala/core/services/local_storage.dart';
 import 'dart:async';
-import 'package:sala/core/services/realtime_hub.dart';
 
 class LoginScreen extends ConsumerStatefulWidget {
   final String? errorMessage;
@@ -53,11 +50,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen>
     if (AppStorage.isLoggedIn && AppStorage.isSessionExpired) {
       Future.microtask(() async {
         try {
-          final uid = AppStorage.userId;
-          RealtimeHub().dispose(); // تصريف المستمعات فوراً لمنع التسريب
-          await NotificationService.instance.detachTokenFromFirestore(uid);
-          await FirebaseAuth.instance.signOut();
-          await AppStorage.clearUserData();
+          await ref.read(authServiceProvider).signOut();
         } catch (_) {}
       });
     }

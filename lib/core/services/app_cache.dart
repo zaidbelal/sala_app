@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart'; // لـ compute()
 import 'package:path_provider/path_provider.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:sala/core/services/local_storage.dart';
 
 // ══════════════════════════════════════════════════════════
 // AppCache — نظام كاش ثلاثي الطبقات بسرعة الضوء
@@ -23,10 +24,26 @@ class AppCache {
   AppCache._();
   static final AppCache instance = AppCache._();
 
-  // ── الطبقة الأولى: ذاكرة RAM ──
+  // ── الطبقة الأولى: ذاكرة RAM المحمية من التضخم ──
   final Map<String, _CacheEntry> _ram = {};
+  static const int _maxRamEntries =
+      120; // سقف أمان يمنع تجاوز الذاكرة العشوائية
 
   SharedPreferences? _prefs;
+
+  void _pruneRamIfNeeded() {
+    if (_ram.length <= _maxRamEntries) return;
+    // حذف المدخلات الأقدم لحماية ذاكرة الهاتف (LRU Cache Pruning)
+    final sortedKeys = _ram.keys.toList()
+      ..sort((a, b) => _ram[a]!.savedAt.compareTo(_ram[b]!.savedAt));
+    final keysToRemove = sortedKeys.take(_ram.length - _maxRamEntries);
+    for (final k in keysToRemove) {
+      // لا نحذف المفاتيح الحيوية الأساسية
+      if (k != _keyCategories && k != _keyBrands && k != _keyProducts) {
+        _ram.remove(k);
+      }
+    }
+  }
 
   // 🚀 مدة صلاحية متوازنة تمنع تعارض الأسعار عند الشراء وتدعم العمل المؤقت دون إنترنت
   static const Duration _categoryTtl = Duration(minutes: 30);
@@ -256,24 +273,55 @@ class AppCache {
   }
 
   Future<void> invalidateProducts() async {
-    _ram.removeWhere(
-        (key, _) => key == _keyProducts || key.startsWith('${_keyProducts}_'));
-    final prefs = _prefs;
-    if (prefs != null) {
-      final keys = prefs
-          .getKeys()
-          .where((k) =>
-              k.startsWith('${_keyProducts}_ts') || k == '${_keyProducts}_ts')
-          .toList();
-      for (final k in keys) {
-        await prefs.remove(k);
+    final previousLock = _productsWriteLock;
+    final completer = Completer<void>();
+    _productsWriteLock = completer.future;
+
+    try {
+      await previousLock;
+    } catch (_) {}
+
+    try {
+      final productCacheKeys = <String>{
+        _keyProducts,
+        ..._ram.keys.where((key) => key.startsWith('${_keyProducts}_')),
+      };
+      final prefs = _prefs;
+      if (prefs != null) {
+        productCacheKeys.addAll(prefs.getKeys().where((key) =>
+            key == _keyProducts || key.startsWith('${_keyProducts}_')));
       }
+
+      _ram.removeWhere((key, _) =>
+          key == _keyProducts || key.startsWith('${_keyProducts}_'));
+      if (prefs != null) {
+        for (final key in productCacheKeys) {
+          await prefs.remove(key);
+        }
+      }
+
+      if (!kIsWeb) {
+        final dir = await getApplicationDocumentsDirectory();
+        await for (final entity in dir.list()) {
+          final name = entity.uri.pathSegments.last;
+          final isProductCacheFile = (name == '$_keyProducts.json' ||
+                  name.startsWith('${_keyProducts}_')) &&
+              name.endsWith('.json');
+          if (isProductCacheFile && entity is File) {
+            await entity.delete();
+          }
+        }
+      }
+    } finally {
+      completer.complete();
     }
   }
 
-  /// جلب كافة المنتجات المخزنة محلياً في ذاكرة الهاتف لخدمة البحث والباركود الفوري
+  /// جلب كافة المنتجات المخزنة محلياً في ذاكرة RAM مع القراءة المباشرة من القرص إن كانت الذاكرة فارغة
   List<Map<String, dynamic>> getAllCachedProducts() {
     final Map<String, Map<String, dynamic>> byId = {};
+
+    // 1. محاولة القراءة من RAM
     for (final entry in _ram.entries) {
       if (entry.key == _keyProducts ||
           entry.key.startsWith('${_keyProducts}_')) {
@@ -289,6 +337,29 @@ class AppCache {
         }
       }
     }
+
+    // 2. إذا كانت الـ RAM غير مكتملة، القراءة المتزامنة المباشرة من القرص
+    if (byId.isEmpty && !kIsWeb) {
+      try {
+        final path = AppStorage.appDocsPath;
+        if (path != null) {
+          final file = File('$path/$_keyProducts.json');
+          if (file.existsSync()) {
+            final raw = file.readAsStringSync();
+            final decoded = _decodeJson(raw);
+            if (decoded != null) {
+              for (final p in decoded) {
+                final id = p['id']?.toString();
+                if (id != null && id.isNotEmpty) {
+                  byId[id] = p;
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
     return byId.values.toList();
   }
 
@@ -317,6 +388,7 @@ class AppCache {
 
   Future<void> _set(String key, List<Map<String, dynamic>> data) async {
     await _saveToDisk(key, data);
+    _pruneRamIfNeeded();
     _ram[key] = _CacheEntry(
       data: data,
       savedAt: DateTime.now(),

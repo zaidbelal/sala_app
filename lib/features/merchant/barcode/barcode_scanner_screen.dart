@@ -13,23 +13,15 @@ class SupermarketSoundHelper {
   SupermarketSoundHelper._();
   static AudioPlayer? _audioPlayer;
 
-  static AudioPlayer get _player {
-    if (_audioPlayer == null) {
-      _audioPlayer = AudioPlayer();
-      _audioPlayer!.setReleaseMode(ReleaseMode.stop);
-    }
-    return _audioPlayer!;
-  }
-
   static Future<void> playSupermarketBeep() async {
     HapticFeedback.mediumImpact();
     try {
-      final p = _player;
-      await p.stop();
-      await p.setVolume(1.0); // 👈 أعلى درجة صوت 100%
-      await p.play(
+      _audioPlayer ??= AudioPlayer()..setReleaseMode(ReleaseMode.stop);
+      await _audioPlayer!.stop();
+      await _audioPlayer!.setVolume(1.0);
+      await _audioPlayer!.play(
         AssetSource('sounds/beep.mp3'),
-        mode: PlayerMode.lowLatency, // 👈 استجابة فورية 0ms كأجهزة السوبرماركت
+        mode: PlayerMode.lowLatency,
       );
     } catch (_) {
       try {
@@ -40,6 +32,17 @@ class SupermarketSoundHelper {
 
   static void playRetryFeedback() {
     HapticFeedback.selectionClick();
+  }
+
+  /// ✅ تحرير فوري ودائم لموارد الأجهزة والصوت في نظام التشغيل
+  static Future<void> releasePlayer() async {
+    if (_audioPlayer != null) {
+      try {
+        await _audioPlayer!.stop();
+        await _audioPlayer!.dispose();
+      } catch (_) {}
+      _audioPlayer = null;
+    }
   }
 }
 
@@ -262,6 +265,8 @@ class _BarcodeScannerScreenState extends State<BarcodeScannerScreen>
     _focusResetTimer?.cancel();
     _laserAnimCtrl.dispose();
     _controller.dispose();
+    SupermarketSoundHelper
+        .releasePlayer(); // 🔒 إغلاق وتفريغ المشغل الصوتي فوراً
     super.dispose();
   }
 
@@ -343,6 +348,7 @@ class _BarcodeScannerScreenState extends State<BarcodeScannerScreen>
 
     // إذا تم مسح نفس الكود غير المطابق قبل أقل من 750ms نترك الكاميرا تبحث عن كود آخر فوراً دون تجميد
     final now = DateTime.now();
+    _pruneUnmatchedCodes(now, protectedCode: code);
     final lastFailedAt = _unmatchedCodesCooldown[code];
     if (lastFailedAt != null &&
         now.difference(lastFailedAt).inMilliseconds < 750) {
@@ -350,6 +356,21 @@ class _BarcodeScannerScreenState extends State<BarcodeScannerScreen>
     }
 
     unawaited(_processScannedCode(code));
+  }
+
+  void _pruneUnmatchedCodes(DateTime now, {required String protectedCode}) {
+    _unmatchedCodesCooldown.removeWhere(
+      (_, failedAt) =>
+          now.difference(failedAt) >= const Duration(milliseconds: 750),
+    );
+    if (_unmatchedCodesCooldown.length < 128) return;
+
+    final oldest = _unmatchedCodesCooldown.entries
+        .where((entry) => entry.key != protectedCode)
+        .reduce(
+          (a, b) => a.value.isBefore(b.value) ? a : b,
+        );
+    _unmatchedCodesCooldown.remove(oldest.key);
   }
 
   Future<void> _processScannedCode(String code) async {

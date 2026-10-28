@@ -13,8 +13,6 @@ class ConnectivityHelper {
         return false;
       }
 
-      // فحص سريع ومباشر على IP عالمي (Cloudflare DNS) بمهلة 1200ms
-      // تجاوز فحص أسماء النطاق (DNS) الذي يعلق طويلاً على شبكات الواي فاي المفصولة
       final socket = await Socket.connect(
         '1.1.1.1',
         443,
@@ -41,5 +39,46 @@ class ConnectivityHelper {
     return Connectivity().onConnectivityChanged.map(
           (results) => results.any((r) => r != ConnectivityResult.none),
         );
+  }
+
+  /// 🔒 المصنف المركزي الشامل: يكشف كافة أشكال أخطاء الشبكة والمهلة (عربية، إنجليزية، ونظامية)
+  static bool isNetworkException(Object? error) {
+    if (error == null) return false;
+
+    // 1. استثناءات الدفتر المؤمّنة أوفلاين
+    if (error.runtimeType.toString().contains('LedgerQueuedException'))
+      return true;
+
+    // 2. استثناءات الإدخال/الإخراج والمهلة الصريحة
+    if (error is SocketException ||
+        error is TimeoutException ||
+        error is HttpException) {
+      return true;
+    }
+
+    final errStr = error.toString().toLowerCase();
+
+    // 3. استثناءات Firebase Cloud Functions و Firestore
+    if (errStr.contains('unavailable') &&
+        !errStr.contains('product_unavailable')) return true;
+    if (errStr.contains('deadline-exceeded') ||
+        errStr.contains('network-request-failed') ||
+        errStr.contains('network_error') ||
+        errStr.contains('retry exhausted') ||
+        errStr.contains('channel error') ||
+        errStr.contains('connection closed') ||
+        errStr.contains('connection reset') ||
+        errStr.contains('host lookup')) {
+      return true;
+    }
+
+    // 4. مطابقة النصوص العربية الناتجة عن تعثر الاتصال
+    return errStr.contains('لا يوجد اتصال') ||
+        errStr.contains('انقطع الاتصال') ||
+        errStr.contains('تعذر الاتصال') ||
+        errStr.contains('انتهت المهلة') ||
+        errStr.contains('فشل الاتصال') ||
+        errStr.contains('غير متصل') ||
+        errStr.contains('تحقق من اتصال');
   }
 }

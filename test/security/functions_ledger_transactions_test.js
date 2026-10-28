@@ -138,6 +138,50 @@ async function main() {
     { ...debtPayload, amount: 99 },
     account.idToken,
   );
+  await expectFunctionFailure(
+    "recordLedgerTransaction",
+    { ...debtPayload, notes: "different transaction" },
+    account.idToken,
+  );
+  await expectFunctionFailure(
+    "recordLedgerTransaction",
+    {
+      ...debtPayload,
+      items: [
+        {
+          product_id: "different-product",
+          name: "Different product",
+          quantity: 1,
+          unit_label: "piece",
+          unit_price: 12.34,
+          subtotal: 12.34,
+          carton_capacity: 1,
+        },
+      ],
+    },
+    account.idToken,
+  );
+  await expectFunctionFailure(
+    "recordLedgerTransaction",
+    {
+      transactionId: "invalid-ledger-item",
+      customerId,
+      type: "debt",
+      amount: 12.34,
+      items: [
+        {
+          product_id: "invalid-quantity",
+          name: "Invalid quantity",
+          quantity: -1,
+          unit_label: "piece",
+          unit_price: 12.34,
+          subtotal: 12.34,
+          carton_capacity: 1,
+        },
+      ],
+    },
+    account.idToken,
+  );
 
   const paymentId = "concurrent-payment-entry";
   const paymentResults = await Promise.all(
@@ -204,6 +248,46 @@ async function main() {
     account.idToken,
   );
   assert.equal(reconciliation.reconciled, true);
+
+  const debtBeforeDeleteId = "debt-before-customer-delete";
+  await callFunction(
+    "recordLedgerTransaction",
+    {
+      transactionId: debtBeforeDeleteId,
+      customerId,
+      type: "debt",
+      amount: 5,
+    },
+    account.idToken,
+  );
+  await callFunction(
+    "deleteLedgerCustomer",
+    { customerId },
+    account.idToken,
+  );
+  summary = await readDocument(
+    `merchant_ledger_summaries/${account.localId}`,
+    account.idToken,
+  );
+  assert.equal(numericField(summary, "total_market_debt"), 0);
+  assert.equal(numericField(summary, "debtors_count"), 0);
+
+  await callFunction(
+    "voidLedgerTransaction",
+    { customerId, entryId: debtBeforeDeleteId },
+    account.idToken,
+  );
+  customer = await readDocument(
+    `merchant_customers/${customerId}`,
+    account.idToken,
+  );
+  assert.equal(numericField(customer, "current_balance"), 0);
+  summary = await readDocument(
+    `merchant_ledger_summaries/${account.localId}`,
+    account.idToken,
+  );
+  assert.equal(numericField(summary, "total_market_debt"), 0);
+  assert.equal(numericField(summary, "debtors_count"), 0);
 
   const deleteCustomerResponse = await firestoreRequest(
     `merchant_customers/${customerId}?updateMask.fieldPaths=is_deleted`,

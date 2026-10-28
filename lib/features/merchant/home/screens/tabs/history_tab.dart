@@ -248,10 +248,6 @@ class _HistoryTabState extends ConsumerState<HistoryTab> {
         }
 
         final orderDocs = orderSnap.data ?? [];
-        if (_olderOrders.isEmpty) {
-          _ordersCursor = null;
-          _hasMoreOrders = orderDocs.length == _historyPageSize;
-        }
         final ordersById = <String, OrderModel>{
           ..._olderOrders,
           for (final order in orderDocs) order.id: order,
@@ -268,10 +264,6 @@ class _HistoryTabState extends ConsumerState<HistoryTab> {
           stream: _returnsStream,
           builder: (context, returnSnap) {
             final rawReturns = returnSnap.data ?? [];
-            if (_olderReturns.isEmpty) {
-              _returnsCursor = null;
-              _hasMoreReturns = rawReturns.length == _historyPageSize;
-            }
             final returnsById = <String, ReturnInvoiceModel>{
               ..._olderReturns,
               for (final rawReturn in rawReturns)

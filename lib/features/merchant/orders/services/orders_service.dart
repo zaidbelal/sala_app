@@ -5,7 +5,9 @@ import 'package:sala/core/services/app_cache.dart';
 import 'package:sala/core/services/wal_service.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:sala/core/services/local_storage.dart';
+import 'package:sala/core/services/connectivity_service.dart';
 
 class OrdersService {
   static final _db = FirebaseFirestore.instance;
@@ -32,10 +34,9 @@ class OrdersService {
 // ════════════════════════════════════════
   // استلام السائق للطلب (عبر السيرفر حصراً)
   // ════════════════════════════════════════
+// ✅ عقد برمجي موثق ومطابق للسيرفر: يتم التحقق من السائق عبر سياق المصادقة السحابي
   static Future<void> assignOrderToDriver({
     required String orderId,
-    String? driverId,
-    String? driverName,
   }) async {
     final cleanOrderId = orderId.trim();
     if (cleanOrderId.isEmpty) throw ArgumentError('معرّف الطلب غير صالح');
@@ -103,6 +104,7 @@ class OrdersService {
       },
     );
 
+    OrderModel? createdOrder;
     try {
       final callable = FirebaseFunctions.instanceFor(region: 'us-central1')
           .httpsCallable('placeOrder',
@@ -118,30 +120,40 @@ class OrdersService {
 
       final data = Map<String, dynamic>.from(response.data as Map);
       final orderMap = Map<String, dynamic>.from(data['order'] as Map);
+      createdOrder = OrderModel.fromJson(orderMap);
 
       if (markWalCommitted) {
-        await WalService.instance.markCommitted(resolvedOrderId);
+        try {
+          await WalService.instance.markCommitted(resolvedOrderId);
+        } catch (error, stackTrace) {
+          debugPrint('Order exists but its WAL marker could not be written: '
+              '$error\n$stackTrace');
+        }
       }
-      await AppCache.instance.invalidateProducts();
+      try {
+        await AppCache.instance.invalidateProducts();
+      } catch (error, stackTrace) {
+        debugPrint('Order exists but product cache invalidation failed: '
+            '$error\n$stackTrace');
+      }
 
-      return OrderModel.fromJson(orderMap);
+      return createdOrder;
     } catch (e) {
+      if (createdOrder != null) {
+        return createdOrder;
+      }
       final err = e.toString().toLowerCase();
 
-      // 🔒 عزل صارم لأخطاء المنتجات والمخزون عن أخطاء الشبكة لمنع تجميد الـ WAL
+      // تمييز أخطاء نفاد المخزون وعدم توفر الأصناف
       final bool isStockOrProductIssue = err.contains('product_unavailable') ||
           err.contains('out_of_stock') ||
-          err.contains('صنف') ||
-          err.contains('غير متوفر');
+          err.contains('resource-exhausted') ||
+          err.contains('failed-precondition');
 
-      final bool isNetworkIssue = !isStockOrProductIssue &&
-          (err.contains('network') ||
-              err.contains('timeout') ||
-              err.contains('socket') ||
-              err.contains('deadline-exceeded') ||
-              (err.contains('unavailable') &&
-                  !err.contains('product_unavailable')));
+      final bool isNetworkIssue =
+          !isStockOrProductIssue && ConnectivityHelper.isNetworkException(e);
 
+      // 🔒 لا يتم شطب المعاملة من WAL إذا كان الخطأ مجرد انقطاع في الشبكة للحفاظ على حق التاجر
       if (!isNetworkIssue) {
         await WalService.instance.markAborted(resolvedOrderId);
       }
@@ -184,15 +196,20 @@ class OrdersService {
     List<String> statuses,
   ) {
     if (statuses.isEmpty) return const Stream.empty();
+    if (statuses.length > 30) {
+      throw ArgumentError.value(
+          statuses.length, 'statuses', 'Firestore supports at most 30 values');
+    }
 
     return _db
         .collection('orders')
         .where('merchant_id', isEqualTo: merchantId)
+        .where('status', whereIn: statuses)
+        .orderBy('created_at', descending: true)
         .limit(200)
         .snapshots(includeMetadataChanges: false)
         .map((snap) {
       final list = snap.docs
-          .where((d) => statuses.contains(d.data()['status']?.toString()))
           .map((d) => OrderModel.fromJson({'id': d.id, ...d.data()}))
           .toList();
       list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
@@ -236,6 +253,7 @@ class OrdersService {
         .collection('orders')
         .where('merchant_id', isEqualTo: merchantId)
         .where('status', isEqualTo: status)
+        .orderBy('created_at', descending: true)
         .limit(200)
         .get(const GetOptions(source: Source.serverAndCache));
     final list = snap.docs.map((d) => {'id': d.id, ...d.data()}).toList();
@@ -258,15 +276,28 @@ class OrdersService {
     required String merchantId,
     required List<String> statuses,
   }) async {
-    final snap = await _db
-        .collection('orders')
-        .where('merchant_id', isEqualTo: merchantId)
-        .limit(200)
-        .get(const GetOptions(source: Source.serverAndCache));
-    final list = snap.docs
-        .where((d) => statuses.contains(d.data()['status']?.toString()))
-        .map((d) => {'id': d.id, ...d.data()})
-        .toList();
+    if (statuses.isEmpty) return [];
+
+    final statusGroups = <List<String>>[
+      for (var i = 0; i < statuses.length; i += 30)
+        statuses.skip(i).take(30).toList(),
+    ];
+    final snapshots = await Future.wait(statusGroups.map((group) {
+      return _db
+          .collection('orders')
+          .where('merchant_id', isEqualTo: merchantId)
+          .where('status', whereIn: group)
+          .orderBy('created_at', descending: true)
+          .limit(200)
+          .get(const GetOptions(source: Source.serverAndCache));
+    }));
+    final docsById = <String, QueryDocumentSnapshot<Map<String, dynamic>>>{};
+    for (final snap in snapshots) {
+      for (final doc in snap.docs) {
+        docsById[doc.id] = doc;
+      }
+    }
+    final list = docsById.values.map((d) => {'id': d.id, ...d.data()}).toList();
     list.sort((a, b) {
       final aDate = a['created_at'] is Timestamp
           ? (a['created_at'] as Timestamp).toDate()
@@ -276,7 +307,7 @@ class OrdersService {
           : DateTime(2000);
       return bDate.compareTo(aDate);
     });
-    return list;
+    return list.take(200).toList();
   }
 
 // ════════════════════════════════════════

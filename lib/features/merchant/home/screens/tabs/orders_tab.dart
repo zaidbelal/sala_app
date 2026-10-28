@@ -110,7 +110,9 @@ class _OrdersTabState extends ConsumerState<OrdersTab>
 
   @override
   void dispose() {
-    _tabController.animation?.removeListener(_onTabAnimation);
+    try {
+      _tabController.animation?.removeListener(_onTabAnimation);
+    } catch (_) {}
     _tabController.dispose();
     super.dispose();
   }

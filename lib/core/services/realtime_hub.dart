@@ -3,6 +3,7 @@
 // ==================================================
 
 import 'dart:async';
+import 'dart:collection';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
@@ -555,7 +556,7 @@ class RealtimeHub {
 
   void _watchConfirmedOrders() {
     bool firstLoad = true;
-    Set<String> seenIds = {};
+    final seenIds = LinkedHashSet<String>();
 
     final sub = _db
         .collection('orders')
@@ -579,7 +580,9 @@ class RealtimeHub {
         _container?.read(realtimeConfirmedOrdersProvider.notifier).update(data);
         _setConnected();
 
-        final currentIds = {for (final d in snap.docs) d.id};
+        final currentIds = LinkedHashSet<String>.from(
+          snap.docs.map((doc) => doc.id),
+        );
         if (!firstLoad) {
           final newIds = currentIds.difference(seenIds);
           for (final id in newIds) {
@@ -597,9 +600,13 @@ class RealtimeHub {
           }
         }
         firstLoad = false;
-        seenIds.addAll(currentIds);
-        if (seenIds.length > 500) {
-          seenIds = currentIds;
+        for (final id in currentIds) {
+          seenIds
+            ..remove(id)
+            ..add(id);
+        }
+        while (seenIds.length > 500) {
+          seenIds.remove(seenIds.first);
         }
       },
       onError: (e) {
@@ -669,6 +676,8 @@ class RealtimeHub {
   Future<void> _restartAsync() async {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
 
     await _categoriesSub?.cancel();
     _categoriesSub = null;
@@ -676,6 +685,8 @@ class RealtimeHub {
     _brandsSub = null;
     await _notificationsSub?.cancel();
     _notificationsSub = null;
+    await _profileSub?.cancel();
+    _profileSub = null; // 🔒 منع تسريب مؤشر الملف الشخصي في الذاكرة
 
     final subscriptions = List<StreamSubscription>.from(_userSubs);
     _userSubs.clear();
@@ -692,56 +703,63 @@ class RealtimeHub {
     }
   }
 
-  // ── الإيقاف الكامل وتطهير كافة مراجع الذاكرة والاشتراكات بحل قطعي ──
-  void dispose() {
+// ✅ التطهير التام للجلسة مع الحفاظ على القنوات الحية للتطبيق بعد تسجيل الخروج
+  Future<void> resetOnSignOut() async {
+    final container = _container;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
 
-    _connectivitySub?.cancel();
-    _connectivitySub = null;
+    final subsToCancel = <StreamSubscription?>[
+      _profileSub,
+      _notificationsSub,
+      _categoriesSub,
+      _brandsSub,
+      ..._userSubs,
+    ];
 
-    _profileSub?.cancel();
     _profileSub = null;
-
-    _notificationsSub?.cancel();
     _notificationsSub = null;
-
-    _categoriesSub?.cancel();
     _categoriesSub = null;
-
-    _brandsSub?.cancel();
     _brandsSub = null;
-
-    for (final s in _userSubs) {
-      try {
-        s.cancel();
-      } catch (_) {}
-    }
     _userSubs.clear();
 
-    final c = _container;
-    if (c != null) {
+    await Future.wait(
+      subsToCancel
+          .whereType<StreamSubscription>()
+          .map((s) => s.cancel().catchError((_) {})),
+    );
+
+    if (container != null) {
       try {
-        c.read(merchantOrdersProvider.notifier).clear();
-        c.read(realtimeNotifsProvider.notifier).clear();
-        c.read(realtimeAllOrdersProvider.notifier).clear();
-        c.read(realtimeConfirmedOrdersProvider.notifier).clear();
-        c.read(realtimeMyShippedOrdersProvider.notifier).clear();
-        c.read(realtimeCategoriesProvider.notifier).update([]);
-        c.read(realtimeBrandsProvider.notifier).update([]);
-        c.read(realtimeProductsProvider.notifier).update([]);
-        c.read(driverNewOrderCallbackProvider.notifier).state = null;
-        c.read(realtimeStatusProvider.notifier).state =
+        container.read(merchantOrdersProvider.notifier).clear();
+        container.read(realtimeNotifsProvider.notifier).clear();
+        container.read(realtimeAllOrdersProvider.notifier).clear();
+        container.read(realtimeConfirmedOrdersProvider.notifier).clear();
+        container.read(realtimeMyShippedOrdersProvider.notifier).clear();
+        container.read(driverNewOrderCallbackProvider.notifier).state = null;
+        container.read(realtimeStatusProvider.notifier).state =
             RealtimeStatus.disconnected;
       } catch (_) {}
     }
 
     _activeUserId = null;
     _activeUserRole = null;
-    _initialized = false;
     reconnectAttempts = 0;
+    _initialized = false;
+  }
+
+  Future<void> dispose() async {
+    await resetOnSignOut();
+    await _connectivitySub?.cancel();
+    _connectivitySub = null;
+    await _categoriesSub?.cancel();
+    _categoriesSub = null;
+    await _brandsSub?.cancel();
+    _brandsSub = null;
+    _initialized = false;
+    _container = null;
   }
 }
 

@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:sala/core/constants/app_colors.dart';
 import 'package:sala/core/services/local_storage.dart';
+import 'package:sala/core/services/connectivity_service.dart';
 import '../widgets/new_order_sheet.dart';
 import 'driver_order_detail_screen.dart';
 import 'driver_stats_screen.dart';
@@ -40,10 +41,26 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
   void initState() {
     super.initState();
     _tabCtrl = TabController(length: 2, vsync: this);
+
+    _ordersSubscription = ref.listenManual<List<Map<String, dynamic>>>(
+      realtimeConfirmedOrdersProvider,
+      (prev, next) {
+        if (prev == null) return;
+        final prevIds = prev.map((e) => e['id']).toSet();
+        final newOrders = next.where((e) => !prevIds.contains(e['id']));
+        for (final order in newOrders) {
+          final assignedDriver = order['driver_id'] as String?;
+          if (assignedDriver == null || assignedDriver.isEmpty) {
+            _onNewOrder(order['id'] ?? '', order);
+          }
+        }
+      },
+    );
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _syncPendingDeliveries();
     });
-    // ✅ الاستماع لعودة الإنترنت لمزامنة تسليمات الأوفلاين تلقائياً بدون إعادة تشغيل التطبيق
+
     _driverConnectivitySub =
         Connectivity().onConnectivityChanged.listen((results) {
       final hasNet = !results.every((r) => r == ConnectivityResult.none);
@@ -134,6 +151,7 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
     _ordersSubscription = null;
     _driverConnectivitySub.cancel();
     _tabCtrl.dispose();
+    _newOrderQueue.clear();
     super.dispose();
   }
 
@@ -185,26 +203,6 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
   }
 
   ProviderSubscription? _ordersSubscription;
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    _ordersSubscription?.close();
-    _ordersSubscription = ref.listenManual<List<Map<String, dynamic>>>(
-      realtimeConfirmedOrdersProvider,
-      (prev, next) {
-        if (prev == null) return;
-        final prevIds = prev.map((e) => e['id']).toSet();
-        final newOrders = next.where((e) => !prevIds.contains(e['id']));
-        for (final order in newOrders) {
-          final assignedDriver = order['driver_id'] as String?;
-          if (assignedDriver == null || assignedDriver.isEmpty) {
-            _onNewOrder(order['id'] ?? '', order);
-          }
-        }
-      },
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -550,8 +548,6 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
     try {
       await OrdersService.assignOrderToDriver(
         orderId: orderId,
-        driverId: driverId,
-        driverName: AppStorage.userName ?? 'مندوب سلة',
       ).timeout(const Duration(seconds: 10));
 
       closeLoadingDialog();
@@ -782,13 +778,10 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
           await OrdersService.assignOrderToDriver(orderId: orderId)
               .timeout(const Duration(seconds: 12));
         } else {
-          final netResults = await Connectivity().checkConnectivity().timeout(
-              const Duration(seconds: 2),
-              onTimeout: () => [ConnectivityResult.none]);
-          final bool isOffline =
-              netResults.every((r) => r == ConnectivityResult.none);
+          // 🔒 اختبار الاتصال الفعلي بالإنترنت عبر المقبس الحي
+          final bool hasInternet = await ConnectivityHelper.hasActiveInternet();
 
-          if (isOffline) {
+          if (!hasInternet) {
             await AppStorage.savePendingDriverDelivery(
               orderId,
               signatureUrl: signatureUrl,
@@ -797,7 +790,7 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
             if (mounted) {
               ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
                 content: Text(
-                  'أنت أوفلاين: تم حفظ التسليم والتوقيع وسيُرسل تلقائياً عند عودة الشبكة 📡',
+                  'أنت أوفلاين: تم تأمين التسليم والتوقيع وسيُرحل تلقائياً فور توفر الشبكة 📡',
                   style: TextStyle(
                       fontFamily: 'Cairo', fontWeight: FontWeight.bold),
                 ),
@@ -808,18 +801,13 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
             return true;
           } else {
             try {
-              // السيرفر سيتولى تحويل التوقيع إلى Storage URL واعتماد الأرباح فوراً
               await OrdersService.deliverOrderByDriver(
                 orderId: orderId,
                 signatureUrl: signatureUrl,
               ).timeout(const Duration(seconds: 20));
             } catch (err) {
-              final errStr = err.toString().toLowerCase();
-              final bool isNetworkIssue = errStr.contains('network') ||
-                  errStr.contains('timeout') ||
-                  errStr.contains('unavailable') ||
-                  errStr.contains('socket');
-              if (isNetworkIssue) {
+              // 🔒 في حال سقط الاتصال أثناء محاولة التسليم يتم الاحتفاظ بالتوقيع وإسناده لطابور الأوفلاين فوراً
+              if (ConnectivityHelper.isNetworkException(err)) {
                 await AppStorage.savePendingDriverDelivery(
                   orderId,
                   signatureUrl: signatureUrl,
@@ -828,7 +816,7 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
                     content: Text(
-                      'أنت أوفلاين: تم حفظ التسليم وسيُرسل تلقائياً عند عودة الشبكة 📡',
+                      'ضعف في الاتصال: تم حفظ التسليم والتوقيع بأمان وسيُرسل تلقائياً 📡',
                       style: TextStyle(
                           fontFamily: 'Cairo', fontWeight: FontWeight.bold),
                     ),

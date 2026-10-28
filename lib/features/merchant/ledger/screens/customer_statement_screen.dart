@@ -52,7 +52,8 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
     HapticFeedback.lightImpact();
     final updatedCustomer = await showDialog<LedgerCustomer>(
       context: context,
-      barrierDismissible: true,
+      barrierDismissible:
+          false, // ✅ حظر النقر العرضي على الخلفية أثناء المعالجة المالية
       builder: (_) => _AddLedgerEntryDialog(
         customer: currentCustomer,
         isDebt: isDebt,
@@ -335,8 +336,9 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   return;
                 }
                 if (context.mounted) {
+                  final messenger = ScaffoldMessenger.of(context);
                   Navigator.pop(context);
-                  ScaffoldMessenger.of(context).showSnackBar(
+                  messenger.showSnackBar(
                     SnackBar(
                       content: Text(
                         queuedMessage ??
@@ -421,34 +423,52 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
 // 🔒 احتساب العمليات غير المتزامنة دائماً لمنع إخفاء القيود المعلقة عند ضعف الشبكة وتجنب التكرار
                   final pendingTxs =
                       AppStorage.getPendingLedgerTxs(_customer.merchantId)
-                          .where((t) => t['customer_id'] == _customer.id);
-                  double pendingDelta = 0.0;
+                          .where((t) => t['customer_id'] == _customer.id)
+                          .toList();
+
+                  // حصر جميع القيود التي صدر لها أمر شطب معلق
+                  final pendingVoidTargetIds = pendingTxs
+                      .where((t) => t['type'] == 'void_request')
+                      .map((t) => t['target_entry_id']?.toString() ?? '')
+                      .where((id) => id.isNotEmpty)
+                      .toSet();
+
+                  int pendingDeltaCents = 0;
+
                   for (final tx in pendingTxs) {
                     final txType = tx['type']?.toString();
                     final txId = tx['id']?.toString() ?? '';
+                    final amtCents = LedgerCustomer.toCents(
+                        (tx['amount'] as num?)?.toDouble() ?? 0.0);
 
-                    if (txType == 'add_customer' ||
-                        txType == 'delete_customer') {
+                    if (txType == 'add_customer' || txType == 'delete_customer')
+                      continue;
+
+                    // تجاهل الحركات المعتمدة بالسيرفر أو المحذوفة
+                    if (serverAppliedIds.contains(txId) ||
+                        _locallyDismissedEntryIds.contains(txId)) {
                       continue;
                     }
 
                     if (txType == 'void_request') {
-                      final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-                      final isDebt = tx['is_debt'] != false;
-                      pendingDelta += isDebt ? -amt : amt;
+                      final targetId = tx['target_entry_id']?.toString() ?? '';
+                      // يُحسب الشطب فقط إذا كان القيد المستهدف معتمداً لدى السيرفر
+                      if (serverAppliedIds.contains(targetId)) {
+                        final isDebt = tx['is_debt'] != false;
+                        pendingDeltaCents += isDebt ? -amtCents : amtCents;
+                      }
                       continue;
                     }
 
-                    // إذا كان السيرفر قد اعتمد هذه الحركة أو تم إبطالها محلياً، لا نكررها
-                    if (serverAppliedIds.contains(txId)) continue;
-                    if (_locallyDismissedEntryIds.contains(txId)) continue;
+                    // إذا كان القيد الأصلي ملغياً في طابور الشطب، لا نضيفه ولا نكرره
+                    if (pendingVoidTargetIds.contains(txId)) continue;
 
                     final isDebt = txType == 'debt';
-                    final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-                    pendingDelta += isDebt ? amt : -amt;
+                    pendingDeltaCents += isDebt ? amtCents : -amtCents;
                   }
 
-                  final double localAdjustments = pendingDelta;
+                  final double localAdjustments =
+                      LedgerCustomer.fromCents(pendingDeltaCents);
                   displayedCustomer = LedgerCustomer(
                     id: serverCustomer.id,
                     merchantId: serverCustomer.merchantId,
@@ -1120,10 +1140,11 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
         transactionId: entryId,
       );
 
-      _assignedTransactionId =
-          null; // 🔒 لا يُصفّر المعرف إلا بعد نجاح الإرسال أو اعتماده في الطابور
+      _assignedTransactionId = null;
       if (!mounted) return;
-      Navigator.pop(context, updatedCustomer);
+      // نعتمد على Stream المستمع للسيرفر فقط لتحديث الرصيد لمنع تعارض المصادر
+      final messenger = ScaffoldMessenger.of(context);
+      Navigator.pop(context, null);
       if (updatedCustomer.phone.trim().isNotEmpty) {
         final lastCreatedEntry = LedgerEntry(
           id: entryId,
@@ -1135,7 +1156,7 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
           createdAt: DateTime.now(),
         );
 
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(
             content: Text(
               widget.isDebt
@@ -1166,8 +1187,9 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
     } on LedgerQueuedException catch (e) {
       _assignedTransactionId = null;
       if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
       Navigator.pop(context, updatedCustomer);
-      ScaffoldMessenger.of(context).showSnackBar(
+      messenger.showSnackBar(
         SnackBar(
           content: Text(
             '📡 ${e.message}',
@@ -1193,141 +1215,147 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
   @override
   Widget build(BuildContext context) {
     final isDebt = widget.isDebt;
-    return AlertDialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-      backgroundColor: context.bgCard,
-      title: Row(
-        children: [
-          Icon(
-            isDebt ? Icons.add_circle_rounded : Icons.check_circle_rounded,
-            color: isDebt ? Colors.red : Colors.green,
-            size: 24,
-          ),
-          const SizedBox(width: 8),
-          Text(
-            isDebt ? 'تسجيل دين جديد (+)' : 'قبول دفعة سداد (-)',
-            style: TextStyle(
-              fontFamily: 'Cairo',
-              fontSize: 16,
-              fontWeight: FontWeight.w800,
-              color: context.textPrimary,
-            ),
-          ),
-        ],
-      ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            'الزبون: ${widget.customer.name}',
-            style: TextStyle(
-              fontFamily: 'Cairo',
-              fontSize: 12,
-              color: context.textSecondary,
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _amountCtrl,
-            autofocus: true,
-            keyboardType: const TextInputType.numberWithOptions(decimal: true),
-            textAlign: TextAlign.center,
-            inputFormatters: [
-              TextInputFormatter.withFunction((oldVal, newVal) {
-                const arabic = {
-                  '٠': '0',
-                  '١': '1',
-                  '٢': '2',
-                  '٣': '3',
-                  '٤': '4',
-                  '٥': '5',
-                  '٦': '6',
-                  '٧': '7',
-                  '٨': '8',
-                  '٩': '9',
-                  '۰': '0',
-                  '۱': '1',
-                  '۲': '2',
-                  '۳': '3',
-                  '۴': '4',
-                  '۵': '5',
-                  '۶': '6',
-                  '۷': '7',
-                  '۸': '8',
-                  '۹': '9'
-                };
-                var t = newVal.text;
-                arabic.forEach((k, v) => t = t.replaceAll(k, v));
-                t = t.replaceAll(RegExp(r'[^0-9.]'), '');
-                return TextEditingValue(
-                  text: t,
-                  selection: TextSelection.collapsed(offset: t.length),
-                );
-              }),
+    return PopScope(
+        canPop:
+            !_isSaving, // ✅ منع زر الرجوع أثناء الحفظ المالي لحماية دورة الحياة
+        child: AlertDialog(
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+          backgroundColor: context.bgCard,
+          title: Row(
+            children: [
+              Icon(
+                isDebt ? Icons.add_circle_rounded : Icons.check_circle_rounded,
+                color: isDebt ? Colors.red : Colors.green,
+                size: 24,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                isDebt ? 'تسجيل دين جديد (+)' : 'قبول دفعة سداد (-)',
+                style: TextStyle(
+                  fontFamily: 'Cairo',
+                  fontSize: 16,
+                  fontWeight: FontWeight.w800,
+                  color: context.textPrimary,
+                ),
+              ),
             ],
-            style: TextStyle(
-              fontFamily: 'Cairo',
-              fontSize: 26,
-              fontWeight: FontWeight.w900,
-              color: isDebt ? Colors.red : Colors.green,
-            ),
-            decoration: InputDecoration(
-              hintText: 'المبلغ ر.ي',
-              filled: true,
-              fillColor: context.bgInput,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(14),
-                borderSide: BorderSide.none,
-              ),
-            ),
           ),
-          const SizedBox(height: 10),
-          TextField(
-            controller: _notesCtrl,
-            style: TextStyle(fontFamily: 'Cairo', color: context.textPrimary),
-            decoration: InputDecoration(
-              hintText: 'ملاحظة أو بيان (مثال: سكر وماء)...',
-              hintStyle: TextStyle(
-                fontFamily: 'Cairo',
-                fontSize: 12,
-                color: context.textHint,
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'الزبون: ${widget.customer.name}',
+                style: TextStyle(
+                  fontFamily: 'Cairo',
+                  fontSize: 12,
+                  color: context.textSecondary,
+                ),
               ),
-              filled: true,
-              fillColor: context.bgInput,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(14),
-                borderSide: BorderSide.none,
+              const SizedBox(height: 12),
+              TextField(
+                controller: _amountCtrl,
+                autofocus: true,
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true),
+                textAlign: TextAlign.center,
+                inputFormatters: [
+                  TextInputFormatter.withFunction((oldVal, newVal) {
+                    const arabic = {
+                      '٠': '0',
+                      '١': '1',
+                      '٢': '2',
+                      '٣': '3',
+                      '٤': '4',
+                      '٥': '5',
+                      '٦': '6',
+                      '٧': '7',
+                      '٨': '8',
+                      '٩': '9',
+                      '۰': '0',
+                      '۱': '1',
+                      '۲': '2',
+                      '۳': '3',
+                      '۴': '4',
+                      '۵': '5',
+                      '۶': '6',
+                      '۷': '7',
+                      '۸': '8',
+                      '۹': '9'
+                    };
+                    var t = newVal.text;
+                    arabic.forEach((k, v) => t = t.replaceAll(k, v));
+                    t = t.replaceAll(RegExp(r'[^0-9.]'), '');
+                    return TextEditingValue(
+                      text: t,
+                      selection: TextSelection.collapsed(offset: t.length),
+                    );
+                  }),
+                ],
+                style: TextStyle(
+                  fontFamily: 'Cairo',
+                  fontSize: 26,
+                  fontWeight: FontWeight.w900,
+                  color: isDebt ? Colors.red : Colors.green,
+                ),
+                decoration: InputDecoration(
+                  hintText: 'المبلغ ر.ي',
+                  filled: true,
+                  fillColor: context.bgInput,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
               ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _notesCtrl,
+                style:
+                    TextStyle(fontFamily: 'Cairo', color: context.textPrimary),
+                decoration: InputDecoration(
+                  hintText: 'ملاحظة أو بيان (مثال: سكر وماء)...',
+                  hintStyle: TextStyle(
+                    fontFamily: 'Cairo',
+                    fontSize: 12,
+                    color: context.textHint,
+                  ),
+                  filled: true,
+                  fillColor: context.bgInput,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: BorderSide.none,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: _isSaving ? null : () => Navigator.pop(context),
+              child: const Text('إلغاء',
+                  style: TextStyle(fontFamily: 'Cairo', color: Colors.grey)),
             ),
-          ),
-        ],
-      ),
-      actions: [
-        TextButton(
-          onPressed: _isSaving ? null : () => Navigator.pop(context),
-          child: const Text('إلغاء',
-              style: TextStyle(fontFamily: 'Cairo', color: Colors.grey)),
-        ),
-        ElevatedButton(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: isDebt ? Colors.red : Colors.green,
-            foregroundColor: Colors.white,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          ),
-          onPressed: _isSaving ? null : _submit,
-          child: _isSaving
-              ? const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(
-                      color: Colors.white, strokeWidth: 2),
-                )
-              : const Text('حفظ',
-                  style: TextStyle(
-                      fontFamily: 'Cairo', fontWeight: FontWeight.bold)),
-        ),
-      ],
-    );
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: isDebt ? Colors.red : Colors.green,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: _isSaving ? null : _submit,
+              child: _isSaving
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                          color: Colors.white, strokeWidth: 2),
+                    )
+                  : const Text('حفظ',
+                      style: TextStyle(
+                          fontFamily: 'Cairo', fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ));
   }
 }

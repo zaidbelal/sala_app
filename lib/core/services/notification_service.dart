@@ -43,7 +43,7 @@ class NotificationService {
             .update({
           'fcm_token': FieldValue.delete(),
           'token_updated_at': FieldValue.serverTimestamp(),
-        }).timeout(const Duration(seconds: 2));
+        }).timeout(const Duration(seconds: 6));
       } catch (error) {
         if (kDebugMode) {
           debugPrint('Failed to detach FCM token: $error');
@@ -51,9 +51,9 @@ class NotificationService {
       }
     }
 
-    // 🔒 حذف التوكن من الجهاز لمنع تسريب أي إشعار بعد تسجيل الخروج
+    // 🔒 مسح وحذف التوكن محلياً مع مهلة كافية لشبكات الجوال
     try {
-      await _messaging.deleteToken().timeout(const Duration(seconds: 2));
+      await _messaging.deleteToken().timeout(const Duration(seconds: 5));
     } catch (error) {
       if (kDebugMode) {
         debugPrint('Failed to delete device FCM token: $error');

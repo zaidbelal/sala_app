@@ -720,8 +720,9 @@ class _AddCustomerDialogState extends State<_AddCustomerDialog> {
       }
     } on LedgerQueuedException catch (e) {
       if (mounted) {
+        final messenger = ScaffoldMessenger.of(context);
         Navigator.pop(context);
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(
             content:
                 Text(e.message, style: const TextStyle(fontFamily: 'Cairo')),
@@ -1759,9 +1760,10 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
       );
       _billTransactionId = null; // تصفير المعرف فقط عند النجاح التام
       if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
       Navigator.pop(context);
 
-      ScaffoldMessenger.of(context).showSnackBar(
+      messenger.showSnackBar(
         SnackBar(
           content: Text(
             '✅ تم قيد الفاتورة (${_grandTotal.toStringAsFixed(0)} ر.ي) في حساب (${_selectedCustomer.name}) بنجاح',
@@ -1769,6 +1771,23 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
           ),
           backgroundColor: AppColors.primary,
           duration: const Duration(seconds: 3),
+        ),
+      );
+    } on LedgerQueuedException catch (e) {
+      // 🔒 التقاط استثناء الأوفلاين المعتمد وإغلاق النافذة فوراً لمنع الضغط المتكرر
+      _billTransactionId = null;
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      Navigator.pop(context);
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            '📡 ${e.message} (${_grandTotal.toStringAsFixed(0)} ر.ي)',
+            style: const TextStyle(
+                fontFamily: 'Cairo', fontWeight: FontWeight.bold),
+          ),
+          backgroundColor: Colors.orange.shade800,
+          duration: const Duration(seconds: 4),
         ),
       );
     } catch (e) {
@@ -1782,41 +1801,14 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
           errStr.contains('connection');
 
       if (isNetworkOrTimeout) {
-        // التأكد الحتمي من أن الفاتورة قد تم تدوينها في طابور الأوفلاين
-        final currentQueue = AppStorage.getPendingLedgerTxs(merchantId);
-        final alreadySaved =
-            currentQueue.any((t) => t['id'] == _billTransactionId);
-        if (!alreadySaved && _billTransactionId != null) {
-          final itemsPayload = _items
-              .map((i) => {
-                    'product_id': i.productId,
-                    'name': '${i.productName} (${i.unitLabel})',
-                    'quantity': i.quantity,
-                    'unit_label': i.unitLabel,
-                    'unit_price': i.unitPrice,
-                    'subtotal': i.total,
-                    'carton_capacity': i.cartonCapacity,
-                  })
-              .toList();
-
-          await AppStorage.savePendingLedgerTx({
-            'id': _billTransactionId,
-            'merchant_id': merchantId,
-            'customer_id': _selectedCustomer.id,
-            'type': 'debt',
-            'amount': _grandTotal,
-            'items': itemsPayload,
-            'created_at': DateTime.now().toIso8601String(),
-          });
-        }
-
         _billTransactionId = null;
         if (!mounted) return;
+        final messenger = ScaffoldMessenger.of(context);
         Navigator.pop(context);
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(
             content: Text(
-              '📡 تم حفظ الفاتورة (${_grandTotal.toStringAsFixed(0)} ر.ي) في طابور الأوفلاين وسيتم قيدها تلقائياً فور استقرار الشبكة',
+              '📡 تم تأمين الفاتورة (${_grandTotal.toStringAsFixed(0)} ر.ي) أوفلاين وستُرحل فور توفر الإنترنت',
               style: const TextStyle(
                   fontFamily: 'Cairo', fontWeight: FontWeight.bold),
             ),
@@ -1826,7 +1818,6 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
         );
         return;
       }
-      // 🔒 الحفاظ على معرّف المعاملة الثابت (_billTransactionId) لمنع الازدواجية المالية عند نقر التاجر مرة أخرى
       if (mounted) {
         setState(() => _isSaving = false);
         ScaffoldMessenger.of(context).showSnackBar(

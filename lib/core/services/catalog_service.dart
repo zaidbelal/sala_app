@@ -31,6 +31,11 @@ final _db = FirebaseFirestore.instance;
 // Providers
 // ─────────────────────────────────────────────────────────
 
+/// حقن الاعتماديات عبر مزودات مركزية
+final appCacheProvider = Provider<AppCache>((ref) => AppCache.instance);
+final deltaSyncProvider =
+    Provider<DeltaSyncService>((ref) => DeltaSyncService.instance);
+
 final categoriesProvider =
     AsyncNotifierProvider<CategoriesNotifier, List<Map<String, dynamic>>>(
   CategoriesNotifier.new,
@@ -201,9 +206,12 @@ class CategoriesNotifier extends AsyncNotifier<List<Map<String, dynamic>>> {
 
   /// تحديث خلفي صامت يوفر استهلاك الشبكة بنسبة 100% عند عدم وجود تعديلات
   Future<void> _bgRefresh() async {
+    final cache = ref.read(appCacheProvider);
+    final deltaSync = ref.read(deltaSyncProvider);
+
     try {
-      await DeltaSyncService.instance.syncCategoriesDelta();
-      final cached = AppCache.instance.getCategories();
+      await deltaSync.syncCategoriesDelta();
+      final cached = cache.getCategories();
       if (cached != null && cached.isNotEmpty && !_isDisposed) {
         state = AsyncValue.data(cached);
         return;
@@ -215,8 +223,9 @@ class CategoriesNotifier extends AsyncNotifier<List<Map<String, dynamic>>> {
       tag: 'categories-bg',
     );
     if (fresh != null) {
-      await AppCache.instance.setCategories(fresh);
-      if (!_isDisposed) {
+      await cache.setCategories(fresh);
+      // ✅ فحص مزدوج للـ mount والـ disposal قبل لمس الـ State
+      if (!_isDisposed && ref.exists(categoriesProvider)) {
         state = AsyncValue.data(fresh);
       }
     }

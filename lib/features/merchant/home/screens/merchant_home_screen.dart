@@ -7,10 +7,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/constants/app_colors.dart';
 import '../../../../core/constants/app_adaptive_colors.dart';
 import '../../../../core/services/local_storage.dart';
+import '../../../../core/services/connectivity_service.dart';
+import '../../../../core/models/product_unit.dart';
 import '../../orders/services/orders_service.dart';
+import '../../products/services/products_service.dart';
 import '../../cart/widgets/cart_floating_button.dart';
 import '../../cart/providers/cart_provider.dart';
-import '../../cart/models/cart_item_model.dart';
 import 'tabs/home_tab.dart';
 import 'tabs/history_tab.dart';
 import 'tabs/orders_tab.dart';
@@ -18,8 +20,6 @@ import 'tabs/profile_tab.dart';
 import '../../ledger/screens/ledger_tab.dart';
 import '../../ledger/services/ledger_service.dart';
 import 'package:sala/core/services/wal_service.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:sala/core/services/app_cache.dart';
 
 final _activeTabProvider = StateProvider<int>((ref) => 0);
 
@@ -169,145 +169,65 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
             successCount++;
             continue;
           }
-          final errorMsg = e.toString().toLowerCase();
+       final errorMsg = e.toString().toLowerCase();
           final bool isStockOrProductIssue =
               errorMsg.contains('product_unavailable') ||
                   errorMsg.contains('out_of_stock') ||
-                  errorMsg.contains('صنف') ||
-                  errorMsg.contains('غير متوفر');
+                  errorMsg.contains('resource-exhausted') ||
+                  errorMsg.contains('failed-precondition');
 
-          final bool isTransientIssue = !isStockOrProductIssue &&
-              (errorMsg.contains('network') ||
-                  errorMsg.contains('timeout') ||
-                  errorMsg.contains('socket') ||
-                  errorMsg.contains('deadline-exceeded') ||
-                  errorMsg.contains('unauthenticated') ||
-                  errorMsg.contains('تسجيل الدخول') ||
-                  errorMsg.contains('جلسة التاجر غير صالحة') ||
-                  errorMsg.contains('user-not-found') ||
-                  errorMsg.contains('permission-denied') ||
-                  (errorMsg.contains('unavailable') &&
-                      !errorMsg.contains('product')));
+          // 🔒 الاعتماد على الفاحص المركزي لكشف انقطاع الإنترنت اللحظي أو المؤقت
+          final bool isTransientIssue = !isStockOrProductIssue && ConnectivityHelper.isNetworkException(e);
 
           if (isTransientIssue) {
             if (kDebugMode) {
-              debugPrint(
-                  '⚠️ تأجيل إرسال الطلب $orderId لحين استقرار الجلسة والاتصال بالإنترنت');
+              debugPrint('⚠️ تأجيل إرسال الطلب $orderId لحين استقرار الجلسة والاتصال بالإنترنت');
             }
-            continue;
+            continue; // الحفاظ على الطلب في الطابور دون حذفه
           } else {
             await WalService.instance.markAborted(orderId);
-            // 🔒 الاستعلام الموجه بدقة للأصناف المعنية فقط بدلاً من تحديد حد أقصى عام (500)
-            List<Map<String, dynamic>> availableProducts = [];
-            try {
-              final pendingItemIds = (pending['items'] as List)
-                  .map((it) => it['product_id']?.toString() ?? '')
-                  .where((id) => id.isNotEmpty)
-                  .toSet()
-                  .toList();
 
-              for (var i = 0; i < pendingItemIds.length; i += 30) {
-                final chunk = pendingItemIds.sublist(
-                  i,
-                  i + 30 > pendingItemIds.length
-                      ? pendingItemIds.length
-                      : i + 30,
-                );
-                final snap = await FirebaseFirestore.instance
-                    .collection('products')
-                    .where(FieldPath.documentId, whereIn: chunk)
-                    .get(const GetOptions(source: Source.server));
-                availableProducts.addAll(
-                  snap.docs
-                      .where((d) =>
-                          d.data()['is_deleted'] != true &&
-                          d.data()['is_active'] != false)
-                      .map((d) => {'id': d.id, ...d.data()}),
-                );
-              }
-            } catch (_) {
-              availableProducts = AppCache.instance.getProducts() ?? [];
-            }
-
-            final activeProductMap = {
-              for (final p in availableProducts)
-                if (p['is_deleted'] != true && p['is_active'] != false)
-                  p['id'].toString(): p
-            };
-
-            final cartMap = <String, dynamic>{};
-            final errorStr = e.toString();
-
-            // 🔒 استخراج معرفات المنتجات المعطلة بدقة Regex محكمة بدلاً من المطابقة النصية الفضفاضة
+            // استخراج الصنف المرفوض بدقة
             final failedIds = <String>{};
-            final exp =
-                RegExp(r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[(.*?)\]');
-            for (final match in exp.allMatches(errorStr)) {
+            final exp = RegExp(r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[(.*?)\]');
+            for (final match in exp.allMatches(e.toString())) {
               final raw = match.group(1);
               if (raw != null) {
-                failedIds.add(
-                    raw.contains(':') ? raw.split(':')[0].trim() : raw.trim());
+                failedIds.add(raw.contains(':') ? raw.split(':')[0].trim() : raw.trim());
               }
             }
 
+            // 🔒 حماية السلة: استرجاع كافة الأصناف السليمة حتى لو تعذر جلب المنتجات من السيرفر حالياً
+            final notifier = ref.read(cartProvider.notifier);
             for (final item in pending['items']) {
               final productId = item['product_id']?.toString() ?? '';
-              final isExplicitlyFailed = failedIds.contains(productId);
-              final liveProduct = activeProductMap[productId];
+              if (failedIds.contains(productId)) continue; // استبعاد الصنف المرفوض فقط
 
-              // لا يُعاد للسلة إلا الصنف السليم الفعّال في قاعدة البيانات
-              if (isExplicitlyFailed || liveProduct == null) {
-                continue;
-              }
+              final rawUnitLabel = item['unit_label']?.toString().trim();
+              final productUnit = (rawUnitLabel != null && rawUnitLabel.isNotEmpty && rawUnitLabel != 'كرتون')
+                  ? ProductUnit(
+                      label: rawUnitLabel,
+                      qty: (item['unit_qty'] as num?)?.toInt() ?? 1,
+                      price: (item['price'] as num?)?.toDouble() ?? 0.0,
+                    )
+                  : null;
 
-              final unitLabel = item['unit_label']?.toString().trim();
-              final cartKey = (unitLabel == null ||
-                      unitLabel.isEmpty ||
-                      unitLabel == 'كرتون')
-                  ? productId
-                  : '${productId}__$unitLabel';
+              final restoredProduct = ProductModel(
+                id: productId,
+                name: item['product_name'] ?? 'منتج',
+                price: (item['price'] as num?)?.toDouble() ?? 0.0,
+                brandId: '',
+              );
 
-              cartMap[cartKey] = {
-                'product': {
-                  'id': productId,
-                  'name': liveProduct['name'] ?? item['product_name'],
-                  'price': item['price'],
-                  'brand_id': liveProduct['brand_id'] ?? '',
-                  'brandId': liveProduct['brand_id'] ?? '',
-                  'image_url': liveProduct['image_url'],
-                  'size_ml': liveProduct['size_ml'],
-                  'items_per_carton': liveProduct['items_per_carton'],
-                },
-                'quantity': item['quantity'],
-                'snapshot_at': DateTime.now().millisecondsSinceEpoch,
-                if (unitLabel != null && unitLabel.isNotEmpty)
-                  'selectedUnit': {
-                    'label': unitLabel,
-                    'qty': item['unit_qty'] ?? 1,
-                    'price': item['price'],
-                  },
-              };
+              notifier.addItem(
+                restoredProduct,
+                (item['quantity'] as num?)?.toInt() ?? 1,
+                unit: productUnit,
+              );
             }
-            if (cartMap.isNotEmpty) {
-              // 🔒 دمج كافة العناصر المعادة أولاً برمجياً ثم حفظها مرة واحدة لمنع تداخل عمليات الكتابة على القرص
-              final notifier = ref.read(cartProvider.notifier);
-              for (final entry in cartMap.entries) {
-                final oldItem =
-                    CartItem.fromJson(entry.value as Map<String, dynamic>);
-                notifier.addItem(
-                  oldItem.product,
-                  oldItem.quantity,
-                  unit: oldItem.selectedUnit,
-                );
-              }
-              await notifier.forceSave();
-            }
+            await notifier.forceSave();
             await AppStorage.removePendingOrder(orderId, currentUserId);
             failCount++;
-            if (kDebugMode) {
-              debugPrint(
-                  '❌ تمت معالجة الطلب المعلق المتعثر $orderId بنجاح: $e');
-            }
           }
         }
       }

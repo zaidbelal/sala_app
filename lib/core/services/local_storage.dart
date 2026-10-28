@@ -16,6 +16,7 @@ class AppStorage {
   static SharedPreferences? _prefs;
   static bool _initialized = false;
   static String? _appDocsPath;
+  static String? get appDocsPath => _appDocsPath;
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
   );
@@ -80,21 +81,6 @@ class AppStorage {
   // حالة التهيئة
   // ══════════════════════════════════════════
   static bool get isInitialized => _initialized;
-
-  /// 🔒 كتابة تزامنية مباشرة لقرص الهاتف (Crash-Safe) لمنع ضياع السلة عند الإغلاق الفجائي
-  static void saveCartBackupSync(String uid, String jsonString,
-      {String? revision}) {
-    if (!kIsWeb && _appDocsPath != null) {
-      try {
-        if (revision != null) {
-          final revisionFile = File('$_appDocsPath/sala_cart_v2_$uid.revision');
-          revisionFile.writeAsStringSync(revision, flush: true);
-        }
-        final file = File('$_appDocsPath/sala_cart_v2_$uid.json');
-        file.writeAsStringSync(jsonString, flush: true);
-      } catch (_) {}
-    }
-  }
 
   // ╔══════════════════════════════════════════╗
   // ║           بيانات المستخدم               ║
@@ -174,20 +160,8 @@ class AppStorage {
     return DateTime.tryParse(raw);
   }
 
-  // ── فحص انتهاء الجلسة (30 يوم) ──
-  static const int sessionDurationDays = 30; // ✅ غيّره من مكان واحد
-
-  /// الجلسة تنتهي بعد [sessionDurationDays] يوماً من آخر نشاط.
-  /// ملاحظة: last_login_at يُحدَّث تلقائياً من _SalaAppState.didChangeAppLifecycleState
-  /// عند كل استئناف للتطبيق — لذا أجهزة POS النشطة لا تنتهي جلساتها.
-  static bool get isSessionExpired {
-    final lastLogin = lastLoginDateTime;
-    if (lastLogin == null) return true;
-
-    return DateTime.now().toUtc().difference(lastLogin.toUtc()) >
-        const Duration(days: sessionDurationDays);
-  }
-
+// ── الجلسة دائمة لا تنتهي إلا بتسجيل الخروج الصريح أو حذف التطبيق ──
+  static bool get isSessionExpired => false;
   // ╔══════════════════════════════════════════╗
   // ║            أدوار المستخدمين             ║
   // ╚══════════════════════════════════════════╝
@@ -279,7 +253,9 @@ class AppStorage {
       }
       currentQueue.add(order);
       final json = jsonEncode(currentQueue);
-      await _db.setString(key, json);
+      if (!await _db.setString(key, json)) {
+        throw StateError('تعذر حفظ الطلب المعلق في التخزين المحلي');
+      }
 // 🔒 كتابة ذرية آمنة متوافقة مع أنظمة Android و iOS تضمن عدم تلف ملفات الطابور
       if (!kIsWeb && _appDocsPath != null) {
         try {
@@ -444,6 +420,51 @@ class AppStorage {
   // ── حركات الدفتر المعلقة (أوفلاين - حماية أموال التاجر) ──
   static String _userPendingLedgerKey([String? uid]) =>
       '${_kPendingLedger}_${uid ?? userId ?? "anonymous"}';
+
+  static bool _samePendingLedgerValue(Object? first, Object? second) {
+    if (first is num && second is num) return first == second;
+    if (first is List && second is List) {
+      if (first.length != second.length) return false;
+      for (var i = 0; i < first.length; i++) {
+        if (!_samePendingLedgerValue(first[i], second[i])) return false;
+      }
+      return true;
+    }
+    if (first is Map && second is Map) {
+      if (first.length != second.length) return false;
+      for (final key in first.keys) {
+        if (!second.containsKey(key) ||
+            !_samePendingLedgerValue(first[key], second[key])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return first == second;
+  }
+
+  static bool _samePendingLedgerIntent(
+    Map<String, dynamic> first,
+    Map<String, dynamic> second,
+  ) {
+    const intentKeys = [
+      'merchant_id',
+      'customer_id',
+      'type',
+      'amount',
+      'notes',
+      'items',
+      'target_entry_id',
+      'is_debt',
+    ];
+    for (final key in intentKeys) {
+      final firstValue = key == 'notes' ? (first[key] ?? '') : first[key];
+      final secondValue = key == 'notes' ? (second[key] ?? '') : second[key];
+      if (!_samePendingLedgerValue(firstValue, secondValue)) return false;
+    }
+    return true;
+  }
+
   static Future<void> savePendingLedgerTx(Map<String, dynamic> txData) async {
     final previousLock = _queueLock;
     final completer = Completer<void>();
@@ -458,12 +479,21 @@ class AppStorage {
       final key = _userPendingLedgerKey(targetUid);
       final queue = getPendingLedgerTxs(targetUid);
       final txId = txData['id']?.toString() ?? '';
-      if (txId.isNotEmpty && queue.any((t) => t['id'] == txId)) {
-        return;
+      if (txId.isNotEmpty) {
+        final existing = queue.where((t) => t['id'] == txId);
+        if (existing.isNotEmpty) {
+          if (existing.any((item) => !_samePendingLedgerIntent(item, txData))) {
+            throw StateError(
+                'تعارض في معرف الحركة المالية المعلقة؛ لم يتم استبدال القيد المحفوظ');
+          }
+          return;
+        }
       }
       queue.add(txData);
       final json = jsonEncode(queue);
-      await _db.setString(key, json);
+      if (!await _db.setString(key, json)) {
+        throw StateError('تعذر حفظ الحركة المالية المعلقة في التخزين المحلي');
+      }
 
       // 🔒 كتابة ذرية آمنة لحركات الدفتر على القرص لمنع فقدان ديون التجار عند انهيار التطبيق
       if (!kIsWeb && _appDocsPath != null) {
@@ -472,7 +502,15 @@ class AppStorage {
           final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
           final finalFile = File('$_appDocsPath/${key}_backup.json');
           await tempFile.writeAsString(json, flush: true);
-          await tempFile.rename(finalFile.path);
+          try {
+            if (await finalFile.exists()) {
+              await finalFile.delete();
+            }
+            await tempFile.rename(finalFile.path);
+          } catch (_) {
+            await tempFile.copy(finalFile.path);
+            if (await tempFile.exists()) await tempFile.delete();
+          }
         } catch (_) {}
       }
     } finally {
@@ -582,7 +620,15 @@ class AppStorage {
           final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
           final finalFile = File('$_appDocsPath/${key}_backup.json');
           await tempFile.writeAsString(json, flush: true);
-          await tempFile.rename(finalFile.path);
+          try {
+            if (await finalFile.exists()) {
+              await finalFile.delete();
+            }
+            await tempFile.rename(finalFile.path);
+          } catch (_) {
+            await tempFile.copy(finalFile.path);
+            if (await tempFile.exists()) await tempFile.delete();
+          }
         } catch (_) {}
       }
     } finally {

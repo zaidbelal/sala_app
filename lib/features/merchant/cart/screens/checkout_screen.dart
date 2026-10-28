@@ -185,14 +185,34 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
 
   // ─── يعرض dialog تحميل فوق كل شيء ───
   BuildContext? _loadingDialogContext;
+  bool _dismissLoadingAfterBuild = false;
+  bool _loadingDismissCallbackScheduled = false;
 
   void _showLoadingDialog() {
+    _dismissLoadingAfterBuild = false;
     showDialog(
       context: context,
       barrierDismissible: false,
       barrierColor: Colors.black54,
       builder: (dialogCtx) {
         _loadingDialogContext = dialogCtx;
+        if (_dismissLoadingAfterBuild && !_loadingDismissCallbackScheduled) {
+          _loadingDismissCallbackScheduled = true;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _loadingDismissCallbackScheduled = false;
+            if (!dialogCtx.mounted ||
+                !identical(_loadingDialogContext, dialogCtx) ||
+                !_dismissLoadingAfterBuild) {
+              return;
+            }
+            _dismissLoadingAfterBuild = false;
+            final navigator = Navigator.of(dialogCtx);
+            if (navigator.canPop()) navigator.pop();
+            if (identical(_loadingDialogContext, dialogCtx)) {
+              _loadingDialogContext = null;
+            }
+          });
+        }
         return PopScope(
           canPop: false,
           child: Center(
@@ -335,10 +355,13 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
   }
 
   Future<void> _placeOrderInternal() async {
-    // ── 1. التحقق من السلة ──
+    // ── 1. التحقق من السلة والخروج الآمن إن فرغت ──
     final cart = ref.read(cartProvider);
     if (cart.isEmpty) {
       _showError('السلة فارغة، أضف منتجات أولاً');
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
       return;
     }
     if (cart.length > AppConfig.maxOrderItems) {
@@ -479,16 +502,31 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
     };
 
     void safeDismissLoading() {
-      if (_loadingDialogContext != null &&
-          Navigator.canPop(_loadingDialogContext!)) {
-        Navigator.of(_loadingDialogContext!).pop();
-        _loadingDialogContext = null;
+      final dialogContext = _loadingDialogContext;
+      if (dialogContext == null) {
+        _dismissLoadingAfterBuild = true;
+        return;
       }
+      if (!dialogContext.mounted) {
+        _loadingDialogContext = null;
+        return;
+      }
+      final navigator = Navigator.of(dialogContext);
+      if (navigator.canPop()) navigator.pop();
+      _loadingDialogContext = null;
+      _dismissLoadingAfterBuild = false;
     }
 
     bool isOffline = !(await ConnectivityHelper.hasActiveInternet());
     if (isOffline) {
-      // 🔒 التحقق الصارم المزدوج: مطابقة الكاش الشامل وفحص حداثته (Stale Guard)
+      // 🔒 فحص الحد الأدنى للطلب المعتمد أوفلاين وسحب السعر من الكاش
+      if (total < serverMinOrder) {
+        safeDismissLoading();
+        _showError(
+            'الحد الأدنى للطلب هو ${serverMinOrder.toStringAsFixed(0)} ر.ي');
+        return;
+      }
+
       final allLocalProducts = AppCache.instance.getAllCachedProducts();
       if (allLocalProducts.isEmpty) {
         safeDismissLoading();
@@ -590,8 +628,17 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
         markWalCommitted: false,
       ).timeout(const Duration(seconds: 30));
       _orderIdempotencyKey = null;
-      await cartNotifier.clearIfRevision(cartRevision);
-      await WalService.instance.markCommitted(generatedOrderId);
+      try {
+        await cartNotifier.clearIfRevision(cartRevision);
+      } catch (error, stackTrace) {
+        debugPrint('Order placed but cart cleanup failed: $error\n$stackTrace');
+      }
+      try {
+        await WalService.instance.markCommitted(generatedOrderId);
+      } catch (error, stackTrace) {
+        debugPrint('Order placed but WAL commit marker failed: '
+            '$error\n$stackTrace');
+      }
 
       if (!mounted) return;
       safeDismissLoading();
@@ -610,23 +657,17 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       safeDismissLoading();
       final errorStr = e.toString().toLowerCase();
 
-      // 🛡️ فحص دقيق: عزل أخطاء توفر المخزون والأصناف تماماً عن أخطاء انقطاع الشبكة
       final bool isStockOrProductIssue =
           errorStr.contains('product_unavailable') ||
               errorStr.contains('out_of_stock') ||
-              errorStr.contains('صنف') ||
-              errorStr.contains('غير متوفر');
+              errorStr.contains('resource-exhausted') ||
+              errorStr.contains('failed-precondition');
 
-      final isNetworkError = !isStockOrProductIssue &&
-          (errorStr.contains('network') ||
-              errorStr.contains('timeout') ||
-              errorStr.contains('socket') ||
-              errorStr.contains('deadline-exceeded') ||
-              errorStr.contains('unavailable'));
+      // 🔒 فحص احترافي يعتمد على المصنف المركزي ويشمل كافة سيناريوهات انقطاع الإنترنت اللحظي
+      final isNetworkError =
+          !isStockOrProductIssue && ConnectivityHelper.isNetworkException(e);
       if (isNetworkError) {
-        // نية العملية مسجلة بالفعل في OrdersService.placeOrder، يتم الحفظ في طابور الأوفلاين مباشرة
         await AppStorage.savePendingOrder(orderData);
-        _orderIdempotencyKey = null;
         await cartNotifier.clearIfRevision(cartRevision);
 
         if (!mounted) return;
@@ -636,7 +677,7 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
             SizedBox(width: 8),
             Expanded(
                 child: Text(
-                    'تعذر الاتصال بالخادم، تم حفظ طلبك وسيتم إرساله تلقائياً فور توفر الشبكة 📡',
+                    'تعذر الاتصال بالخادم، تم حفظ طلبك بأمان وسيُرسل تلقائياً فور توفر الشبكة 📡',
                     style: TextStyle(
                         fontFamily: 'Cairo', fontWeight: FontWeight.w700))),
           ]),
@@ -644,51 +685,61 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           behavior: SnackBarBehavior.floating,
           shape:
               RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          duration: const Duration(seconds: 3),
+          duration: const Duration(seconds: 4),
         ));
 
         await Future.delayed(const Duration(milliseconds: 600));
+        _orderIdempotencyKey =
+            null; // 🔒 لا يُصفّر المفتاح إلا بعد تمام التأكيد والتأمين
         if (mounted) {
           Navigator.of(context).popUntil((route) => route.isFirst);
         }
         return;
       }
       HapticFeedback.vibrate();
-      // 🔒 الحفاظ على مفتاح التثبيت المالي في حالة إعادة النقر لضمان عدم إنشاء طلب مكرر بسعر مختلف
+
       final err = e.toString();
-// 🚀 استخراج جماعي شامل لجميع الأصناف والوحدات التالفة دفعة واحدة (allMatches)
-      if (err.contains('PRODUCT_UNAVAILABLE_[') ||
-          err.contains('OUT_OF_STOCK_[')) {
-        final RegExp exp =
-            RegExp(r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[(.*?)\]');
-        final matches = exp.allMatches(err);
-        if (matches.isNotEmpty) {
-          final cartNotifier = ref.read(cartProvider.notifier);
-          final keysToRemove = <String>{};
+      // استخراج مرن وشامل يدعم JSON والمعرّفات النصية والمفصولة بفواصل
+      final RegExp exp = RegExp(
+        r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)(?:\[|\b)([\w\-\:,\s]+)(?:\]|\b)',
+        caseSensitive: false,
+      );
+      final matches = exp.allMatches(err);
+      if (matches.isNotEmpty) {
+        final cartNotifier = ref.read(cartProvider.notifier);
+        final keysToRemove = <String>{};
 
-          for (final m in matches) {
-            final rawTarget = m.group(1);
-            if (rawTarget == null) continue;
+        for (final m in matches) {
+          final rawTarget = m.group(1);
+          if (rawTarget == null) continue;
 
-            if (rawTarget.contains(':')) {
-              final parts = rawTarget.split(':');
+          final targetTokens = rawTarget.split(RegExp(r'[,;\s]+'));
+          for (final token in targetTokens) {
+            final cleanToken = token.trim();
+            if (cleanToken.isEmpty) continue;
+
+            if (cleanToken.contains(':')) {
+              final parts = cleanToken.split(':');
               final badProdId = parts[0].trim();
               final badUnit = parts[1].trim();
               for (final e in cart.entries) {
                 if (e.value.product.id == badProdId &&
-                    e.value.unitLabel.trim() == badUnit) {
+                    e.value.unitLabel.trim().toLowerCase() ==
+                        badUnit.toLowerCase()) {
                   keysToRemove.add(e.key);
                 }
               }
             } else {
-              final targetId = rawTarget.trim();
               for (final e in cart.entries) {
-                if (e.value.product.id == targetId) {
+                if (e.value.product.id == cleanToken) {
                   keysToRemove.add(e.key);
                 }
               }
             }
           }
+        }
+
+        if (keysToRemove.isNotEmpty) {
           for (final k in keysToRemove) {
             cartNotifier.removeItem(k);
           }

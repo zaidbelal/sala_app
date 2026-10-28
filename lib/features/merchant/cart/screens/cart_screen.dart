@@ -47,33 +47,42 @@ class _CartScreenState extends ConsumerState<CartScreen> {
         chunks.add(cartProductIds.sublist(i,
             i + 30 > cartProductIds.length ? cartProductIds.length : i + 30));
       }
-      final futures = chunks.map((chunk) => FirebaseFirestore.instance
-          .collection('products')
-          .where(FieldPath.documentId, whereIn: chunk)
-          .get(const GetOptions(source: Source.server)));
-      final results = await Future.wait(futures);
-      for (final snap in results) {
-        latestProducts.addAll(snap.docs.map((d) => {'id': d.id, ...d.data()}));
+      final successfullyQueriedIds = <String>{};
+      for (final chunk in chunks) {
+        try {
+          final snap = await FirebaseFirestore.instance
+              .collection('products')
+              .where(FieldPath.documentId, whereIn: chunk)
+              .get(const GetOptions(source: Source.server));
+          latestProducts
+              .addAll(snap.docs.map((d) => {'id': d.id, ...d.data()}));
+          successfullyQueriedIds.addAll(chunk);
+        } catch (_) {
+          // في حال فشل أي Chunk شبكياً، لا نعتبر منتجاته محذوفة ونحفظها للمحاولة القادمة
+        }
+      }
+      if (successfullyQueriedIds.isEmpty) return;
+
+      final hasChanges =
+          ref.read(cartProvider.notifier).validateAndUpdatePrices(
+                latestProducts,
+                queriedBatchIds: successfullyQueriedIds,
+              );
+
+      if (hasChanges && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                '⚠️ تم تحديث سلتك واستبعاد الأصناف التي لم تعد متوفرة ومطابقة أحدث الأسعار',
+                style: TextStyle(fontFamily: 'Cairo')),
+            backgroundColor: Colors.orange,
+            behavior: SnackBarBehavior.floating,
+            duration: Duration(seconds: 4),
+          ),
+        );
       }
     } catch (_) {
       return;
-    }
-// تمرير كافة المعرفات المفحوصة لحذف الأصناف التي أُزيلت من السيرفر حتى لو عادت النتيجة فارغة
-    final hasChanges = ref.read(cartProvider.notifier).validateAndUpdatePrices(
-          latestProducts,
-          queriedBatchIds: cartProductIds.toSet(),
-        );
-    if (hasChanges && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-              '⚠️ تم تحديث سلتك واستبعاد الأصناف التي لم تعد متوفرة ومطابقة أحدث الأسعار',
-              style: TextStyle(fontFamily: 'Cairo')),
-          backgroundColor: Colors.orange,
-          behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: 4),
-        ),
-      );
     }
   }
 

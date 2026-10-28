@@ -105,8 +105,27 @@ void main() async {
     FlutterError.onError = (details) {
       final errorStr = details.exception.toString();
       if (errorStr.contains('fonts.gstatic.com') ||
-          errorStr.contains('Failed to load font') ||
-          errorStr.contains('MultiImageStreamCompleter')) {
+          errorStr.contains('Failed to load font')) {
+        return;
+      }
+      if (errorStr.contains('MultiImageStreamCompleter')) {
+        FlutterError.presentError(details);
+        try {
+          unawaited(
+            FirebaseCrashlytics.instance
+                .recordError(
+              details.exception,
+              details.stack,
+              reason: 'Image stream error',
+              fatal: false,
+            )
+                .catchError((Object error) {
+              debugPrint('Failed to report image stream error: $error');
+            }),
+          );
+        } catch (error) {
+          debugPrint('Failed to report image stream error: $error');
+        }
         return;
       }
       FlutterError.presentError(details);
@@ -146,11 +165,8 @@ void main() async {
   try {
     await AppCache.instance.init();
     await WalService.instance.init();
-    // 🔒 منح مهلة متوافقة مع استعلام السيرفر لضمان إتمام تسوية العمليات المالية بعد الانهيار
-    await WalService.instance.reconcilePendingEntries().timeout(
-          const Duration(milliseconds: 4500),
-          onTimeout: () => null,
-        );
+    // 🔒 تشغيل تسوية القيود المالية في الخلفية بشكل آمن بدون مهلة قصيرة تعطل فتح التطبيق
+    unawaited(WalService.instance.reconcilePendingEntries());
   } catch (e) {
     debugPrint('❌ Cache/WAL Initialization Warning: $e');
   }
