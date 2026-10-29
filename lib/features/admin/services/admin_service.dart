@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/foundation.dart';
 import '../../../../core/services/app_cache.dart';
@@ -137,6 +138,18 @@ class AdminService {
   }
 
   Future<void> _runFinancialFieldsMigration() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      throw StateError('انتهت جلسة الدخول، سجّل الدخول مجدداً');
+    }
+    final idToken = await user.getIdToken(true);
+    if (idToken == null || idToken.isEmpty) {
+      throw StateError('تعذر تأكيد جلسة الدخول، سجّل الدخول مجدداً');
+    }
+    if (FirebaseAuth.instance.currentUser?.uid != user.uid) {
+      throw StateError('تغيّرت جلسة الدخول، سجّل الدخول مجدداً');
+    }
+
     final callable =
         FirebaseFunctions.instanceFor(region: 'us-central1').httpsCallable(
       'migrateFinancialFields',
@@ -144,7 +157,7 @@ class AdminService {
     );
     String? previousProgress;
     while (true) {
-      final response = await callable.call();
+      final response = await callable.call({'idToken': idToken});
       final data = Map<String, dynamic>.from(response.data as Map);
       if (data['done'] == true) return;
       final progress = '${data['stage']}|${data['cursor'] ?? ''}';

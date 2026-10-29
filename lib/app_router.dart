@@ -77,6 +77,18 @@ final appRouterProvider = Provider<GoRouter>((ref) {
         }
         return null;
       }
+
+      final hasMatchingFirebaseSession =
+          firebaseUser != null && firebaseUser.uid == AppStorage.userId;
+      if (!hasMatchingFirebaseSession) {
+        if (path == AppRoutes.login ||
+            path == AppRoutes.signup ||
+            path == AppRoutes.privacy) {
+          return null;
+        }
+        return AppRoutes.login;
+      }
+
 // 2. إذا كان المستخدم مسجلاً محلياً بالفعل وحاول فتح صفحة تسجيل الدخول، وجّهه لشاشته فوراً
       if (AppStorage.isLoggedIn &&
           (path == AppRoutes.login || path == AppRoutes.signup)) {
@@ -88,9 +100,6 @@ final appRouterProvider = Provider<GoRouter>((ref) {
 
       // 3. السماح بالمسارات العامة للزوار فقط
       if (publicRoutes.contains(path)) {
-        if (path == AppRoutes.signupDetails && firebaseUser == null) {
-          return AppRoutes.login;
-        }
         return null;
       }
       // 4. الحساب محظور نهائياً

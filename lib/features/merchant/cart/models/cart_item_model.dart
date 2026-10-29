@@ -34,7 +34,6 @@ class CartItem {
         quantity: quantity ?? this.quantity,
         selectedUnit: selectedUnit ?? this.selectedUnit,
       );
-
   Map<String, dynamic> toJson() {
     final unitMap = selectedUnit?.toMap();
 
@@ -57,6 +56,10 @@ class CartItem {
         'imageUrl': product.imageUrl,
         'brandId': product.brandId,
         'size_ml': product.sizeMl,
+        'size_text': product.sizeText,
+        'barcode': product.barcode,
+        'stock': product
+            .stock, // 🔒 حفظ المخزون الحقيقي لمنع تصفيره عند إعادة فتح السلة
         'items_per_carton': product.itemsPerCarton,
         'units': product.units.map((u) => u.toMap()).toList(),
       },
@@ -82,11 +85,14 @@ class CartItem {
         'image_url': img,
         'brand_id': p['brandId'] ?? p['brand_id'] ?? '',
         'size_ml': p['size_ml'],
+        'size_text': p['size_text'],
+        'barcode': p['barcode'],
         'items_per_carton': p['items_per_carton'],
         'units': rawUnits ?? (parsedUnit != null ? [parsedUnit.toMap()] : []),
         'category_id': '',
         'cost_price': 0,
-        'stock': 0,
+        'stock': (p['stock'] as num?)?.toDouble() ??
+            0.0, // 🔒 استرجاع المخزون الفعلي بدلاً من 0
         'is_active': true,
       }),
       quantity: (j['quantity'] as num?)?.toInt() ?? 1,

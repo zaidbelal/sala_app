@@ -131,16 +131,19 @@ class _HistoryTabState extends ConsumerState<HistoryTab> {
         .where('merchant_id', isEqualTo: merchantId)
         .where('status', whereIn: _historyStatuses)
         .orderBy('created_at', descending: true);
+
     var cursor = _ordersCursor;
     if (cursor == null) {
+      // 🛡️ مزامنة المؤشر مع سقف البث المباشر (200 طلب) لمنع إعادة جلب الطلبات المحملة مسبقاً
       final firstPage = await query
-          .limit(_historyPageSize)
+          .limit(200)
           .get(const GetOptions(source: Source.serverAndCache));
-      if (firstPage.docs.length < _historyPageSize) {
+      if (firstPage.docs.length < 200) {
         _hasMoreOrders = false;
         return null;
       }
       cursor = firstPage.docs.last;
+      _ordersCursor = cursor;
     }
     return query
         .startAfterDocument(cursor)
@@ -155,16 +158,19 @@ class _HistoryTabState extends ConsumerState<HistoryTab> {
         .collection('order_returns')
         .where('merchant_id', isEqualTo: merchantId)
         .orderBy('created_at', descending: true);
+
     var cursor = _returnsCursor;
     if (cursor == null) {
+      // 🛡️ مزامنة المؤشر مع سقف المرتجعات المباشرة (100 إرجاع) لمنع تكرار القراءات
       final firstPage = await query
-          .limit(_historyPageSize)
+          .limit(100)
           .get(const GetOptions(source: Source.serverAndCache));
-      if (firstPage.docs.length < _historyPageSize) {
+      if (firstPage.docs.length < 100) {
         _hasMoreReturns = false;
         return null;
       }
       cursor = firstPage.docs.last;
+      _returnsCursor = cursor;
     }
     return query
         .startAfterDocument(cursor)

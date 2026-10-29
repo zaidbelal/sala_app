@@ -66,19 +66,17 @@ class _LedgerTabState extends State<LedgerTab> {
   Widget build(BuildContext context) {
     final merchantId = AppStorage.userId ?? '';
     final storeName = AppStorage.storeName ?? AppStorage.userName ?? 'البقالة';
-
     return Scaffold(
       backgroundColor: context.bgPage,
       body: SafeArea(
-        child: StreamBuilder<Map<String, dynamic>>(
-          stream: LedgerService.instance.watchMerchantLedgerSummary(merchantId),
-          builder: (context, summarySnap) {
-            final summaryData = summarySnap.data ?? {};
-            final totalMarketDebt =
-                (summaryData['total_market_debt'] as num?)?.toDouble() ?? 0.0;
-            return StreamBuilder<List<LedgerCustomer>>(
-              stream: LedgerService.instance.watchCustomers(merchantId),
-              builder: (context, snapshot) {
+        child: StreamBuilder<List<LedgerCustomer>>(
+          stream: LedgerService.instance.watchCustomers(merchantId),
+          builder: (context, snapshot) {
+            return StreamBuilder<Map<String, dynamic>>(
+              stream:
+                  LedgerService.instance.watchMerchantLedgerSummary(merchantId),
+              builder: (context, summarySnap) {
+                final summaryData = summarySnap.data ?? {};
                 if (snapshot.hasError) {
                   return Center(
                     child: Padding(
@@ -208,36 +206,51 @@ class _LedgerTabState extends State<LedgerTab> {
                       ),
                       child: Row(
                         children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  'إجمالي ديونك في السوق',
-                                  style: TextStyle(
-                                      fontFamily: 'Cairo',
-                                      fontSize: 12,
-                                      color: Colors.white70),
-                                ),
-                                Text(
-                                  '${totalMarketDebt.toStringAsFixed(0)} ر.ي',
-                                  style: const TextStyle(
-                                    fontFamily: 'Cairo',
-                                    fontSize: 26,
-                                    fontWeight: FontWeight.w900,
-                                    color: Colors.white,
+                          // 🔒 احتساب الإجمالي التراكمي الحي الموثوق (أوفلاين وأونلاين)
+                          Builder(builder: (context) {
+                            final double liveTotalDebt = allCustomers.fold(
+                              0.0,
+                              (sum, c) =>
+                                  sum +
+                                  (c.currentBalance > 0
+                                      ? c.currentBalance
+                                      : 0.0),
+                            );
+                            final int liveDebtorsCount = allCustomers
+                                .where((c) => c.currentBalance > 0)
+                                .length;
+
+                            return Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'إجمالي ديونك في السوق',
+                                    style: TextStyle(
+                                        fontFamily: 'Cairo',
+                                        fontSize: 12,
+                                        color: Colors.white70),
                                   ),
-                                ),
-                                Text(
-                                  'عدد المدينين: ${summaryData['debtors_count'] ?? allCustomers.where((c) => c.currentBalance > 0).length} زبون',
-                                  style: const TextStyle(
+                                  Text(
+                                    '${liveTotalDebt.toStringAsFixed(0)} ر.ي',
+                                    style: const TextStyle(
                                       fontFamily: 'Cairo',
-                                      fontSize: 11,
-                                      color: Colors.white),
-                                ),
-                              ],
-                            ),
-                          ),
+                                      fontSize: 26,
+                                      fontWeight: FontWeight.w900,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                  Text(
+                                    'عدد المدينين: $liveDebtorsCount زبون',
+                                    style: const TextStyle(
+                                        fontFamily: 'Cairo',
+                                        fontSize: 11,
+                                        color: Colors.white),
+                                  ),
+                                ],
+                              ),
+                            );
+                          }),
                           ElevatedButton.icon(
                             style: ElevatedButton.styleFrom(
                               backgroundColor: Colors.white,
@@ -1155,6 +1168,7 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
                   return;
                 }
 
+                final resolvedUnit = customUnit.isNotEmpty ? customUnit : 'حبة';
                 setState(() {
                   _items.add(_PosDebtItem(
                     productId:
@@ -1163,7 +1177,7 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
                     cartonPrice: price,
                     cartonCapacity: 1,
                     unitLabel:
-                        customUnit, // الوحدة التي كتبها التاجر بيده أو فارغة
+                        resolvedUnit, // إسناد "حبة" افتراضياً لمنع أي نص فارغ
                     unitPrice: price,
                     quantity: qty > 0 ? qty : 1,
                   ));
@@ -1738,14 +1752,20 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
         'pos_${safeMId}_${DateTime.now().microsecondsSinceEpoch}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}_${_selectedCustomer.id.substring(0, _selectedCustomer.id.length > 4 ? 4 : _selectedCustomer.id.length)}';
     try {
       final itemsPayload = _items.map((i) {
+        final safeUnit =
+            i.unitLabel.trim().isNotEmpty ? i.unitLabel.trim() : 'حبة';
+        final displayName = i.unitLabel.trim().isNotEmpty
+            ? '${i.productName} (${i.unitLabel.trim()})'
+            : i.productName;
+
         return {
           'product_id': i.productId,
-          'name': '${i.productName} (${i.unitLabel})',
+          'name': displayName,
           'quantity': i.quantity,
-          'unit_label': i.unitLabel,
+          'unit_label': safeUnit,
           'unit_price': i.unitPrice,
           'subtotal': i.total,
-          'carton_capacity': i.cartonCapacity,
+          'carton_capacity': i.cartonCapacity > 0 ? i.cartonCapacity : 1,
         };
       }).toList();
 

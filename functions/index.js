@@ -414,11 +414,21 @@ exports.checkPhoneNumber = onCall(
 exports.migrateFinancialFields = onCall(
   { region: "us-central1", cors: true, timeoutSeconds: 120 },
   async (request) => {
-    if (!request.auth) {
+    let callerUid = request.auth?.uid;
+    if (!callerUid && typeof request.data?.idToken === "string") {
+      try {
+        const decodedToken = await auth.verifyIdToken(request.data.idToken, true);
+        callerUid = decodedToken.uid;
+      } catch (error) {
+        console.error("migrateFinancialFields could not verify the supplied ID token", error);
+        throw new HttpsError("unauthenticated", "تعذر التحقق من جلسة الدخول");
+      }
+    }
+    if (!callerUid) {
       throw new HttpsError("unauthenticated", "يجب تسجيل الدخول أولاً");
     }
     await requireActiveRole(
-      request.auth.uid,
+      callerUid,
       ["admin", "super_admin", "accountant", "warehouse_manager"],
       "ترحيل البيانات المالية مخصص لمدير النظام",
     );
@@ -834,7 +844,7 @@ exports.placeOrder = onCall(
           throw new HttpsError("failed-precondition", "تعذر احتساب إجمالي الطلب بدقة");
         }
 
-        enrichedItems.push({
+       enrichedItems.push({
           order_id: orderRef.id,
           merchant_id: uid,
           product_id: pId,
@@ -852,6 +862,30 @@ exports.placeOrder = onCall(
           profit: itemProfit,
         });
       }
+
+      // 🛡️ فحص حاسم للمخزون: منع إنشاء أي طلب ناقص وإشعار التاجر فوراً بالأصناف غير المتوفرة
+      if (unavailableItems.length > 0) {
+        const ids = unavailableItems.map((i) => i.id).join(",");
+        const names = unavailableItems.map((i) => i.name).join("، ");
+        throw new HttpsError(
+          "failed-precondition",
+          `PRODUCT_UNAVAILABLE_[${ids}]: نعتذر، الأصناف التالية لم تعد متوفرة في المستودع (${names})`,
+        );
+      }
+
+      if (outOfStockItems.length > 0) {
+        const ids = outOfStockItems.map((i) => i.id).join(",");
+        const names = outOfStockItems.map((i) => i.name).join("، ");
+        throw new HttpsError(
+          "failed-precondition",
+          `OUT_OF_STOCK_[${ids}]: نعتذر، نفد مخزون الأصناف التالية من المستودع (${names})`,
+        );
+      }
+
+      if (enrichedItems.length === 0) {
+        throw new HttpsError("failed-precondition", "لا توجد أصناف صالحة لإتمام هذا الطلب");
+      }
+
 // 🚀 توليد رقم الفاتورة ذرياً وحسابياً فائق السرعة بدون أي قفل قاعدة بيانات (High-Throughput 100+ TPS)
       // يعتمد على الزمن الحالي بنظام Base36 مدمجاً مع 3 خانات عشوائية (مثال: ORD-L8K2P9)
       // 🚀 توليد رقم فاتورة عالي الإنتاجية يستحيل تصادمه إحصائياً (1 في 4.3 مليار لكل جزء ثانية)
@@ -1322,41 +1356,65 @@ exports.deliverOrderByDriver = onCall(
     if (callerRole === "driver" && preflightOrder.driver_id !== uid) {
       throw new HttpsError("permission-denied", "هذا الطلب غير مسند إليك أو تم تسليمه لسائق آخر");
     }
-
-    // Validate before allocating Storage; the transaction below repeats authorization.
+// 🔒 تحفة المعالجة الهجينة للتوقيع: دعم كامل لروابط Storage المسبقة (أونلاين) وبايتات Base64 (أوفلاين)
     let finalSignatureUrl = null;
     if (signatureData != null) {
       if (typeof signatureData !== "string" || signatureData.length > 1400000) {
-        throw new HttpsError("invalid-argument", "حجم التوقيع غير صالح");
-      }
-      const signatureMatch = signatureData.match(/^data:image\/png;base64,([A-Za-z0-9+/]+={0,2})$/);
-      if (!signatureMatch) {
-        throw new HttpsError("invalid-argument", "صيغة التوقيع غير صالحة");
+        throw new HttpsError("invalid-argument", "حجم بيانات التوقيع يتجاوز الحد المسموح");
       }
 
-      const buffer = Buffer.from(signatureMatch[1], "base64");
-      const pngHeader = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-      if (buffer.length === 0 || buffer.length > 1024 * 1024 ||
-          !buffer.subarray(0, 8).equals(pngHeader)) {
-        throw new HttpsError("invalid-argument", "ملف التوقيع غير صالح أو يتجاوز الحجم المسموح");
-      }
+      const rawSig = signatureData.trim();
 
-      try {
-        const bucket = storage.bucket();
-        const fileName = `signatures/order_${cleanOrderId}_${Date.now()}.png`;
-        const file = bucket.file(fileName);
-        const downloadToken = crypto.randomUUID();
+      // ── المسار الأول: إذا كان التوقيع مرفوعاً مسبقاً من تطبيق الفلاتر كـ رابط ويب رسمي (أونلاين) ──
+      if (rawSig.startsWith("https://")) {
+        try {
+          const parsedUrl = new URL(rawSig);
+          const objectPath = decodeURIComponent(parsedUrl.pathname.split("/o/")[1] || "");
+          const belongsToOrder =
+            objectPath.startsWith(`signatures/signature_${cleanOrderId}_`) ||
+            objectPath.startsWith(`signatures/order_${cleanOrderId}_`);
 
-        await file.save(buffer, {
-          metadata: {
-            contentType: "image/png",
-            metadata: { firebaseStorageDownloadTokens: downloadToken },
-          },
-        });
-        finalSignatureUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(fileName)}?alt=media&token=${downloadToken}`;
-      } catch (uploadError) {
-        console.error("[deliverOrderByDriver] Failed to store signature file:", uploadError);
-        finalSignatureUrl = null;
+          if (parsedUrl.hostname !== "firebasestorage.googleapis.com" ||
+              !parsedUrl.searchParams.has("token") || !belongsToOrder) {
+            throw new HttpsError("invalid-argument", "رابط التوقيع غير صالح أو لا يتبع هذا الطلب أمنياً");
+          }
+          finalSignatureUrl = rawSig;
+        } catch (urlError) {
+          if (urlError instanceof HttpsError) throw urlError;
+          throw new HttpsError("invalid-argument", "صيغة رابط التوقيع غير صالحة");
+        }
+      } 
+      // ── المسار الثاني: إذا كان التوقيع ملتقطاً أوفلاين كـ Base64 Data URI ──
+      else {
+        const signatureMatch = rawSig.match(/^data:image\/png;base64,([A-Za-z0-9+/]+={0,2})$/);
+        if (!signatureMatch) {
+          throw new HttpsError("invalid-argument", "صيغة التوقيع غير صالحة (يجب أن يكون رابط HTTPS معتمد أو Base64)");
+        }
+
+        const buffer = Buffer.from(signatureMatch[1], "base64");
+        const pngHeader = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]); // البصمة الرقمية القياسية لملفات PNG
+        if (buffer.length === 0 || buffer.length > 1024 * 1024 ||
+            !buffer.subarray(0, 8).equals(pngHeader)) {
+          throw new HttpsError("invalid-argument", "ملف التوقيع تالف أو لا يطابق ترويسة ملفات PNG الحقيقية");
+        }
+
+        try {
+          const bucket = storage.bucket();
+          const fileName = `signatures/order_${cleanOrderId}_${Date.now()}.png`;
+          const file = bucket.file(fileName);
+          const downloadToken = crypto.randomUUID();
+
+          await file.save(buffer, {
+            metadata: {
+              contentType: "image/png",
+              metadata: { firebaseStorageDownloadTokens: downloadToken },
+            },
+          });
+          finalSignatureUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(fileName)}?alt=media&token=${downloadToken}`;
+        } catch (uploadError) {
+          console.error("[deliverOrderByDriver] Failed to store signature file:", uploadError);
+          finalSignatureUrl = null;
+        }
       }
     }
     return await db.runTransaction(async (tx) => {
@@ -1958,9 +2016,9 @@ exports.adminUpdateOrderStatus = onCall(
       ["admin", "super_admin", "accountant", "warehouse_manager"],
       "هذه العملية خاصة بالإدارة فقط",
     );
-
-    const orderRef = db.collection("orders").doc(cleanOrderId);
-    const requiresStockRestore = cleanStatus === "cancelled" || cleanStatus === "rejected";
+const orderRef = db.collection("orders").doc(cleanOrderId);
+    // 🛡️ شمل حالة "returned" في استرجاع المخزون إلى المستودع لمنع العجز المخزني
+    const requiresStockRestore = cleanStatus === "cancelled" || cleanStatus === "rejected" || cleanStatus === "returned";
 
     // جلب عناصر الطلب خارج المعاملة في حال تطلب استرجاع المخزون
     let itemDocs = [];
@@ -2013,7 +2071,8 @@ exports.adminUpdateOrderStatus = onCall(
       }
       if (driverId) updatePayload.driver_id = String(driverId).trim();
       if (driverName) updatePayload.driver_name = String(driverName).trim();
-// 1. اعتماد الأرباح وتحديث المستند الرئيسي للإحصائيات ذرياً
+
+      // 1. 🛡️ تسوية الأرباح والإحصائيات بدقة تامة عند التسليم أو الإرجاع
       if (cleanStatus === "delivered" && !isProfitRecorded) {
         const totalProfit = Number(
           financialSnap.data()?.total_profit ?? order.total_profit,
@@ -2033,8 +2092,29 @@ exports.adminUpdateOrderStatus = onCall(
           profit_recorded: true,
           updated_at: FieldValue.serverTimestamp(),
         }, { merge: true });
+      } else if (cleanStatus === "returned" && isProfitRecorded) {
+        // 🔒 خصم أرباح الطلب المسلم سابقاً وإضافته إلى إحصائيات المرتجعات المستردة
+        const totalProfit = Number(
+          financialSnap.data()?.total_profit ?? order.total_profit,
+        ) || 0;
+        const totalAmount = Number(order.total_amount) || Number(order.total) || 0;
+
+        const summaryParentRef = db.collection("stats").doc("profit_summary");
+        tx.set(summaryParentRef, {
+          accumulated_profit: FieldValue.increment(-totalProfit),
+          cycle_profit: FieldValue.increment(-totalProfit),
+          accumulated_returns: FieldValue.increment(totalAmount),
+          last_updated: FieldValue.serverTimestamp(),
+        }, { merge: true });
+        updatePayload.profit_recorded = false;
+        tx.set(financialRef, {
+          order_id: cleanOrderId,
+          profit_recorded: false,
+          updated_at: FieldValue.serverTimestamp(),
+        }, { merge: true });
       }
-      // 2. استرجاع المخزون الفعلي في حالة الإلغاء أو الرفض
+
+      // 2. 🛡️ استرجاع المخزون الفعلي في حالة الإلغاء أو الرفض أو الإرجاع
       if (requiresStockRestore && itemDocs.length > 0) {
         for (const itemDoc of itemDocs) {
           const item = itemDoc.data();
@@ -2160,6 +2240,8 @@ exports.addLedgerCustomer = onCall(
           throw new HttpsError("permission-denied", "غير مصرح لك بتعديل بيانات زبون لا يتبع متجرك");
         }
       }
+const existingData = existingSnap.exists ? (existingSnap.data() || {}) : {};
+      const isReactivatingDeleted = existingSnap.exists && existingData.is_deleted === true;
 
       const customerData = {
         id: docRef.id,
@@ -2172,18 +2254,31 @@ exports.addLedgerCustomer = onCall(
         updated_at: FieldValue.serverTimestamp(),
       };
 
-      if (!existingSnap.exists) {
+      if (!existingSnap.exists || isReactivatingDeleted) {
+        // 🔒 تصفير شامل وفوري للزبون المحذوف وتطهير أثره المالي لمنع عودة ديونه المشطوبة
         customerData.current_balance = 0.0;
+        customerData.ledger_version = 0;
+        customerData.applied_tx_ids = [];
+        customerData.last_transaction_id = null;
+        customerData.deleted_at = FieldValue.delete();
+        customerData.summary_deducted = FieldValue.delete();
+        customerData.reconciled_at = FieldValue.serverTimestamp();
         customerData.created_at = FieldValue.serverTimestamp();
+
+        // استبدال كامل للوثيقة دون دمج { merge: true } لإلغاء أي حقول قديمة
         tx.set(docRef, customerData);
       } else {
+        // تحديث عادي لبيانات زبون قائم ونشط مع الحفاظ على رصيده الحالي
         tx.set(docRef, customerData, { merge: true });
       }
+
       return {
         success: true,
         customer: {
           ...customerData,
-          current_balance: existingSnap.exists ? (existingSnap.data().current_balance || 0.0) : 0.0,
+          current_balance: (!existingSnap.exists || isReactivatingDeleted)
+            ? 0.0
+            : (Number(existingData.current_balance) || 0.0),
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         },
@@ -2310,23 +2405,25 @@ exports.recordLedgerTransaction = onCall(
     if (items != null && !Array.isArray(items)) {
       throw new HttpsError("invalid-argument", "قائمة أصناف القيد غير صالحة");
     }
-    const sanitizedItems = (items || []).map((it) => {
+   const sanitizedItems = (items || []).map((it) => {
       if (!it || typeof it !== "object" || Array.isArray(it)) {
         throw new HttpsError("invalid-argument", "بيانات صنف القيد غير صالحة");
       }
 
       const productId = String(it.product_id || "").trim();
       const name = String(it.name || it.product_name || "").trim();
-      const unitLabel = String(it.unit_label || "").trim();
+      // 🔒 إذا ترك التاجر حقل الوحدة فارغاً للسلع اليدوية، يتم إسناد "حبة" تلقائياً بدلاً من رفض المعاملة
+      const rawUnitLabel = String(it.unit_label || "").trim();
+      const unitLabel = rawUnitLabel.length > 0 ? rawUnitLabel : "حبة";
       const quantity = Number(it.quantity);
       const unitPrice = Number(it.unit_price);
       const subtotal = Number(it.subtotal);
-      const cartonCapacity = Number(it.carton_capacity);
-      if (!productId || !name || !unitLabel ||
+      const cartonCapacity = Number(it.carton_capacity) > 0 ? Number(it.carton_capacity) : 1;
+
+      if (!productId || !name ||
           !Number.isSafeInteger(quantity) || quantity <= 0 ||
           !Number.isFinite(unitPrice) || unitPrice < 0 ||
           !Number.isFinite(subtotal) || subtotal < 0 ||
-          !Number.isFinite(cartonCapacity) || cartonCapacity <= 0 ||
           !Number.isSafeInteger(Math.round(unitPrice * quantity * 100)) ||
           Math.round(unitPrice * quantity * 100) !== Math.round(subtotal * 100)) {
         throw new HttpsError("invalid-argument", "بيانات صنف القيد أو إجماليه غير صالحة");
@@ -2424,9 +2521,11 @@ const result = await db.runTransaction(async (tx) => {
 
  tx.set(entryRef, entryData);
 
-      // 🔒 نافذة منزلقة (Sliding Window): الاحتفاظ بآخر 40 معرّفاً فقط لمنع تجاوز سقف الـ 1MB نهائياً
+     // 🔒 توسيع نافذة الأمان المحاسبي إلى 200 حركة (تستهلك ~7KB فقط وتغطي أسابيع من العمل أوفلاين)
       const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
-      const boundedApplied = [...existingApplied.slice(-39), entryId];
+      const boundedApplied = existingApplied.includes(entryId)
+        ? existingApplied
+        : [...existingApplied.slice(-199), entryId];
 
       tx.update(customerRef, {
         current_balance: newBalance,
@@ -2544,14 +2643,17 @@ exports.voidLedgerTransaction = onCall(
         voided_at: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
       });
-// 🔒 التخلص نهائياً من مصفوفة الـ 1500 والاعتماد على تسلسل الإصدار الخفيف (Lightweight OCC Ledger Versioning)
-   const currentVersion = Number(customerData.ledger_version) || 0;
+// 🔒 توسيع نافذة الأمان المحاسبي للشطب إلى 200 حركة مع منع التكرار
+      const currentVersion = Number(customerData.ledger_version) || 0;
       const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
-      const boundedApplied = [...existingApplied.slice(-39), `void_${cleanEntryId}`];
+      const voidTag = `void_${cleanEntryId}`;
+      const boundedApplied = existingApplied.includes(voidTag)
+        ? existingApplied
+        : [...existingApplied.slice(-199), voidTag];
 
       tx.update(customerRef, {
         current_balance: newBalance,
-        last_transaction_id: `void_${cleanEntryId}`,
+        last_transaction_id: voidTag,
         applied_tx_ids: boundedApplied,
         ledger_version: currentVersion + 1,
         last_applied_timestamp: FieldValue.serverTimestamp(),

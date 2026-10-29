@@ -38,8 +38,8 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
   LatLng? _location;
   String _paymentMethod = 'cash';
   bool _isLoading = false;
-  String?
-      _orderIdempotencyKey; // ✅ مفتاح التثبيت لمنع تكرار إنشاء الطلب عند إعادة المحاولة
+  String? _orderIdempotencyKey;
+  String? _lastSubmittedPayloadSignature; // 🔒 بصمة التحقق من ثبات محتوى الطلب
   @override
   void initState() {
     super.initState();
@@ -487,6 +487,14 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       'longitude': _location!.longitude,
       'payment_method': _paymentMethod,
     };
+    // 🔒 مطابقة بصمة محتوى الطلب: إذا عدّل التاجر أي بند أو مبلغ أو ملاحظة أو موقع يُلغى المفتاح القديم فوراً
+    final currentPayloadSignature =
+        '$merchantId|${itemsList.length}|$total|$notesString|$_paymentMethod|${_location?.latitude},${_location?.longitude}|$cartRevision';
+    if (_lastSubmittedPayloadSignature != currentPayloadSignature) {
+      _orderIdempotencyKey = null;
+      _lastSubmittedPayloadSignature = currentPayloadSignature;
+    }
+
     _orderIdempotencyKey ??=
         FirebaseFirestore.instance.collection('orders').doc().id;
     final String generatedOrderId = _orderIdempotencyKey!;
@@ -527,12 +535,10 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
         return;
       }
 
-      final allLocalProducts = AppCache.instance.getAllCachedProducts();
+      var allLocalProducts = AppCache.instance.getAllCachedProducts();
       if (allLocalProducts.isEmpty) {
-        safeDismissLoading();
-        _showError(
-            'تعذر التحقق من توفر المنتجات في وضع عدم الاتصال، يرجى الاتصال بالإنترنت أولاً');
-        return;
+        // 🛡️ خط دفاع احتياطي: اعتماد المنتجات الموجودة سلفاً في سلة التاجر لتأمين إتمام الطلب أوفلاين
+        allLocalProducts = cart.values.map((e) => e.product.toJson()).toList();
       }
 
       final verifiedActiveMap = {
@@ -540,8 +546,9 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           if (p['is_deleted'] != true && p['is_active'] != false)
             p['id']?.toString(): p
       };
-
       final List<String> unverifiedOrStaleKeys = [];
+      String? stockExceededError;
+
       for (final item in cart.values) {
         final pId = item.product.id;
         final liveP = verifiedActiveMap[pId];
@@ -549,6 +556,20 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           unverifiedOrStaleKeys.add(item.cartKey);
           continue;
         }
+
+        // 🛡️ فحص حاسم للمخزون: منع حفظ الطلب أوفلاين إذا كانت الكمية المطلوبة تتجاوز المخزون المتوفر
+        final availableStock = (liveP['stock'] as num?)?.toDouble() ?? 0.0;
+        final capacity = (liveP['items_per_carton'] as num?)?.toInt() ?? 1;
+        final unitQty = item.selectedUnit?.qty ?? capacity;
+        final requestedCartons =
+            (item.quantity * unitQty) / (capacity > 0 ? capacity : 1);
+
+        if (requestedCartons > availableStock) {
+          stockExceededError =
+              'الكمية المطلوبة من (${item.product.name}) تتجاوز المخزون المتوفر بالمستودع (${availableStock.toInt()} كرتون)';
+          break;
+        }
+
         // التحقق من توفر الوحدة المحددة وسعرها
         final unitLabel = item.unitLabel;
         if (unitLabel != 'كرتون') {
@@ -561,6 +582,12 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
         }
       }
 
+      if (stockExceededError != null) {
+        safeDismissLoading();
+        _showError(stockExceededError);
+        return;
+      }
+
       if (unverifiedOrStaleKeys.isNotEmpty) {
         safeDismissLoading();
         for (final k in unverifiedOrStaleKeys) {
@@ -570,7 +597,6 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
             'تم استبعاد أصناف غير متوفرة أو تغيرت وحداتها في الكتالوج، راجع سلتك');
         return;
       }
-
       try {
         await AppStorage.savePendingOrder(orderData);
         await WalService.instance.writeIntent(
@@ -753,6 +779,10 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
           return;
         }
       }
+      // 🔒 تصفير المفتاح القديم حتماً عند فشل المعاملة لتمكين التاجر من تصحيح مدخلاته والمحاولة بمعرّف جديد
+      _orderIdempotencyKey = null;
+      _lastSubmittedPayloadSignature = null;
+
       final lowerErr = err.toLowerCase();
       final friendlyMessage = (lowerErr.contains('network') ||
               lowerErr.contains('timeout') ||

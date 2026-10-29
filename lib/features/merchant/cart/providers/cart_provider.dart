@@ -36,7 +36,6 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
 
   // ── طبقة المستودع المعزولة (Cart Storage Repository) ──
   final _repository = const CartStorageRepository();
-
   Future<void> _load() async {
     if (kIsWeb) return;
     try {
@@ -44,7 +43,27 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
       if (revision != null) _cartRevision = revision;
       _cartRevision ??= _newCartRevision();
 
-      final loaded = await _repository.readCart(_key);
+      var loaded = await _repository.readCart(_key);
+
+      // 🔒 تحفة الترحيل التلقائي: إذا سجل التاجر دخوله وسلته فارغة، ننقل بضائع سلة الزائر السابقة لحسابه فوراً
+      final currentUid = AppStorage.userId;
+      if ((loaded == null || loaded.isEmpty) &&
+          currentUid != null &&
+          currentUid.isNotEmpty) {
+        const guestKey = 'sala_cart_v2_guest';
+        final guestCart = await _repository.readCart(guestKey);
+        if (guestCart != null && guestCart.isNotEmpty) {
+          loaded = guestCart;
+          // ترحيل السلة وحفظها باسم التاجر المسجل وتطهير سلة الزائر
+          await _repository.saveCart(
+            key: _key,
+            revision: _cartRevision!,
+            items: guestCart,
+          );
+          await _repository.deleteCart(guestKey);
+        }
+      }
+
       if (loaded == null || loaded.isEmpty) return;
 
       final merged = _ignoreLoadedCart
@@ -382,30 +401,39 @@ class CartStorageRepository {
         (k, v) => MapEntry(k, CartItem.fromJson(v as Map<String, dynamic>)));
   }
 
+  Future<void> deleteCart(String key) async {
+    if (kIsWeb) return;
+    try {
+      final file = await _getFile('$key.json');
+      final revFile = await _getFile('$key.revision');
+      final backupFile = await _getFile('$key.bak');
+      if (file != null && await file.exists()) await file.delete();
+      if (revFile != null && await revFile.exists()) await revFile.delete();
+      if (backupFile != null && await backupFile.exists())
+        await backupFile.delete();
+      await AppStorage.remove(key);
+    } catch (_) {}
+  }
+
   Future<void> saveCart({
     required String key,
     required String revision,
     required Map<String, CartItem> items,
   }) async {
-    if (kIsWeb || !AppStorage.isLoggedIn || AppStorage.userId == null) return;
+    // 🔒 تم رفع حظر الزائر: يُسمح بحفظ السلة دائماً على القرص سواء كان مسجلاً أو زائراً
+    if (kIsWeb) return;
     final file = await _getFile('$key.json');
     final revFile = await _getFile('$key.revision');
     if (file == null || revFile == null) return;
-
-    final uid = AppStorage.userId ?? 'guest';
 
     if (items.isEmpty) {
       if (await file.exists()) await file.delete();
       final backupFile = File('${file.path}.bak');
       if (await backupFile.exists()) await backupFile.delete();
       if (await revFile.exists()) await revFile.delete();
-      final dir = await getApplicationDocumentsDirectory();
-      final syncBackup = File('${dir.path}/sala_cart_v2_$uid.json');
-      if (await syncBackup.exists()) await syncBackup.delete();
       await AppStorage.remove(key);
       return;
     }
-
     final jsonString = jsonEncode(items.map((k, v) => MapEntry(k, v.toJson())));
     final nonce = DateTime.now().microsecondsSinceEpoch;
     final tempFile = File('${file.path}_$nonce.tmp');

@@ -25,6 +25,7 @@ class CustomerStatementScreen extends StatefulWidget {
 
 class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
   late LedgerCustomer _customer;
+  late LedgerCustomer _latestLiveCustomer; // 🔒 مرجع حي للرصيد الفعلي اللحظي
   final Set<String> _locallyDismissedEntryIds = {};
   int _currentLimit = 50;
 
@@ -32,6 +33,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
   void initState() {
     super.initState();
     _customer = widget.customer;
+    _latestLiveCustomer = widget.customer;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final mId = AppStorage.userId ?? '';
       final lastReconciled = _customer.reconciledAt;
@@ -364,7 +366,10 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
             tooltip: 'إرسال تذكير واتساب',
             icon: const Icon(Icons.chat_rounded, color: Colors.green),
             onPressed: () async {
-              if (_customer.phone.trim().isEmpty) {
+              // 🔒 استخدام الرصيد الحي الفعلي بعد المعاملة مباشرة
+              final targetCustomer = _latestLiveCustomer;
+
+              if (targetCustomer.phone.trim().isEmpty) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
                     content: Text('⚠️ هذا الزبون لا يملك رقم هاتف مسجل للتذكير',
@@ -376,7 +381,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                 return;
               }
               final sent = await LedgerService.instance.sendWhatsAppReminder(
-                customer: _customer,
+                customer: targetCustomer,
                 storeName: widget.storeName,
               );
               if (!sent && context.mounted) {
@@ -425,8 +430,14 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       AppStorage.getPendingLedgerTxs(_customer.merchantId)
                           .where((t) => t['customer_id'] == _customer.id)
                           .toList();
+// 🔒 حصر القيود المعلقة في الأوفلاين للتمييز القطعي بين قيود السيرفر وقيود الهاتف
+                  final pendingCreationTxIds = pendingTxs
+                      .where(
+                          (t) => t['type'] == 'debt' || t['type'] == 'payment')
+                      .map((t) => t['id']?.toString() ?? '')
+                      .where((id) => id.isNotEmpty)
+                      .toSet();
 
-                  // حصر جميع القيود التي صدر لها أمر شطب معلق
                   final pendingVoidTargetIds = pendingTxs
                       .where((t) => t['type'] == 'void_request')
                       .map((t) => t['target_entry_id']?.toString() ?? '')
@@ -434,39 +445,47 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       .toSet();
 
                   int pendingDeltaCents = 0;
-
                   for (final tx in pendingTxs) {
                     final txType = tx['type']?.toString();
                     final txId = tx['id']?.toString() ?? '';
                     final amtCents = LedgerCustomer.toCents(
                         (tx['amount'] as num?)?.toDouble() ?? 0.0);
 
-                    if (txType == 'add_customer' || txType == 'delete_customer')
+                    if (txType == 'add_customer' ||
+                        txType == 'delete_customer') {
                       continue;
+                    }
 
-                    // تجاهل الحركات المعتمدة بالسيرفر أو المحذوفة
+                    // 🔒 تخطي أي حركة معتمدة بالسيرفر أو مقروءة في قائمة الحركات الحية
                     if (serverAppliedIds.contains(txId) ||
-                        _locallyDismissedEntryIds.contains(txId)) {
+                        serverAppliedIds.contains('void_$txId')) {
                       continue;
                     }
 
                     if (txType == 'void_request') {
                       final targetId = tx['target_entry_id']?.toString() ?? '';
-                      // يُحسب الشطب فقط إذا كان القيد المستهدف معتمداً لدى السيرفر
-                      if (serverAppliedIds.contains(targetId)) {
+
+                      if (serverAppliedIds.contains('void_$targetId')) {
+                        continue;
+                      }
+
+                      final isTargetCreatedInCurrentOfflineQueue =
+                          pendingCreationTxIds.contains(targetId);
+                      if (!isTargetCreatedInCurrentOfflineQueue) {
                         final isDebt = tx['is_debt'] != false;
                         pendingDeltaCents += isDebt ? -amtCents : amtCents;
                       }
                       continue;
                     }
 
-                    // إذا كان القيد الأصلي ملغياً في طابور الشطب، لا نضيفه ولا نكرره
-                    if (pendingVoidTargetIds.contains(txId)) continue;
+                    if (pendingVoidTargetIds.contains(txId) ||
+                        _locallyDismissedEntryIds.contains(txId)) {
+                      continue;
+                    }
 
                     final isDebt = txType == 'debt';
                     pendingDeltaCents += isDebt ? amtCents : -amtCents;
                   }
-
                   final double localAdjustments =
                       LedgerCustomer.fromCents(pendingDeltaCents);
                   displayedCustomer = LedgerCustomer(
@@ -483,6 +502,8 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     updatedAt: serverCustomer.updatedAt,
                   );
                 }
+                // 🔒 تحديث مؤشر الزبون الحي لحظياً لأي إجراء لاحق في الصفحة
+                _latestLiveCustomer = displayedCustomer;
                 final isOverLimit = displayedCustomer.isOverLimit;
                 final isNegative = displayedCustomer.currentBalance < 0;
 
@@ -1010,16 +1031,29 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
   late final TextEditingController _amountCtrl;
   late final TextEditingController _notesCtrl;
   bool _isSaving = false;
+  String? _assignedTransactionId;
 
   @override
   void initState() {
     super.initState();
     _amountCtrl = TextEditingController();
     _notesCtrl = TextEditingController();
+    // 🔒 مراقبة مدخلات التاجر لفك القفل المالي تلقائياً عند تعديل أي بيان
+    _amountCtrl.addListener(_onInputChanged);
+    _notesCtrl.addListener(_onInputChanged);
+  }
+
+  void _onInputChanged() {
+    // 🛡️ فك قفل Idempotency Key فوراً عند تعديل التاجر للمبلغ أو البيان لمنع تعارض السيرفر
+    if (_assignedTransactionId != null) {
+      _assignedTransactionId = null;
+    }
   }
 
   @override
   void dispose() {
+    _amountCtrl.removeListener(_onInputChanged);
+    _notesCtrl.removeListener(_onInputChanged);
     _amountCtrl.dispose();
     _notesCtrl.dispose();
     super.dispose();
@@ -1053,8 +1087,6 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
     return res;
   }
 
-  String? _assignedTransactionId;
-
   Future<void> _submit() async {
     if (_isSaving) return;
 
@@ -1068,7 +1100,7 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
 
     final merchantId = AppStorage.userId ?? '';
 
-    // Keep one Firestore-generated id across retries of this submission.
+    // توليد معرف فريد مخصص للمبلغ والبيان الحاليين
     if (_assignedTransactionId == null) {
       final generatedId = FirebaseFirestore.instance
           .collection('merchant_ledger_entries')
@@ -1077,6 +1109,7 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
       _assignedTransactionId = 'ledger_$generatedId';
     }
     final entryId = _assignedTransactionId!;
+
     if (widget.isDebt && widget.customer.creditLimit > 0) {
       final projected = widget.customer.currentBalance + amt;
       if (projected > widget.customer.creditLimit) {
@@ -1142,9 +1175,9 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
 
       _assignedTransactionId = null;
       if (!mounted) return;
-      // نعتمد على Stream المستمع للسيرفر فقط لتحديث الرصيد لمنع تعارض المصادر
       final messenger = ScaffoldMessenger.of(context);
-      Navigator.pop(context, null);
+      // 🔒 إرجاع كائن الزبون المحدّث دائماً لتحديث الشاشة فوراً
+      Navigator.pop(context, updatedCustomer);
       if (updatedCustomer.phone.trim().isNotEmpty) {
         final lastCreatedEntry = LedgerEntry(
           id: entryId,
@@ -1201,6 +1234,8 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
       );
     } catch (e) {
       debugPrint('Ledger transaction submission failed: $e');
+      // 🔒 تصفير القفل فور حدوث أي خطأ لتمكين التاجر من تصحيح بياناته وإعادة المحاولة دون تعليق
+      _assignedTransactionId = null;
       if (!mounted) return;
       setState(() => _isSaving = false);
       ScaffoldMessenger.of(context).showSnackBar(

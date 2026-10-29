@@ -298,8 +298,8 @@ class LedgerService {
         serverMap[custId] = LedgerCustomer.fromMap({'id': custId, ...d.data()});
         serverDocRaws[custId] = d.data();
       }
-
-      // 🛡️ دمج الكاش المحلي مع استبعاد أي زبون محذوف نهائياً لمنع انبعاثه
+// 🛡️ دمج الكاش المحلي مع تتبع معرّفات الكاش لمنع مضاعفة الرصيد في الأوفلاين
+      final Set<String> fromDiskCacheIds = {};
       final existingLocalCached = await getCachedCustomers(cleanMerchantId);
       for (final cached in existingLocalCached) {
         if (deletedCustomerIds.contains(cached.id) ||
@@ -307,6 +307,7 @@ class LedgerService {
             pendingDeletes.contains(cached.id)) continue;
         if (!serverMap.containsKey(cached.id)) {
           serverMap[cached.id] = cached;
+          fromDiskCacheIds.add(cached.id);
         }
       }
 
@@ -332,7 +333,8 @@ class LedgerService {
           );
         }
       }
-// 🔒 التحقق المحاسبي: إضافة فوارق الأوفلاين فقط للحركات التي لم يُقيدها السيرفر بعد
+
+      // 🔒 التحقق المحاسبي: إضافة فوارق الأوفلاين فقط للبيانات القادمة من السيرفر الحي
       final pendingTxs = allPending.where((t) =>
           t['type'] == 'debt' ||
           t['type'] == 'payment' ||
@@ -340,6 +342,13 @@ class LedgerService {
 
       for (final entry in serverMap.entries) {
         final c = entry.value;
+
+        // 🛡️ حماية حاسمة: إذا كان الزبون مقروءاً من كاش القرص (fromDiskCacheIds)،
+        // فرصيده يحتوي مسبقاً على الحركات المعلقة محلياً ولا يجوز إعادة جمعها أبداً
+        if (fromDiskCacheIds.contains(c.id)) {
+          continue;
+        }
+
         final docRaw = serverDocRaws[c.id];
         final appliedIds = (docRaw?['applied_tx_ids'] as List<dynamic>? ?? [])
             .map((e) => e.toString())
@@ -348,31 +357,57 @@ class LedgerService {
         if (lastTxId != null && lastTxId.isNotEmpty) {
           appliedIds.add(lastTxId);
         }
+        final customerPendingList =
+            pendingTxs.where((tx) => tx['customer_id'] == c.id).toList();
 
-        final unappliedPending = pendingTxs.where((tx) {
-          if (tx['customer_id'] != c.id) return false;
+        final pendingCreationIds = customerPendingList
+            .where((t) => t['type'] == 'debt' || t['type'] == 'payment')
+            .map((t) => t['id']?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toSet();
+
+        final pendingVoidTargetIds = customerPendingList
+            .where((t) => t['type'] == 'void_request')
+            .map((t) => t['target_entry_id']?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toSet();
+
+        int deltaCents = 0;
+        for (final tx in customerPendingList) {
+          final txType = tx['type']?.toString();
           final txId = tx['id']?.toString() ?? '';
-          return !appliedIds.contains(txId) &&
-              !appliedIds.contains('void_$txId');
-        });
+          final amtCents = toCents((tx['amount'] as num?)?.toDouble() ?? 0.0);
 
-        double delta = 0.0;
-        for (final tx in unappliedPending) {
-          final amt = (tx['amount'] as num?)?.toDouble() ?? 0.0;
-          if (tx['type'] == 'void_request') {
-            final isDebt = tx['is_debt'] != false;
-            delta += isDebt ? -amt : amt;
-          } else {
-            delta += (tx['type'] == 'debt') ? amt : -amt;
+          // التحقق الأمني: إذا تم تطبيق الحركة بالسيرفر نتخطاها فوراً
+          if (appliedIds.contains(txId) || appliedIds.contains('void_$txId')) {
+            continue;
           }
+
+          if (txType == 'void_request') {
+            final targetId = tx['target_entry_id']?.toString() ?? '';
+            if (appliedIds.contains('void_$targetId')) continue;
+
+            final isCreatedOffline = pendingCreationIds.contains(targetId);
+            if (!isCreatedOffline) {
+              final isDebt = tx['is_debt'] != false;
+              deltaCents += isDebt ? -amtCents : amtCents;
+            }
+            continue;
+          }
+
+          if (pendingVoidTargetIds.contains(txId)) continue;
+
+          deltaCents += (txType == 'debt') ? amtCents : -amtCents;
         }
-        if (delta != 0.0) {
+        if (deltaCents != 0) {
+          final computedBalance =
+              fromCents(toCents(c.currentBalance) + deltaCents);
           serverMap[c.id] = LedgerCustomer(
             id: c.id,
             merchantId: c.merchantId,
             name: c.name,
             phone: c.phone,
-            currentBalance: sanitizeMoney(c.currentBalance + delta),
+            currentBalance: sanitizeMoney(computedBalance),
             creditLimit: c.creditLimit,
             salaryDay: c.salaryDay,
             lastReminderSentAt: c.lastReminderSentAt,
@@ -381,7 +416,6 @@ class LedgerService {
           );
         }
       }
-
       final combinedList = serverMap.values.toList()
         ..sort((a, b) => b.currentBalance.compareTo(a.currentBalance));
 
@@ -1078,7 +1112,6 @@ class LedgerService {
           synced++;
           continue;
         }
-
         await recordTransaction(
           merchantId: item['merchant_id'] ?? merchantId,
           customerId: custId,
@@ -1087,14 +1120,22 @@ class LedgerService {
           notes: item['notes'],
           items: item['items'] ?? const [],
           transactionId: txId,
-          isSyncing:
-              true, // 🔒 منع مضاعفة الرصيد المحلي عند انقطاع الإنترنت أثناء المزامنة
+          isSyncing: true,
         );
         await AppStorage.removePendingLedgerTx(txId, merchantId);
         successfullySyncedIds.add(txId);
         synced++;
       } catch (e) {
         final errStr = e.toString().toLowerCase();
+
+        // 🔒 حماية الطابور من التسمم والتعليق: إذا حُذف الزبون بالسيرفر، نلغي القيد ونحذفه فوراً
+        if (errStr.contains('customer_deleted') ||
+            errStr.contains('not-found')) {
+          await AppStorage.removePendingLedgerTx(txId, merchantId);
+          await WalService.instance.markAborted(txId);
+          continue;
+        }
+
         final isIdempotencyConflict = errStr.contains('already-exists');
         if (isIdempotencyConflict) {
           try {
@@ -1218,7 +1259,7 @@ class LedgerService {
     );
   }
 
-// ─── استماع فوري للقيود محصن أمنياً ومطابق لقواعد Firestore الصارمة ───
+// ─── استماع فوري للقيود مفهرس سحابياً لضمان جلب أحدث الفواتير دائماً ───
   Stream<List<LedgerEntry>> watchCustomerEntries(String customerId,
       {int limit = 50}) {
     final currentMerchantId = AppStorage.userId ?? '';
@@ -1226,16 +1267,13 @@ class LedgerService {
     if (cleanCustomerId.isEmpty || currentMerchantId.trim().isEmpty) {
       return const Stream.empty();
     }
-// 🛡️ استعلام مؤمن وفوري بدون اشتراط فهارس مركبة معقدة
-    // 🔒 استعلام يعتمد فقط على شروط المساواة دون إجبار Firestore على فهرس مركب
-    // الفرز يتم في الذاكرة المحلية (In-Memory) مما يمنع خطأ FAILED_PRECONDITION نهائياً
-    // 🔒 استعلام مفهرس سحابياً تنازلياً يضمن جلب أحدث الحركات فوراً مهما بلغت آلاف السجلات
-// 🔒 استعلام خفيف لا يتطلب أي Composite Index على السيرفر ويمنع FAILED_PRECONDITION
-    // ✅ استعلام خفيف يعتمد على الفهارس الافتراضية الفردية فقط ويفصل الفرز للذاكرة المحلية
+
+    // 🔒 فرز تاريخي تنازلي على السيرفر لضمان جلب أحدث الحركات فوراً وتفادي حجبها بالـ limit
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
         .where('merchant_id', isEqualTo: currentMerchantId.trim())
         .where('customer_id', isEqualTo: cleanCustomerId)
+        .orderBy('created_at', descending: true)
         .limit(limit);
 
     return query.snapshots(includeMetadataChanges: true).map((snap) {
@@ -1245,7 +1283,6 @@ class LedgerService {
               d.data()['is_voided'] != true)
           .map((d) => LedgerEntry.fromMap({'id': d.id, ...d.data()}))
           .toList();
-
       final pendingQueue = AppStorage.getPendingLedgerTxs(currentMerchantId)
           .where((t) => t['customer_id'] == cleanCustomerId);
 

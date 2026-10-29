@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:sala/core/services/local_storage.dart';
@@ -70,6 +71,11 @@ class SessionChecker {
 
     // فحص محلي فوري لتسريع فتح التطبيق وعدم حجب المستخدم
     if (AppStorage.isBanned) {
+      return SessionResult.unauthenticated;
+    }
+
+    final firebaseUser = FirebaseAuth.instance.currentUser;
+    if (firebaseUser == null || firebaseUser.uid != userId) {
       return SessionResult.unauthenticated;
     }
 

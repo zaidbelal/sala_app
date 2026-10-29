@@ -478,12 +478,13 @@ class _BarcodeScannerScreenState extends State<BarcodeScannerScreen>
       Query<Map<String, dynamic>> q) async {
     QuerySnapshot<Map<String, dynamic>> snap;
     try {
+      // 🛡️ رفع سقف النتائج إلى 15 لتخطي الأصناف المحذوفة سلفاً بنفس الباركود والوصول للمنتج النشط
       snap = await q
-          .limit(3)
+          .limit(15)
           .get(const GetOptions(source: Source.serverAndCache))
           .timeout(const Duration(seconds: 3));
     } catch (_) {
-      snap = await q.limit(3).get(const GetOptions(source: Source.cache));
+      snap = await q.limit(15).get(const GetOptions(source: Source.cache));
     }
     for (final d in snap.docs) {
       final data = d.data();

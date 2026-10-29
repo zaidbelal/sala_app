@@ -282,6 +282,7 @@ class AppCache {
     } catch (_) {}
 
     try {
+      final expiredDate = DateTime(2000);
       final productCacheKeys = <String>{
         _keyProducts,
         ..._ram.keys.where((key) => key.startsWith('${_keyProducts}_')),
@@ -292,26 +293,20 @@ class AppCache {
             key == _keyProducts || key.startsWith('${_keyProducts}_')));
       }
 
-      _ram.removeWhere((key, _) =>
-          key == _keyProducts || key.startsWith('${_keyProducts}_'));
-      if (prefs != null) {
-        for (final key in productCacheKeys) {
-          await prefs.remove(key);
+      // 🛡️ وسم البيانات بأنها منتهية الصلاحية (Stale) لتحديثها لاحقاً دون حذف ملفات القرص لتأمين الأوفلاين
+      for (final key in productCacheKeys) {
+        final current = _ram[key];
+        if (current != null) {
+          _ram[key] = _CacheEntry(
+            data: current.data,
+            savedAt: expiredDate,
+          );
+        }
+        if (prefs != null) {
+          await prefs.setString('${key}_ts', expiredDate.toIso8601String());
         }
       }
-
-      if (!kIsWeb) {
-        final dir = await getApplicationDocumentsDirectory();
-        await for (final entity in dir.list()) {
-          final name = entity.uri.pathSegments.last;
-          final isProductCacheFile = (name == '$_keyProducts.json' ||
-                  name.startsWith('${_keyProducts}_')) &&
-              name.endsWith('.json');
-          if (isProductCacheFile && entity is File) {
-            await entity.delete();
-          }
-        }
-      }
+      // 🔒 ملفات القرص تبقى محفوظة بالكامل لتشغيل الطلبات في وضع عدم الاتصال (Offline-First)
     } finally {
       completer.complete();
     }

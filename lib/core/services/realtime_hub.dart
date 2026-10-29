@@ -193,17 +193,31 @@ class RealtimeHub {
     _heartbeatTimer?.cancel();
   }
 
-  // ── قنوات المستخدم مع قفل الحماية ────────────────────────
+// ── قنوات المستخدم مع قفل الحماية والاستعادة الذاتية للحاوية ────────────────────────
   Future<void> startForUser(
     String userId, {
     String role = 'merchant',
+    ProviderContainer? container,
   }) async {
     if (userId.isEmpty) return;
+
+    // 🔒 استعادة ذاتية فورية: التقاط الحاوية من الوسيط أو من شجرة التطبيق إذا فُقدت بعد الخروج
+    if (container != null) {
+      _container = container;
+    } else if (_container == null) {
+      final navCtx = NotificationService.navigatorKey.currentContext;
+      if (navCtx != null) {
+        try {
+          _container = ProviderScope.containerOf(navCtx);
+        } catch (_) {}
+      }
+    }
 
     final normalizedRole = role.toLowerCase().trim();
     if (_activeUserId == userId &&
         _activeUserRole == normalizedRole &&
-        _userSubs.isNotEmpty) {
+        _userSubs.isNotEmpty &&
+        _initialized) {
       return;
     }
 
@@ -218,15 +232,14 @@ class RealtimeHub {
     try {
       if (_activeUserId == userId &&
           _activeUserRole == normalizedRole &&
-          _userSubs.isNotEmpty) {
+          _userSubs.isNotEmpty &&
+          _initialized) {
         return;
       }
 
-      if (_container != null) {
-        _initialized = true;
-        _setConnected();
-        _startHeartbeat();
-      }
+      _initialized = true;
+      _setConnected();
+      _startHeartbeat();
 
       _connectivitySub ??=
           ConnectivityHelper.onConnectivityChanged.listen((hasNet) {
@@ -274,11 +287,13 @@ class RealtimeHub {
 
       await AppStorage.setIsBanned(isBanned);
       await AppStorage.setIsActive(isActive);
-
       if (isBanned || (!isActive && data['account_status'] != 'pending')) {
         final navContext = NotificationService.navigatorKey.currentContext;
         final container = _container;
-        dispose();
+
+        // 🔒 تطهير اشتراكات المستخدم بأمان دون تدمير حاوية التطبيق المركزية
+        await resetOnSignOut();
+
         if (container != null) {
           try {
             container.read(cartProvider.notifier).clear();
@@ -310,7 +325,6 @@ class RealtimeHub {
         }
         return;
       }
-
       if (wasInactive && isActive) {
         await AppStorage.setIsActive(true);
         await AppStorage.saveUserData(

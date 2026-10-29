@@ -230,6 +230,7 @@ class SearchService {
     final matches = <String, Map<String, dynamic>>{};
     DocumentSnapshot<Map<String, dynamic>>? cursor;
 
+    // 1. البحث السحابي المباشر بالبادئة الأولى
     while (matches.length < resultLimit) {
       Query<Map<String, dynamic>> query = collection
           .where('name', isGreaterThanOrEqualTo: prefix)
@@ -256,6 +257,25 @@ class SearchService {
 
       if (matches.length >= resultLimit || page.docs.length < pageSize) break;
       cursor = page.docs.last;
+    }
+
+    // 2. 🛡️ بحث موسع شامل: إيجاد المنتجات التي تقع الكلمات في وسطها أو نهايتها
+    if (matches.length < resultLimit) {
+      try {
+        final broadSnap = await collection
+            .where('is_active', isEqualTo: true)
+            .limit(150)
+            .get(const GetOptions(source: Source.serverAndCache));
+
+        for (final doc in broadSnap.docs) {
+          final data = doc.data();
+          if (data['is_deleted'] == true) continue;
+          if (_matchesTokens(data['name']?.toString() ?? '', tokens)) {
+            matches[doc.id] = {'id': doc.id, ...data};
+            if (matches.length >= resultLimit) break;
+          }
+        }
+      } catch (_) {}
     }
 
     return matches.values.toList(growable: false);
