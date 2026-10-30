@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:convert'; // 👈 لحل خطأ jsonDecode
+import 'dart:io'; // 👈 لحل خطأ File
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -11,11 +14,10 @@ import '../../orders/screens/order_status_screen.dart';
 import '../providers/cart_provider.dart';
 import 'location_picker_screen.dart';
 import 'package:sala/core/constants/app_adaptive_colors.dart';
-import '../../../../core/services/local_storage.dart'; // 🚀 ضروري جداً للوصول إلى AppStorage
+import '../../../../core/services/local_storage.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:sala/features/auth/login/services/auth_service.dart';
 import '../../../../core/services/connectivity_service.dart';
-import 'dart:async';
 import 'package:sala/core/services/wal_service.dart';
 import 'package:sala/core/services/app_cache.dart';
 
@@ -534,11 +536,34 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
             'الحد الأدنى للطلب هو ${serverMinOrder.toStringAsFixed(0)} ر.ي');
         return;
       }
-
+// 🛡️ استرجاع الكتالوج المعتمد من الذاكرة والقرص الصلب مع حظر فحص السلة لنفسها
       var allLocalProducts = AppCache.instance.getAllCachedProducts();
+
+      // إذا كانت الذاكرة باردة بعد فتح التطبيق أوفلاين، نقرأ الكتالوج مباشرة من ملف القرص
+      if (allLocalProducts.isEmpty && !kIsWeb) {
+        try {
+          final appPath = AppStorage.appDocsPath;
+          if (appPath != null) {
+            final catalogFile = File('$appPath/cache_products.json');
+            if (catalogFile.existsSync()) {
+              final rawContent = catalogFile.readAsStringSync();
+              final decoded = jsonDecode(rawContent);
+              if (decoded is List) {
+                allLocalProducts = List<Map<String, dynamic>>.from(
+                  decoded.map((e) => Map<String, dynamic>.from(e as Map)),
+                );
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      // إذا لم يتوفر كتالوج على القرص، نمنع الاعتماد الذاتي المضلل ونوجه التاجر للتأكد
       if (allLocalProducts.isEmpty) {
-        // 🛡️ خط دفاع احتياطي: اعتماد المنتجات الموجودة سلفاً في سلة التاجر لتأمين إتمام الطلب أوفلاين
-        allLocalProducts = cart.values.map((e) => e.product.toJson()).toList();
+        safeDismissLoading();
+        _showError(
+            'تعذر التحقق من مخزون المستودع أوفلاين؛ افتح التطبيق مع توفر الإنترنت مرة واحدة لتحديث الكتالوج');
+        return;
       }
 
       final verifiedActiveMap = {
@@ -548,7 +573,6 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
       };
       final List<String> unverifiedOrStaleKeys = [];
       String? stockExceededError;
-
       for (final item in cart.values) {
         final pId = item.product.id;
         final liveP = verifiedActiveMap[pId];
@@ -726,8 +750,9 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
 
       final err = e.toString();
       // استخراج مرن وشامل يدعم JSON والمعرّفات النصية والمفصولة بفواصل
+      // 🔒 تعبير نمطي يونيكود شامل يدعم كافة المحارف والوحدات العربية داخل وخارج الأقواس
       final RegExp exp = RegExp(
-        r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)(?:\[|\b)([\w\-\:,\s]+)(?:\]|\b)',
+        r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[([^\]]+)\]',
         caseSensitive: false,
       );
       final matches = exp.allMatches(err);
@@ -736,22 +761,24 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
         final keysToRemove = <String>{};
 
         for (final m in matches) {
-          final rawTarget = m.group(1);
-          if (rawTarget == null) continue;
+          final rawContent = m.group(1);
+          if (rawContent == null || rawContent.trim().isEmpty) continue;
 
-          final targetTokens = rawTarget.split(RegExp(r'[,;\s]+'));
-          for (final token in targetTokens) {
+          // تقسيم العناصر في حال إرجاع عدة أصناف غير متوفرة
+          final tokens = rawContent.split(RegExp(r'[,;]+'));
+          for (final token in tokens) {
             final cleanToken = token.trim();
             if (cleanToken.isEmpty) continue;
 
             if (cleanToken.contains(':')) {
-              final parts = cleanToken.split(':');
-              final badProdId = parts[0].trim();
-              final badUnit = parts[1].trim();
+              final splitIndex = cleanToken.indexOf(':');
+              final badProdId = cleanToken.substring(0, splitIndex).trim();
+              final badUnit = cleanToken.substring(splitIndex + 1).trim();
+
               for (final e in cart.entries) {
+                final itemUnit = e.value.unitLabel.trim();
                 if (e.value.product.id == badProdId &&
-                    e.value.unitLabel.trim().toLowerCase() ==
-                        badUnit.toLowerCase()) {
+                    (itemUnit == badUnit || badUnit.isEmpty)) {
                   keysToRemove.add(e.key);
                 }
               }
@@ -764,11 +791,14 @@ class _CheckoutScreenState extends ConsumerState<CheckoutScreen> {
             }
           }
         }
-
         if (keysToRemove.isNotEmpty) {
           for (final k in keysToRemove) {
             cartNotifier.removeItem(k);
           }
+          // 🔒 إغلاق قطعي للطلب في سجل WAL ووسمه كمنتهٍ لمنع قيامته الشبحية عند إعادة تشغيل التطبيق
+          AppStorage.markOrderIdTerminal(generatedOrderId, merchantId);
+          await AppStorage.removePendingOrder(generatedOrderId, merchantId);
+          await WalService.instance.markAborted(generatedOrderId);
           _orderIdempotencyKey = null;
 
           _showError(

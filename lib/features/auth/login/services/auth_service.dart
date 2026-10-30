@@ -392,25 +392,27 @@ class AuthService {
       }
     }
     await AppStorage.clearUserData();
+    await AppStorage.remove(
+        'ledger_deleted_cust_ids_set'); // 👈 تطهير شواهد الدفتر لمنع تسريبها بين الحسابات
     await AppCache.instance.clearAll();
     FirebaseService.clearCache();
     SearchService.clearCache();
     PrefetchService.instance.clear();
-    BarcodeIndexManager.instance
-        .rebuildIndex(); // 🔒 تصفير فهرس الباركود وإعادة تهيئته فارغاً
+    BarcodeIndexManager.instance.rebuildIndex();
+
     if (targetContainer != null) {
-      // 🔒 إعادة تعيين قسري فوري للحاويات لإلغاء أي اشتراكات حية وتطهير الذاكرة
-      targetContainer.refresh(categoriesProvider);
-      targetContainer.refresh(productsProvider(null));
-      targetContainer.refresh(realtimeNotifsProvider);
-      targetContainer.refresh(merchantOrdersProvider);
-      targetContainer.refresh(cartProvider);
-      targetContainer.refresh(realtimeCategoriesProvider);
-      targetContainer.refresh(realtimeBrandsProvider);
-      targetContainer.refresh(realtimeConfirmedOrdersProvider);
-      targetContainer.refresh(realtimeMyShippedOrdersProvider);
-      targetContainer.refresh(realtimeAllOrdersProvider);
-      targetContainer.refresh(driverNewOrderCallbackProvider);
+      // 🛡️ إبطال هادئ بدون استدعاء فوري (Invalidate بدلاً من Refresh) لمنع استنزاف الباقة وطلب 2500 منتج بالخلفية
+      targetContainer.invalidate(categoriesProvider);
+      targetContainer.invalidate(productsProvider);
+      targetContainer.invalidate(realtimeNotifsProvider);
+      targetContainer.invalidate(merchantOrdersProvider);
+      targetContainer.invalidate(cartProvider);
+      targetContainer.invalidate(realtimeCategoriesProvider);
+      targetContainer.invalidate(realtimeBrandsProvider);
+      targetContainer.invalidate(realtimeConfirmedOrdersProvider);
+      targetContainer.invalidate(realtimeMyShippedOrdersProvider);
+      targetContainer.invalidate(realtimeAllOrdersProvider);
+      targetContainer.invalidate(driverNewOrderCallbackProvider);
     }
   }
 

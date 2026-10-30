@@ -92,21 +92,25 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
               final path = signatureUrl.replaceFirst('file://', '');
               final f = File(path);
               if (await f.exists()) {
-                signatureUrl = await f.readAsString();
+                final raw = await f.readAsString();
+                signatureUrl =
+                    raw.trim().replaceAll('\r', '').replaceAll('\n', '');
               } else {
-                // تأجيل العملية لحين توفر الملف لمنع تسليم الطلب بدون توقيع المستلم
+                // في حال فقدان ملف التوقيع المؤقت نتخطى للقيد التالي
                 continue;
               }
             } catch (_) {
               continue;
             }
           }
+
           await OrdersService.deliverOrderByDriver(
             orderId: orderId,
             signatureUrl: signatureUrl,
           );
-          await AppStorage.removePendingDriverDelivery(orderId, driverId);
 
+          // نجاح قطعي: حذف المهمة وملف التوقيع المرتبط بها فوراً
+          await AppStorage.removePendingDriverDelivery(orderId, driverId);
           if (!kIsWeb) {
             try {
               final dir = await getApplicationDocumentsDirectory();
@@ -115,20 +119,26 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
             } catch (_) {}
           }
         } catch (e) {
+          final isNetworkError = ConnectivityHelper.isNetworkException(e);
           final err = e.toString().toLowerCase();
-          // 🔒 فحص شامل يتضمن أخطاء الصلاحيات لمنع حبس تسليمات السائق في الطابور نهائياً
-          if (err.contains('order-not-found') ||
-              err.contains('not_found') ||
+
+          // 🛡️ قائمة الحالات النهائية الصريحة التي يرفض السيرفر تسليمها قطعياً
+          final bool isTerminalRejection = !isNetworkError ||
               err.contains('already-delivered') ||
               err.contains('already_delivered') ||
-              err.contains('failed-precondition') ||
-              err.contains('already-exists') ||
-              err.contains('permission-denied') ||
-              err.contains('permission_denied') ||
-              err.contains('غير مصرح') ||
-              err.contains('غير مسند') ||
               err.contains('تم تسجيل تسليم الطلب مسبقاً') ||
-              err.contains('الطلب غير موجود')) {
+              err.contains('order-not-found') ||
+              err.contains('not-found') ||
+              err.contains('not_found') ||
+              err.contains('الطلب غير موجود') ||
+              err.contains('permission-denied') ||
+              err.contains('غير مسند إليك') ||
+              err.contains('سائق آخر') ||
+              err.contains('failed-precondition') ||
+              err.contains('invalid-argument');
+
+          if (isTerminalRejection) {
+            // كسر الحلقة التكرارية نهائياً وحذف المهمة والتوقيع العالقين
             await AppStorage.removePendingDriverDelivery(orderId, driverId);
             if (!kIsWeb) {
               try {
@@ -137,6 +147,23 @@ class _DriverHomeScreenState extends ConsumerState<DriverHomeScreen>
                 if (await f.exists()) await f.delete();
               } catch (_) {}
             }
+
+            if (mounted && !err.contains('already')) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    '⚠️ تم إسقاط مزامنة الطلب #${orderId.length > 6 ? orderId.substring(0, 6) : orderId} لرفضه نهائياً من السيرفر (مسند لسائق آخر أو ملغي)',
+                    style: const TextStyle(fontFamily: 'Cairo'),
+                  ),
+                  backgroundColor: Colors.deepOrange,
+                  duration: const Duration(seconds: 4),
+                ),
+              );
+            }
+          } else {
+            // خطأ شبكة مؤقت بحت: تأجيل الطلب للمحاولة القادمة دون استنزاف
+            debugPrint('⚠️ ضعف اتصال مؤقت: تأجيل تسليم الطلب $orderId: $e');
+            break; // التوقف عن الدوران لحماية البطارية والباقة لحين استقرار الشبكة
           }
         }
       }

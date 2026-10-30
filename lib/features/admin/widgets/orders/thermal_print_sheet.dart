@@ -72,10 +72,22 @@ class _ThermalPrintPreviewSheetState extends State<ThermalPrintPreviewSheet> {
       return;
     }
     setState(() => _isProcessing = true);
+
+    // 🔒 تحضير التوقيع مسبقاً وتأكيد استقراره على القرص قبل تصوير الفاتورة الحرارية
+    if (widget.signatureUrl != null &&
+        widget.signatureUrl!.startsWith('http')) {
+      try {
+        await ImagePrecacheService.instance.cacheManager
+            .getSingleFile(widget.signatureUrl!)
+            .timeout(const Duration(seconds: 4));
+        if (mounted) setState(() {});
+        await Future.delayed(const Duration(milliseconds: 100));
+      } catch (_) {}
+    }
+
     final bytes = await ThermalPrinterService.capturePngFromKey(_receiptKey);
     if (!mounted) return;
     setState(() => _isProcessing = false);
-
     if (bytes == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(

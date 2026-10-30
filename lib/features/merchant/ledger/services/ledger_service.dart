@@ -585,61 +585,54 @@ class LedgerService {
     required String merchantId,
     required String customerId,
     double currentBalance = 0.0,
+    bool isSyncing =
+        false, // 👈 راية تمنع تكرار الحفظ في طابور الأوفلاين عند المزامنة
   }) async {
     final cleanMerchantId = merchantId.trim();
     final cleanCustomerId = customerId.trim();
     if (cleanCustomerId.isEmpty || cleanMerchantId.isEmpty) return;
 
-    // حفظ نسخة احتياطية محلية دائمة من بيانات الزبون المحذوف في ملف أرشيف
+    // قراءة الزبون والاحتفاظ بنسخة حية كاملة منه قبل لمس أي كاش
     final cached = await getCachedCustomers(cleanMerchantId);
     final cachedIndex = cached.indexWhere((c) => c.id == cleanCustomerId);
     final cachedCustomer = cachedIndex == -1 ? null : cached[cachedIndex];
 
-    if (cachedCustomer != null && !kIsWeb) {
-      try {
-        final dir = await getApplicationDocumentsDirectory();
-        final backupFile = File(
-            '${dir.path}/ledger_deleted_cust_backup_$cleanCustomerId.json');
-        await backupFile.writeAsString(jsonEncode(cachedCustomer.toMap()),
-            flush: true);
-      } catch (_) {}
-    }
-
-    // 1. الإخفاء الفوري الدائم حتى بعد إغلاق التطبيق أوفلاين
-    _recordDeletedCustomerId(cleanCustomerId);
-
-    // 2. التحديث في كاش القرص
-    cached.removeWhere((c) => c.id == cleanCustomerId);
-    await _cacheCustomersLocally(cleanMerchantId, cached);
+    // دالة تراجع متزامنة تضمن عودة الزبون فوراً للواجهة والقرص إذا حدث أي خطأ
     Future<void> restoreCustomer() async {
       _removeDeletedCustomerId(cleanCustomerId);
-      if (cachedCustomer == null) return;
-      final restored = await getCachedCustomers(cleanMerchantId);
-      if (!restored.any((customer) => customer.id == cleanCustomerId)) {
-        restored.insert(
-          cachedIndex.clamp(0, restored.length).toInt(),
-          cachedCustomer,
-        );
-        await _cacheCustomersLocally(cleanMerchantId, restored);
+      if (cachedCustomer != null) {
+        final currentCached = await getCachedCustomers(cleanMerchantId);
+        if (!currentCached.any((c) => c.id == cleanCustomerId)) {
+          final insertIdx = cachedIndex.clamp(0, currentCached.length);
+          currentCached.insert(insertIdx, cachedCustomer);
+          await _cacheCustomersLocally(cleanMerchantId, currentCached);
+        }
       }
     }
 
-    // 3. استدعاء السيرفر لتسوية ديون السوق أو حفظها في طابور الأوفلاين
+    // 1. تطبيق الحذف التفاؤلي الفوري محلياً لتحسين الاستجابة (Optimistic UI)
+    _recordDeletedCustomerId(cleanCustomerId);
+    cached.removeWhere((c) => c.id == cleanCustomerId);
+    await _cacheCustomersLocally(cleanMerchantId, cached);
+
     final hasInternet = await ConnectivityHelper.hasActiveInternet();
     final deletedAt = DateTime.now().toIso8601String();
+
     if (!hasInternet) {
-      try {
-        await AppStorage.savePendingLedgerTx({
-          'id': 'del_$cleanCustomerId',
-          'merchant_id': cleanMerchantId,
-          'customer_id': cleanCustomerId,
-          'type': 'delete_customer',
-          'amount': currentBalance,
-          'created_at': deletedAt,
-        });
-      } catch (_) {
-        await restoreCustomer();
-        rethrow;
+      if (!isSyncing) {
+        try {
+          await AppStorage.savePendingLedgerTx({
+            'id': 'del_$cleanCustomerId',
+            'merchant_id': cleanMerchantId,
+            'customer_id': cleanCustomerId,
+            'type': 'delete_customer',
+            'amount': currentBalance,
+            'created_at': deletedAt,
+          });
+        } catch (_) {
+          await restoreCustomer();
+          rethrow;
+        }
       }
       throw const LedgerQueuedException(
           'لا يوجد اتصال بالإنترنت، حُذف الزبون محلياً وحُفظ طلب الحذف للمزامنة');
@@ -651,23 +644,34 @@ class LedgerService {
         options: HttpsCallableOptions(timeout: const Duration(seconds: 15)),
       );
       await callable.call({'customerId': cleanCustomerId});
+
+      // ✅ فور نجاح الحذف في السيرفر: نطهر المعرّف من قائمة الشواهد المؤقتة لأن السيرفر أصبح يحمل is_deleted: true
+      _removeDeletedCustomerId(cleanCustomerId);
     } catch (e) {
+      // 🛡️ إذا رفض السيرفر الحذف لأسباب أمنية أو صلاحيات: تراجع فوري واستعادة الزبون وديونه للشاشة
       if (_isFatalLedgerError(e)) {
         await restoreCustomer();
+        // إزالة أمر الحذف العالق من طابور المزامنة إن وجد لمنع إعادة تكراره
+        await AppStorage.removePendingLedgerTx(
+            'del_$cleanCustomerId', cleanMerchantId);
         rethrow;
       }
-      try {
-        await AppStorage.savePendingLedgerTx({
-          'id': 'del_$cleanCustomerId',
-          'merchant_id': cleanMerchantId,
-          'customer_id': cleanCustomerId,
-          'type': 'delete_customer',
-          'amount': currentBalance,
-          'created_at': deletedAt,
-        });
-      } catch (_) {
-        await restoreCustomer();
-        rethrow;
+
+      // إذا كان الخطأ مجرد انقطاع في الشبكة ولم نكن في وضع مزامنة: نحفظ الحركة في طابور الأوفلاين
+      if (!isSyncing) {
+        try {
+          await AppStorage.savePendingLedgerTx({
+            'id': 'del_$cleanCustomerId',
+            'merchant_id': cleanMerchantId,
+            'customer_id': cleanCustomerId,
+            'type': 'delete_customer',
+            'amount': currentBalance,
+            'created_at': deletedAt,
+          });
+        } catch (_) {
+          await restoreCustomer();
+          rethrow;
+        }
       }
       throw const LedgerQueuedException(
           'تعذر الاتصال بالسيرفر، حُفظ طلب حذف الزبون للمزامنة');
@@ -820,56 +824,44 @@ class LedgerService {
     final cleanEntryId = entryId.trim();
     final voidRequestId = 'void_$cleanEntryId';
 
-    final pendingQueue = AppStorage.getPendingLedgerTxs(cleanMerchantId);
-    if (pendingQueue.any((t) => t['id'] == voidRequestId)) return;
-    final pendingIdx = pendingQueue.indexWhere((t) => t['id'] == cleanEntryId);
-    if (pendingIdx != -1) {
-      final pendingItem = pendingQueue[pendingIdx];
-      final amt = sanitizeMoney((pendingItem['amount'] as num).toDouble());
-      final isDebt = pendingItem['type'] == 'debt';
-      final reverseDelta = isDebt ? -amt : amt;
-
-      // أبقِ القيد حتى تُرسل المزامنة القيد ثم تؤكد الشطب على الخادم.
-      await AppStorage.savePendingLedgerTx({
-        'id': voidRequestId,
-        'merchant_id': cleanMerchantId,
-        'customer_id': cleanCustomerId,
-        'type': 'void_request',
-        'target_entry_id': cleanEntryId,
-        'amount': amt,
-        'is_debt': isDebt,
-        'created_at': DateTime.now().toIso8601String(),
-      });
-
-      final cached = await getCachedCustomers(cleanMerchantId);
-      final cIdx = cached.indexWhere((c) => c.id == cleanCustomerId);
-      if (cIdx != -1) {
-        final old = cached[cIdx];
-        cached[cIdx] = LedgerCustomer(
-          id: old.id,
-          merchantId: old.merchantId,
-          name: old.name,
-          phone: old.phone,
-          currentBalance: sanitizeMoney(old.currentBalance + reverseDelta),
-          creditLimit: old.creditLimit,
-          salaryDay: old.salaryDay,
-          lastReminderSentAt: old.lastReminderSentAt,
-          createdAt: old.createdAt,
-          updatedAt: DateTime.now(),
-        );
-        await _cacheCustomersLocally(cleanMerchantId, cached);
-      }
-      return;
-    }
-    final hasInternet = await ConnectivityHelper.hasActiveInternet();
     if (!knownAmount.isFinite || knownAmount <= 0) {
       throw ArgumentError.value(
           knownAmount, 'knownAmount', 'يجب أن يكون مبلغ القيد موجباً وصالحاً');
     }
     final targetAmount = sanitizeMoney(knownAmount);
     final isDebtTarget = knownIsDebt;
+    final reverseDelta = isDebtTarget ? -targetAmount : targetAmount;
 
-    // 🔒 تدوين نية الإبطال في WAL فوراً سواء كان الهاتف متصلاً أو أوفلاين
+    final hasInternet = await ConnectivityHelper.hasActiveInternet();
+    final pendingQueue = AppStorage.getPendingLedgerTxs(cleanMerchantId);
+    if (pendingQueue.any((t) => t['id'] == voidRequestId)) return;
+    final pendingIdx = pendingQueue.indexWhere((t) => t['id'] == cleanEntryId);
+
+    // 🔒 فحص قاطع: لا يُحذف القيد أوفلاين دون إخطار السيرفر إلا إذا ثبت يقيناً بالاتصال المباشر عدم وجوده بالسيرفر
+    if (pendingIdx != -1 && hasInternet) {
+      bool existsOnServer = false;
+      try {
+        final checkDoc = await _db
+            .collection('merchant_ledger_entries')
+            .doc(cleanEntryId)
+            .get(const GetOptions(source: Source.server))
+            .timeout(const Duration(seconds: 3));
+        existsOnServer = checkDoc.exists;
+      } catch (_) {
+        existsOnServer = true; // نتحوط للأمان في حال تعثر فحص السيرفر
+      }
+
+      if (!existsOnServer) {
+        // ثبت يقيناً أن القيد لم يصل السيرفر إطلاقاً؛ يُحذف محلياً بأمان تام دون طلب شطب
+        await AppStorage.removePendingLedgerTx(cleanEntryId, cleanMerchantId);
+        await WalService.instance.markAborted(cleanEntryId);
+        await _applyLocalCustomerAdjustment(
+            cleanMerchantId, cleanCustomerId, reverseDelta);
+        return;
+      }
+    }
+
+    // 🔒 تدوين نية الشطب في سجل الـ WAL محلياً
     await WalService.instance.writeIntent(
       transactionId: cleanEntryId,
       type: WalOperationType.ledgerTransaction,
@@ -882,80 +874,63 @@ class LedgerService {
       },
     );
 
-    if (!hasInternet) {
-      await AppStorage.savePendingLedgerTx({
-        'id': voidRequestId,
-        'merchant_id': cleanMerchantId,
-        'customer_id': cleanCustomerId,
-        'type': 'void_request',
-        'target_entry_id': cleanEntryId,
-        'amount': targetAmount,
-        'is_debt': isDebtTarget,
-        'created_at': DateTime.now().toIso8601String(),
-      });
+    // 🔒 تأمين طلب الشطب في طابور الأوفلاين (Pending Queue) لضمان عدم عودة الدين الشبحي إطلاقاً
+    final voidTxPayload = {
+      'id': voidRequestId,
+      'merchant_id': cleanMerchantId,
+      'customer_id': cleanCustomerId,
+      'type': 'void_request',
+      'target_entry_id': cleanEntryId,
+      'amount': targetAmount,
+      'is_debt': isDebtTarget,
+      'created_at': DateTime.now().toIso8601String(),
+    };
+    await AppStorage.savePendingLedgerTx(voidTxPayload);
+    await _applyLocalCustomerAdjustment(
+        cleanMerchantId, cleanCustomerId, reverseDelta);
 
-      final cached = await getCachedCustomers(cleanMerchantId);
-      final cIdx = cached.indexWhere((c) => c.id == cleanCustomerId);
-      if (cIdx != -1) {
-        final old = cached[cIdx];
-        final reverseDelta = isDebtTarget ? -targetAmount : targetAmount;
-        cached[cIdx] = LedgerCustomer(
-          id: old.id,
-          merchantId: old.merchantId,
-          name: old.name,
-          phone: old.phone,
-          currentBalance: sanitizeMoney(old.currentBalance + reverseDelta),
-          creditLimit: old.creditLimit,
-          salaryDay: old.salaryDay,
-          lastReminderSentAt: old.lastReminderSentAt,
-          createdAt: old.createdAt,
-          updatedAt: DateTime.now(),
-        );
-        await _cacheCustomersLocally(cleanMerchantId, cached);
-      }
-      return;
+    if (!hasInternet) {
+      return; // تم التأمين محلياً وسيرسل السيرفر عند عودة الاتصال عبر دالة المزامنة
     }
+
+    // محاولة الإرسال الفوري للسيرفر إذا توفر الإنترنت
     try {
       await _sendVoidTransaction(cleanCustomerId, cleanEntryId);
+      await AppStorage.removePendingLedgerTx(voidRequestId, cleanMerchantId);
     } catch (e) {
       if (_isFatalLedgerError(e)) {
+        await AppStorage.removePendingLedgerTx(voidRequestId, cleanMerchantId);
         await WalService.instance.markAborted(cleanEntryId);
         rethrow;
       }
+      // في حال حدوث خطأ شبكة مؤقت، يبقى القيد في AppStorage لترسله دالة المزامنة تلقائياً
+    }
+  }
 
-      // 🛡️ حفظ طلب الشطب في طابور الأوفلاين عند تعثر الاتصال بالسيرفر
-      await AppStorage.savePendingLedgerTx({
-        'id': voidRequestId,
-        'merchant_id': cleanMerchantId,
-        'customer_id': cleanCustomerId,
-        'type': 'void_request',
-        'target_entry_id': cleanEntryId,
-        'amount': targetAmount,
-        'is_debt': isDebtTarget,
-        'created_at': DateTime.now().toIso8601String(),
-      });
-
-      final cached = await getCachedCustomers(cleanMerchantId);
-      final cIdx = cached.indexWhere((c) => c.id == cleanCustomerId);
-      if (cIdx != -1) {
-        final old = cached[cIdx];
-        final reverseDelta = isDebtTarget ? -targetAmount : targetAmount;
-        cached[cIdx] = LedgerCustomer(
-          id: old.id,
-          merchantId: old.merchantId,
-          name: old.name,
-          phone: old.phone,
-          currentBalance: sanitizeMoney(old.currentBalance + reverseDelta),
-          creditLimit: old.creditLimit,
-          salaryDay: old.salaryDay,
-          lastReminderSentAt: old.lastReminderSentAt,
-          createdAt: old.createdAt,
-          updatedAt: DateTime.now(),
-        );
-        await _cacheCustomersLocally(cleanMerchantId, cached);
-      }
-      throw TimeoutException(
-          'تعثر الاتصال بالسيرفر، تم حفظ طلب الشطب في طابور الأوفلاين');
+  /// دالة مساعدة مركزية لتحديث الكاش المحلي لرصيد الزبون بدقة القروش
+  Future<void> _applyLocalCustomerAdjustment(
+    String merchantId,
+    String customerId,
+    double delta,
+  ) async {
+    final cached = await getCachedCustomers(merchantId);
+    final cIdx = cached.indexWhere((c) => c.id == customerId);
+    if (cIdx != -1) {
+      final old = cached[cIdx];
+      final newCents = toCents(old.currentBalance) + toCents(delta);
+      cached[cIdx] = LedgerCustomer(
+        id: old.id,
+        merchantId: old.merchantId,
+        name: old.name,
+        phone: old.phone,
+        currentBalance: fromCents(newCents),
+        creditLimit: old.creditLimit,
+        salaryDay: old.salaryDay,
+        lastReminderSentAt: old.lastReminderSentAt,
+        createdAt: old.createdAt,
+        updatedAt: DateTime.now(),
+      );
+      await _cacheCustomersLocally(merchantId, cached);
     }
   }
 
@@ -999,47 +974,87 @@ class LedgerService {
   }
 
 // ─── مزامنة طابور الأوفلاين مع السيرفر بدقة موحدة وبدون فقدان للملف الدائم ───
-// قفل تزامني خاص بملف اليومية الدائم لمنع تضارب القراءة والكتابة
-  static Future<void> _durableFileLock = Future.value();
-
   Future<LedgerSyncResult> syncPendingLedgerQueue(String merchantId) async {
-    final Map<String, Map<String, dynamic>> unifiedQueue = {};
-// 1. قراءة الطابور المخزن محلياً في SharedPreferences أولاً
-    for (final item in AppStorage.getPendingLedgerTxs(merchantId)) {
-      final id = item['id']?.toString() ?? '';
-      if (id.isNotEmpty) unifiedQueue[id] = item;
-    }
-
-    // 2. دمج كافة القيود والعمليات المحفوظة في ملف القرص الصلب الدائم قبل الترتيب والفرز
-    File? durableFile;
-    if (!kIsWeb) {
-      try {
-        final dir = await getApplicationDocumentsDirectory();
-        durableFile = File('${dir.path}/ledger_durable_journal_$merchantId.db');
-        if (await durableFile.exists()) {
-          final lines = await durableFile.readAsLines();
-          for (final line in lines) {
-            if (line.trim().isEmpty) continue;
-            try {
-              final item = Map<String, dynamic>.from(jsonDecode(line.trim()));
-              final id = item['id']?.toString() ?? '';
-              if (id.isEmpty) continue;
-              if (item['action'] == 'void_local' || item['is_voided'] == true) {
-                unifiedQueue.remove(id);
-              } else if (!unifiedQueue.containsKey(id)) {
-                unifiedQueue[id] = item;
-              }
-            } catch (_) {}
-          }
-        }
-      } catch (_) {}
-    }
-
-    if (unifiedQueue.isEmpty) {
+    final rawPending = AppStorage.getPendingLedgerTxs(merchantId);
+    if (rawPending.isEmpty) {
       return const LedgerSyncResult(syncedCount: 0, unresolvedCount: 0);
     }
 
-    // 🔒 الترتيب الزمني الفعلي لكامل الطابور الموحد (SharedPreferences + ملف القرص الدائم معاً)
+    // فهرسة موحدة مبنية على المفتاح الأساسي للعملية
+    final Map<String, Map<String, dynamic>> unifiedQueue = {
+      for (final item in rawPending)
+        if ((item['id']?.toString() ?? '').isNotEmpty)
+          item['id'].toString(): Map<String, dynamic>.from(item)
+    };
+
+    int synced = 0;
+    int unresolved = 0;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 🛡️ المرحلة 1: التسوية والتصفية المسبقة الذكية (Pre-Sync Netting Pass)
+    // إسقاط العمليات الملغاة محلياً بالكامل لمنع إرسال قيود شبحية إلى السيرفر
+    // ══════════════════════════════════════════════════════════════════════
+
+    // أ) إسقاط أزواج (القيد + طلب شطبه) التي وُلدت معاً في الأوفلاين
+    final voidRequests =
+        unifiedQueue.values.where((t) => t['type'] == 'void_request').toList();
+
+    for (final voidReq in voidRequests) {
+      final voidTxId = voidReq['id']?.toString() ?? '';
+      final targetEntryId = voidReq['target_entry_id']?.toString() ?? '';
+
+      // إذا كان القيد الأصلي لا يزال في الطابور المحلي (لم يسبق اعتماده بالسيرفر)
+      if (targetEntryId.isNotEmpty && unifiedQueue.containsKey(targetEntryId)) {
+        await AppStorage.removePendingLedgerTx(targetEntryId, merchantId);
+        await AppStorage.removePendingLedgerTx(voidTxId, merchantId);
+        await WalService.instance.markAborted(targetEntryId);
+        unifiedQueue.remove(targetEntryId);
+        unifiedQueue.remove(voidTxId);
+        synced += 2;
+      }
+    }
+
+    // ب) إسقاط زبائن الأوفلاين الذين أُضيفوا ثم حُذفوا أوفلاين قبل مزامنتهم للسيرفر
+    final deleteCustomerRequests = unifiedQueue.values
+        .where((t) => t['type'] == 'delete_customer')
+        .toList();
+
+    for (final delReq in deleteCustomerRequests) {
+      final delTxId = delReq['id']?.toString() ?? '';
+      final custId = delReq['customer_id']?.toString() ?? '';
+      final addCustTxId = 'cust_$custId';
+
+      if (custId.isNotEmpty && unifiedQueue.containsKey(addCustTxId)) {
+        await AppStorage.removePendingLedgerTx(addCustTxId, merchantId);
+        await AppStorage.removePendingLedgerTx(delTxId, merchantId);
+        unifiedQueue.remove(addCustTxId);
+        unifiedQueue.remove(delTxId);
+
+        // تنظيف أي حركات مالية أُنشئت لهذا الزبون في نفس جلسة الأوفلاين
+        final dependentTxs = unifiedQueue.values
+            .where((t) => t['customer_id'] == custId)
+            .toList();
+
+        for (final dep in dependentTxs) {
+          final depId = dep['id']?.toString() ?? '';
+          if (depId.isNotEmpty) {
+            await AppStorage.removePendingLedgerTx(depId, merchantId);
+            await WalService.instance.markAborted(depId);
+            unifiedQueue.remove(depId);
+            synced++;
+          }
+        }
+        synced += 2;
+      }
+    }
+
+    if (unifiedQueue.isEmpty) {
+      return LedgerSyncResult(syncedCount: synced, unresolvedCount: 0);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 🚀 المرحلة 2: إرسال العمليات المتبقية الحقيقية مرتبة زمنياً
+    // ══════════════════════════════════════════════════════════════════════
     final sortedQueueList = unifiedQueue.values.toList()
       ..sort((a, b) {
         final aTime = DateTime.tryParse(a['created_at']?.toString() ?? '') ??
@@ -1049,9 +1064,12 @@ class LedgerService {
         return aTime.compareTo(bTime);
       });
 
-    int synced = 0;
-    int unresolved = 0;
-    final List<String> successfullySyncedIds = [];
+    // 🔒 مجموعة تتبع ديناميكية تمنع تجويع قيود الزبائن الجدد وتتيح مزامنتها في نفس الدورة
+    final pendingCreationCustomerIds = sortedQueueList
+        .where((q) => q['type'] == 'add_customer')
+        .map((q) => q['customer_id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toSet();
 
     for (final item in sortedQueueList) {
       final txId = item['id']?.toString() ?? '';
@@ -1070,37 +1088,38 @@ class LedgerService {
             existingCustomerId: custId,
           );
           await AppStorage.removePendingLedgerTx(txId, merchantId);
-          successfullySyncedIds.add(txId);
+          pendingCreationCustomerIds
+              .remove(custId); // 👈 فك الحظر فوراً عن قيود هذا الزبون
           synced++;
           continue;
         }
+
         if (type == 'delete_customer') {
           await deleteCustomer(
             merchantId: merchantId,
             customerId: custId,
             currentBalance: (item['amount'] as num?)?.toDouble() ?? 0.0,
+            isSyncing: true,
           );
           await AppStorage.removePendingLedgerTx(txId, merchantId);
-          successfullySyncedIds.add(txId);
+          pendingCreationCustomerIds.remove(custId);
           synced++;
           continue;
         }
+
         if (type == 'void_request') {
           final targetEntryId = item['target_entry_id']?.toString() ?? '';
           if (targetEntryId.isNotEmpty) {
-            if (unifiedQueue.containsKey(targetEntryId) &&
-                !successfullySyncedIds.contains(targetEntryId)) {
-              continue;
-            }
             try {
               await _sendVoidTransaction(custId, targetEntryId);
             } catch (voidErr) {
               final errText = voidErr.toString().toLowerCase();
-              // إذا كان القيد غير موجود على السيرفر أصلاً (أُنشئ وحُذف أوفلاين)، نعتبر الإلغاء ناجحاً
               if (errText.contains('not-found') ||
+                  errText.contains('already-voided') ||
+                  errText.contains('alreadyvoided') ||
                   errText.contains('غير موجود')) {
                 debugPrint(
-                    'Void target $targetEntryId was never on server. Clearing from queue.');
+                    'Void target $targetEntryId already voided on server. Removing.');
                 await WalService.instance.markCommitted(targetEntryId);
               } else {
                 rethrow;
@@ -1108,10 +1127,17 @@ class LedgerService {
             }
           }
           await AppStorage.removePendingLedgerTx(txId, merchantId);
-          successfullySyncedIds.add(txId);
           synced++;
           continue;
         }
+
+        // 🔒 التحقق الدقيق: تأجيل القيد فقط إذا تعثر إنشاء الزبون مسبقاً في هذه الدورة
+        if (pendingCreationCustomerIds.contains(custId)) {
+          unresolved++;
+          continue;
+        }
+
+        // قيود الديون والسداد (debt / payment) - تمر الآن بسلاسة تامة للزبائن الجدد
         await recordTransaction(
           merchantId: item['merchant_id'] ?? merchantId,
           customerId: custId,
@@ -1123,23 +1149,45 @@ class LedgerService {
           isSyncing: true,
         );
         await AppStorage.removePendingLedgerTx(txId, merchantId);
-        successfullySyncedIds.add(txId);
         synced++;
       } catch (e) {
         final errStr = e.toString().toLowerCase();
 
-        // 🔒 حماية الطابور من التسمم والتعليق: إذا حُذف الزبون بالسيرفر، نلغي القيد ونحذفه فوراً
-        if (errStr.contains('customer_deleted') ||
-            errStr.contains('not-found')) {
+        // 🛡️ حظر مسح الديون: لا يُحذف القيد المالي إطلاقاً عند خطأ not-found منعاً لضياع أموال التاجر
+        if (errStr.contains('customer_deleted')) {
           await AppStorage.removePendingLedgerTx(txId, merchantId);
           await WalService.instance.markAborted(txId);
           continue;
         }
 
+        // إذا كان خطأ not-found، نحاول التحقق هل الزبون موجود محلياً لإعادة إنشائه بدلاً من شطب الدين
+        if (errStr.contains('not-found')) {
+          final cachedCustomers = await getCachedCustomers(merchantId);
+          final match = cachedCustomers.firstWhere((c) => c.id == custId,
+              orElse: () => LedgerCustomer(
+                  id: '',
+                  merchantId: '',
+                  name: '',
+                  phone: '',
+                  currentBalance: 0,
+                  createdAt: DateTime.now(),
+                  updatedAt: DateTime.now()));
+          if (match.id.isNotEmpty) {
+            try {
+              await addCustomer(
+                merchantId: merchantId,
+                name: match.name,
+                phone: match.phone,
+                creditLimit: match.creditLimit,
+                salaryDay: match.salaryDay,
+                existingCustomerId: custId,
+              );
+            } catch (_) {}
+          }
+        }
         final isIdempotencyConflict = errStr.contains('already-exists');
         if (isIdempotencyConflict) {
           try {
-            // ✅ مطابقة نوع العملية: إذا كانت إضافة زبون، نفحص جدول الزبائن
             if (type == 'add_customer') {
               final doc = await _db
                   .collection('merchant_customers')
@@ -1148,108 +1196,19 @@ class LedgerService {
                   .timeout(const Duration(seconds: 4));
               if (doc.exists && doc.data()?['merchant_id'] == merchantId) {
                 await AppStorage.removePendingLedgerTx(txId, merchantId);
-                successfullySyncedIds.add(txId);
                 synced++;
                 continue;
               }
             } else if (await _matchesPersistedLedgerIntent(txId, item)) {
               await WalService.instance.markCommitted(txId);
               await AppStorage.removePendingLedgerTx(txId, merchantId);
-              successfullySyncedIds.add(txId);
               synced++;
               continue;
             }
-          } catch (verificationError) {
-            debugPrint(
-                'Could not verify existing ledger entry $txId; preserving the pending entry: $verificationError');
-          }
+          } catch (_) {}
         }
+
         unresolved++;
-        debugPrint(isIdempotencyConflict
-            ? 'Ledger idempotency conflict for $txId; preserving the pending entry because the existing entry did not match the intent: $e'
-            : 'Ledger sync deferred for $txId; preserving the pending entry: $e');
-      }
-    }
-    final deferredVoidRequests = AppStorage.getPendingLedgerTxs(merchantId)
-        .where((item) =>
-            item['type'] == 'void_request' &&
-            successfullySyncedIds
-                .contains(item['target_entry_id']?.toString() ?? ''))
-        .toList();
-    for (final item in deferredVoidRequests) {
-      final targetEntryId = item['target_entry_id']?.toString() ?? '';
-      final requestId = item['id']?.toString() ?? '';
-      final customerId = item['customer_id']?.toString() ?? '';
-      if (targetEntryId.isEmpty || requestId.isEmpty || customerId.isEmpty) {
-        continue;
-      }
-      try {
-        await _sendVoidTransaction(customerId, targetEntryId);
-        await AppStorage.removePendingLedgerTx(requestId, merchantId);
-        successfullySyncedIds.add(requestId);
-        synced++;
-      } catch (e) {
-        final error = e.toString().toLowerCase();
-        if (error.contains('not-found') || error.contains('alreadyvoided')) {
-          await AppStorage.removePendingLedgerTx(requestId, merchantId);
-          successfullySyncedIds.add(requestId);
-          synced++;
-        } else {
-          unresolved++;
-          if (kDebugMode) {
-            debugPrint(
-                '⚠️ تأجيل شطب القيد $targetEntryId لحين استقرار الاتصال: $e');
-          }
-        }
-      }
-    }
-// 3. إعادة كتابة ملف القرص الدائم داخل قفل Mutex لقراءة التعديلات اللحظية الطازجة
-    if (!kIsWeb && durableFile != null && successfullySyncedIds.isNotEmpty) {
-      final prevLock = _durableFileLock;
-      final completer = Completer<void>();
-      _durableFileLock = completer.future;
-      try {
-        await prevLock;
-      } catch (_) {}
-
-      try {
-        final syncedSet = successfullySyncedIds.toSet();
-        // قراءة الملف مجدداً داخل القفل لالتقاط أي عمليات كُتبت أثناء استجابة الشبكة
-        final freshLines = await durableFile.exists()
-            ? await durableFile.readAsLines()
-            : <String>[];
-        final remainingLines = <String>[];
-
-        for (final line in freshLines) {
-          final trimmed = line.trim();
-          if (trimmed.isEmpty) continue;
-          try {
-            final entry = jsonDecode(trimmed);
-            final id = entry['id']?.toString() ?? '';
-            if (!syncedSet.contains(id)) {
-              remainingLines.add(trimmed);
-            }
-          } catch (_) {
-            remainingLines.add(trimmed);
-          }
-        }
-
-        final tempFile = File(
-            '${durableFile.path}.${DateTime.now().microsecondsSinceEpoch}.tmp');
-        await tempFile.writeAsString(
-          remainingLines.isEmpty ? '' : '${remainingLines.join('\n')}\n',
-          flush: true,
-        );
-        if (remainingLines.isEmpty) {
-          if (await durableFile.exists()) await durableFile.delete();
-          if (await tempFile.exists()) await tempFile.delete();
-        } else {
-          await tempFile.rename(durableFile.path);
-        }
-      } catch (e) {
-        debugPrint('⚠️ فشل التحديث الذري لملف اليومية الدائم: $e');
-      } finally {
-        completer.complete();
       }
     }
 
@@ -1268,7 +1227,7 @@ class LedgerService {
       return const Stream.empty();
     }
 
-    // 🔒 فرز تاريخي تنازلي على السيرفر لضمان جلب أحدث الحركات فوراً وتفادي حجبها بالـ limit
+    // 🔒 استعلام زمني تنازلي محكم يجلب الدفعة كاملة بحدها الأقصى
     final Query<Map<String, dynamic>> query = _db
         .collection('merchant_ledger_entries')
         .where('merchant_id', isEqualTo: currentMerchantId.trim())
@@ -1277,12 +1236,12 @@ class LedgerService {
         .limit(limit);
 
     return query.snapshots(includeMetadataChanges: true).map((snap) {
+      // 🛡️ نحتفظ بجميع الحركات بما فيها المشطوبة كـ Audit-Trail لتفادي بتر عداد الصفحات
       final list = snap.docs
-          .where((d) =>
-              d.data()['merchant_id'] == currentMerchantId.trim() &&
-              d.data()['is_voided'] != true)
+          .where((d) => d.data()['merchant_id'] == currentMerchantId.trim())
           .map((d) => LedgerEntry.fromMap({'id': d.id, ...d.data()}))
           .toList();
+
       final pendingQueue = AppStorage.getPendingLedgerTxs(currentMerchantId)
           .where((t) => t['customer_id'] == cleanCustomerId);
 
@@ -1303,17 +1262,29 @@ class LedgerService {
         }
       }
 
-      if (voidedTargetIds.isNotEmpty) {
-        list.removeWhere((e) => voidedTargetIds.contains(e.id));
+      // وسم الحركات المشطوبة في طابور الأوفلاين فوراً دون إتلاف حجم المصفوفة
+      for (int i = 0; i < list.length; i++) {
+        if (voidedTargetIds.contains(list[i].id)) {
+          list[i] = LedgerEntry(
+            id: list[i].id,
+            merchantId: list[i].merchantId,
+            customerId: list[i].customerId,
+            type: list[i].type,
+            amount: list[i].amount,
+            notes: list[i].notes,
+            items: list[i].items,
+            isVoided: true,
+            createdAt: list[i].createdAt,
+          );
+        }
       }
 
-      // فرز نهائي لدمج حركات الأوفلاين الأحدث في القمة
       list.sort((a, b) => b.createdAt.compareTo(a.createdAt));
       return list;
     });
   }
 
-// ─── إشعار / تذكير محاسبي معتمد عبر واتساب ───
+// ─── إشعار / تذكير محاسبي معتمد عبر واتساب (محصن ضد الأرقام السالبة 100%) ───
   Future<bool> sendWhatsAppReminder({
     required LedgerCustomer customer,
     required String storeName,
@@ -1348,6 +1319,12 @@ class LedgerService {
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
 
     final buffer = StringBuffer();
+    final balance = customer.currentBalance;
+    final absBalance = balance.abs().round();
+    final isCustomerInDebt = balance > 0.01; // عليه دين للمحل
+    final isCustomerInCredit = balance < -0.01; // له رصيد دائن (فائض سداد)
+    final isCustomerSettled =
+        !isCustomerInDebt && !isCustomerInCredit; // خالص تماماً
 
     // ── حالة 1: إشعار سداد دفعة نقدية (سند قبض رسمي) ──
     if (lastEntry != null && !lastEntry.isDebt) {
@@ -1361,26 +1338,30 @@ class LedgerService {
       }
       buffer.writeln('📅 *التاريخ:* $dateStr ($timeStr)');
       buffer.writeln('━━━━━━━━━━━━━━━━━━━━');
-      if (customer.currentBalance <= 0) {
+
+      if (isCustomerInCredit) {
+        buffer.writeln('✨ *حالة الحساب بعد السداد:*');
+        buffer
+            .writeln('🟢 *يوجد لكم رصيد فائض (دائن لصالحكم):* $absBalance ر.ي');
+        buffer.writeln('جزاكم الله خيراً وبارك في مالكم ورزقكم 🌸');
+      } else if (isCustomerSettled) {
         buffer.writeln('✅ *الحساب الآن: خالص تماماً (0 ر.ي)*');
-        buffer.writeln('جزاكم الله خيراً وبارك الله في مالكم ورزقكم 🌸');
+        buffer.writeln('بيض الله وجوهكم وبارك في مالكم ورزقكم 🌸');
       } else {
-        buffer.writeln(
-            '📊 *الرصيد المتبقي بذمتكم:* ${customer.currentBalance.round()} ر.ي');
-        buffer.writeln('شكراً لوفائكم وحسن تعاملكم 🙏');
+        buffer.writeln('📊 *الرصيد المتبقي بذمتكم:* $absBalance ر.ي');
+        buffer.writeln('شكراً لوفائكم وحسن تعاملكم الدائم 🙏');
       }
     }
     // ── حالة 2: إشعار قيد مشتريات جديدة (فاتورة دين) ──
     else if (lastEntry != null && lastEntry.isDebt) {
-      buffer.writeln('🧾 *فاتورة مشتريات بالآجل (دين)*');
+      buffer.writeln('🧾 *فاتورة مشتريات بالآجل*');
       buffer.writeln('🏪 *المحل:* $storeName');
       buffer.writeln('━━━━━━━━━━━━━━━━━━━━');
       buffer.writeln('العميل المحترم: *${customer.name}*');
-      buffer.writeln(
-          '➕ *مبلغ الفاتورة الجديدة:* ${lastEntry.amount.round()} ر.ي');
+      buffer.writeln('➕ *مبلغ الفاتورة:* ${lastEntry.amount.round()} ر.ي');
       buffer.writeln('📅 *التاريخ:* $dateStr ($timeStr)');
       if (lastEntry.items.isNotEmpty) {
-        buffer.writeln('🛒 *الأصناف المسجلة بالتفصيل:*');
+        buffer.writeln('🛒 *الأصناف المسجلة:*');
         for (final item in lastEntry.items) {
           final name = item['name'] ?? item['product_name'] ?? 'صنف';
           final qty = item['quantity'] ?? 1;
@@ -1388,28 +1369,47 @@ class LedgerService {
           final price = (item['unit_price'] as num?)?.round() ?? 0;
           final total = (item['subtotal'] as num?)?.round() ??
               (price * (qty as num).round());
-          buffer.writeln('  • $name: $qty $unit × $price ر.ي = $total ر.ي');
+          buffer.writeln('  • $name: $qty $unit × $price = $total ر.ي');
         }
       } else if (lastEntry.notes != null &&
           lastEntry.notes!.trim().isNotEmpty) {
         buffer.writeln('📝 *البيان:* ${lastEntry.notes!.trim()}');
       }
       buffer.writeln('━━━━━━━━━━━━━━━━━━━━');
-      buffer.writeln(
-          '💰 *إجمالي الحساب التراكمي المطلوب:* ${customer.currentBalance.round()} ر.ي');
+
+      if (isCustomerInCredit) {
+        buffer.writeln('💡 *تم خصم الفاتورة من رصيدكم الدائن المسبق.*');
+        buffer.writeln('🟢 *المتبقي لصالحكم لدى المحل:* $absBalance ر.ي');
+      } else if (isCustomerSettled) {
+        buffer.writeln(
+            '✅ *تمت تغطية الفاتورة بالكامل من رصيدكم، والحساب الآن خالص (0 ر.ي)*');
+      } else {
+        buffer.writeln('💰 *إجمالي الرصيد المطلوب بذمتكم:* $absBalance ر.ي');
+      }
       buffer.writeln('نسعد دائماً بخدمتكم وتلبية طلباتكم 💐');
     }
-    // ── حالة 3: رسالة تذكير دورية بالمطالبة ──
+    // ── حالة 3: رسالة تذكير ومطابقة دورية ──
     else {
       buffer.writeln(
           'السلام عليكم ورحمة الله وبركاته يا أخي العزيز *${customer.name}* 🌸');
-      buffer.writeln('نود تذكيركم بالحساب المتبقي لديكم لدى *($storeName)*:');
-      buffer.writeln(
-          '💰 *المبلغ المطلوب سداده:* ${customer.currentBalance.round()} ر.ي');
+      buffer.writeln('نود إحاطتكم بحالة حسابكم الحالي لدى *($storeName)*:');
       buffer.writeln('📅 *تاريخ المطابقة:* $dateStr');
-      buffer.writeln('');
-      buffer.writeln(
-          'شاكرين ومقدرين حسن تعاملكم الدائم معنا، وبارك الله في رزقكم 🙏');
+      buffer.writeln('━━━━━━━━━━━━━━━━━━━━');
+
+      if (isCustomerInCredit) {
+        buffer.writeln(
+            '🟢 *لديكم رصيد دائن (لصالحكم في ذمة المحل) بقيمة:* $absBalance ر.ي');
+        buffer.writeln('سعداء بتعاملكم الراقي معنا ونتشرف بخدمتكم دائماً 🙏');
+      } else if (isCustomerSettled) {
+        buffer.writeln('✅ *حسابكم خالص تماماً (0 ر.ي).*');
+        buffer.writeln('شاكرين ومقدرين حسن تعاملكم والتزامكم الدائم 🌸');
+      } else {
+        buffer.writeln(
+            '💰 *المبلغ المتبقي المطلوب سداده بذمتكم:* $absBalance ر.ي');
+        buffer.writeln('');
+        buffer.writeln(
+            'شاكرين ومقدرين حسن تعاملكم ووفائكم المعتاد، وبارك الله في رزقكم 🙏');
+      }
     }
 
     final encodedMessage = Uri.encodeComponent(buffer.toString());
@@ -1473,8 +1473,10 @@ class LedgerService {
     final customer =
         LedgerCustomer.fromMap(args['customer'] as Map<String, dynamic>);
     final storeName = args['storeName'] as String;
+    // 🔒 فلترة صارمة: استبعاد أي حركة مشطوبة أو ملغاة نهائياً من حسابات وجداول الـ PDF
     final entries = (args['entries'] as List)
         .map((e) => LedgerEntry.fromMap(e as Map<String, dynamic>))
+        .where((e) => !e.isVoided)
         .toList();
 
     final Uint8List? fontRegularBytes = args['fontRegular'] as Uint8List?;

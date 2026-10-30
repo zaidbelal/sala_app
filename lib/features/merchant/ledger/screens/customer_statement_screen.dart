@@ -54,8 +54,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
     HapticFeedback.lightImpact();
     final updatedCustomer = await showDialog<LedgerCustomer>(
       context: context,
-      barrierDismissible:
-          false, // ✅ حظر النقر العرضي على الخلفية أثناء المعالجة المالية
+      barrierDismissible: false,
       builder: (_) => _AddLedgerEntryDialog(
         customer: currentCustomer,
         isDebt: isDebt,
@@ -63,7 +62,10 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
     );
 
     if (updatedCustomer != null && mounted) {
-      setState(() => _customer = updatedCustomer);
+      setState(() {
+        _customer = updatedCustomer;
+        _latestLiveCustomer = updatedCustomer;
+      });
     }
   }
 
@@ -157,10 +159,18 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                           limit: 250)
                       .first;
 
+                  // 🔒 تصفية الحركات النشطة فقط واستبعاد المشطوبة محلياً وسحابياً
+                  final activeEntries = entriesSnap
+                      .where((e) =>
+                          !e.isVoided &&
+                          !_locallyDismissedEntryIds.contains(e.id))
+                      .toList();
+
+                  // 🚀 فتح شيت المشاركة الرسمي ومشاركة الملف عبر واتساب والتطبيقات الأخرى
                   await LedgerService.instance.shareCustomerStatementPdf(
                     customer: authoritativeCustomer,
                     storeName: widget.storeName,
-                    entries: entriesSnap,
+                    entries: activeEntries,
                   );
                 } catch (e) {
                   if (context.mounted) {
@@ -261,7 +271,9 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
             tooltip: 'حذف الزبون من الدفتر',
             icon: const Icon(Icons.delete_forever_rounded, color: Colors.red),
             onPressed: () async {
-              final hasDebt = _customer.currentBalance > 0;
+              // 🔒 استخدام الرصيد اللحظي الفعلي الموثوق بدلاً من الحالة القديمة
+              final liveCustomer = _latestLiveCustomer;
+              final hasDebt = liveCustomer.currentBalance > 0;
               final confirmed = await showDialog<bool>(
                 context: context,
                 builder: (dCtx) => AlertDialog(
@@ -283,8 +295,8 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                   ),
                   content: Text(
                     hasDebt
-                        ? 'تنبيه مالي ⚠️: الزبون (${_customer.name}) متبقٍ في ذمته دين قدره (${_customer.currentBalance.toStringAsFixed(0)} ر.ي).\n\nحذف الزبون سيشطب هذا الدين ويسقطه من إجمالي ديون السوق لديك.\n\nهل أنت متأكد من الحذف؟'
-                        : 'هل تريد حذف الزبون (${_customer.name}) نهائياً من دفتر الديون؟',
+                        ? 'تنبيه مالي ⚠️: الزبون (${liveCustomer.name}) متبقٍ في ذمته دين قدره (${liveCustomer.currentBalance.toStringAsFixed(0)} ر.ي).\n\nحذف الزبون سيشطب هذا الدين ويسقطه من إجمالي ديون السوق لديك.\n\nهل أنت متأكد من الحذف؟'
+                        : 'هل تريد حذف الزبون (${liveCustomer.name}) نهائياً من دفتر الديون؟',
                     style: TextStyle(
                         fontFamily: 'Cairo',
                         fontSize: 13,
@@ -321,8 +333,8 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                 try {
                   await LedgerService.instance.deleteCustomer(
                     merchantId: mId,
-                    customerId: _customer.id,
-                    currentBalance: _customer.currentBalance,
+                    customerId: liveCustomer.id,
+                    currentBalance: liveCustomer.currentBalance,
                   );
                 } on LedgerQueuedException catch (e) {
                   queuedMessage = e.message;
@@ -344,7 +356,7 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                     SnackBar(
                       content: Text(
                         queuedMessage ??
-                            'تم حذف الزبون (${_customer.name}) بنجاح ✅',
+                            'تم حذف الزبون (${liveCustomer.name}) بنجاح ✅',
                         style: const TextStyle(fontFamily: 'Cairo'),
                       ),
                       backgroundColor: queuedMessage == null
@@ -693,12 +705,26 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                             color: AppColors.primary));
                   }
                   final rawEntries = snapshot.data ?? [];
+                  // تصفية الحركات النشطة الحالية
                   final entries = rawEntries
                       .where((e) =>
                           !_locallyDismissedEntryIds.contains(e.id) &&
                           !e.isVoided)
                       .toList();
-                  if (entries.isEmpty) {
+
+                  // 🔒 حل العيب الثالث: فحص التصفح يعتمد على إجمالي ما تم جلبه من السيرفر وليس المتبقي بعد الفلترة
+                  final bool hasMore = rawEntries.length >= _currentLimit;
+
+                  // 🚀 تصفح ذاتي سلس: إذا استهلكت القيود المشطوبة أغلب الصفحة، يتوسع تلقائياً للدفعة التالية
+                  if (hasMore &&
+                      entries.length < 5 &&
+                      rawEntries.length >= _currentLimit) {
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted) setState(() => _currentLimit += 50);
+                    });
+                  }
+
+                  if (entries.isEmpty && !hasMore) {
                     return Center(
                       child: Text(
                         'لا توجد عمليات سابقة مسجلة لهذا الزبون',
@@ -709,9 +735,6 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       ),
                     );
                   }
-
-                  final hasMore = entries.length >= _currentLimit;
-
                   return ListView.builder(
                     padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
                     itemCount: entries.length + (hasMore ? 1 : 0),
@@ -740,7 +763,6 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                       final isDebt = item.isDebt;
                       final dateStr =
                           '${item.createdAt.year}/${item.createdAt.month.toString().padLeft(2, '0')}/${item.createdAt.day.toString().padLeft(2, '0')}  ${item.createdAt.hour.toString().padLeft(2, '0')}:${item.createdAt.minute.toString().padLeft(2, '0')}';
-
                       return Dismissible(
                         key: ValueKey(item.id),
                         direction: DismissDirection.endToStart,
@@ -791,31 +813,6 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                               knownAmount: item.amount,
                               knownIsDebt: isDebt,
                             );
-                            final delta = isDebt ? -item.amount : item.amount;
-                            if (mounted) {
-                              setState(() {
-                                _customer = LedgerCustomer(
-                                  id: _customer.id,
-                                  merchantId: _customer.merchantId,
-                                  name: _customer.name,
-                                  phone: _customer.phone,
-                                  currentBalance: LedgerCustomer.sanitizeAmount(
-                                    _customer.currentBalance + delta,
-                                  ),
-                                  creditLimit: _customer.creditLimit,
-                                  salaryDay: _customer.salaryDay,
-                                  lastReminderSentAt:
-                                      _customer.lastReminderSentAt,
-                                  createdAt: _customer.createdAt,
-                                  updatedAt: DateTime.now(),
-                                );
-                              });
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                    content: Text(
-                                        '✅ تم إبطال القيد وتصحيح رصيد الزبون بنجاح')),
-                              );
-                            }
                             return true;
                           } catch (e) {
                             final err = e.toString().toLowerCase();
@@ -825,58 +822,58 @@ class _CustomerStatementScreenState extends State<CustomerStatementScreen> {
                                     err.contains('socket') ||
                                     err.contains('unavailable');
 
+                            if (isOfflineOrTimeout) {
+                              return true; // تم تأمينه في طابور الأوفلاين ويُسمح بحذفه بصرياً
+                            }
+
                             if (mounted) {
-                              if (isOfflineOrTimeout) {
-                                // تم حفظ الشطب محلياً في الطابور بنجاح، لذا نسمح بإخفاء العنصر فوراً لمنع تكرار حذفه
-                                final delta =
-                                    isDebt ? -item.amount : item.amount;
-                                setState(() {
-                                  _locallyDismissedEntryIds.add(item.id);
-                                  _customer = LedgerCustomer(
-                                    id: _customer.id,
-                                    merchantId: _customer.merchantId,
-                                    name: _customer.name,
-                                    phone: _customer.phone,
-                                    currentBalance:
-                                        LedgerCustomer.sanitizeAmount(
-                                      _customer.currentBalance + delta,
-                                    ),
-                                    creditLimit: _customer.creditLimit,
-                                    salaryDay: _customer.salaryDay,
-                                    lastReminderSentAt:
-                                        _customer.lastReminderSentAt,
-                                    createdAt: _customer.createdAt,
-                                    updatedAt: DateTime.now(),
-                                  );
-                                });
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(
-                                    content: Text(
-                                        '📡 تم حفظ طلب الإلغاء أوفلاين وسيُشطب تلقائياً فور توفر الشبكة',
-                                        style: TextStyle(fontFamily: 'Cairo')),
-                                    backgroundColor: Colors.orange,
-                                  ),
-                                );
-                                return true; // حذف العنصر من الشاشة فوراً
-                              } else {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text('تعذر إبطال القيد: $e',
-                                        style: const TextStyle(
-                                            fontFamily: 'Cairo')),
-                                    backgroundColor: Colors.red,
-                                  ),
-                                );
-                                return false;
-                              }
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text('تعذر إبطال القيد: $e',
+                                      style:
+                                          const TextStyle(fontFamily: 'Cairo')),
+                                  backgroundColor: Colors.red,
+                                ),
+                              );
                             }
                             return false;
                           }
                         },
                         onDismissed: (_) {
+                          // 🔒 نقطة الحقيقة الواحدة: يُحسب التعديل المالي مرة واحدة فقط بعد اكتمال السحب
+                          final delta = isDebt ? -item.amount : item.amount;
                           setState(() {
                             _locallyDismissedEntryIds.add(item.id);
+                            final updated = LedgerCustomer(
+                              id: _latestLiveCustomer.id,
+                              merchantId: _latestLiveCustomer.merchantId,
+                              name: _latestLiveCustomer.name,
+                              phone: _latestLiveCustomer.phone,
+                              currentBalance: LedgerCustomer.sanitizeAmount(
+                                _latestLiveCustomer.currentBalance + delta,
+                              ),
+                              creditLimit: _latestLiveCustomer.creditLimit,
+                              salaryDay: _latestLiveCustomer.salaryDay,
+                              lastReminderSentAt:
+                                  _latestLiveCustomer.lastReminderSentAt,
+                              createdAt: _latestLiveCustomer.createdAt,
+                              updatedAt: DateTime.now(),
+                            );
+                            _customer = updated;
+                            _latestLiveCustomer = updated;
                           });
+
+                          ScaffoldMessenger.of(context).clearSnackBars();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(
+                                  '✅ تم إبطال القيد وتصحيح رصيد الزبون بدقة',
+                                  style: TextStyle(fontFamily: 'Cairo')),
+                              backgroundColor: AppColors.primary,
+                              behavior: SnackBarBehavior.floating,
+                              duration: Duration(seconds: 2),
+                            ),
+                          );
                         },
                         background: Container(
                           alignment: Alignment.centerLeft,
@@ -1032,28 +1029,17 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
   late final TextEditingController _notesCtrl;
   bool _isSaving = false;
   String? _assignedTransactionId;
+  String? _lastPayloadHash;
 
   @override
   void initState() {
     super.initState();
     _amountCtrl = TextEditingController();
     _notesCtrl = TextEditingController();
-    // 🔒 مراقبة مدخلات التاجر لفك القفل المالي تلقائياً عند تعديل أي بيان
-    _amountCtrl.addListener(_onInputChanged);
-    _notesCtrl.addListener(_onInputChanged);
-  }
-
-  void _onInputChanged() {
-    // 🛡️ فك قفل Idempotency Key فوراً عند تعديل التاجر للمبلغ أو البيان لمنع تعارض السيرفر
-    if (_assignedTransactionId != null) {
-      _assignedTransactionId = null;
-    }
   }
 
   @override
   void dispose() {
-    _amountCtrl.removeListener(_onInputChanged);
-    _notesCtrl.removeListener(_onInputChanged);
     _amountCtrl.dispose();
     _notesCtrl.dispose();
     super.dispose();
@@ -1100,16 +1086,19 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
 
     final merchantId = AppStorage.userId ?? '';
 
-    // توليد معرف فريد مخصص للمبلغ والبيان الحاليين
-    if (_assignedTransactionId == null) {
+    // 🔒 توليد معرّف مالي مرتبط بالقيمة والبيان ولا يتغير عند مجرد إعادة النقر بنفس البيانات
+    final currentPayloadHash =
+        '${widget.customer.id}_${widget.isDebt}_${amt}_${_notesCtrl.text.trim()}';
+    if (_assignedTransactionId == null ||
+        _lastPayloadHash != currentPayloadHash) {
       final generatedId = FirebaseFirestore.instance
           .collection('merchant_ledger_entries')
           .doc()
           .id;
       _assignedTransactionId = 'ledger_$generatedId';
+      _lastPayloadHash = currentPayloadHash;
     }
     final entryId = _assignedTransactionId!;
-
     if (widget.isDebt && widget.customer.creditLimit > 0) {
       final projected = widget.customer.currentBalance + amt;
       if (projected > widget.customer.creditLimit) {
@@ -1234,14 +1223,15 @@ class _AddLedgerEntryDialogState extends State<_AddLedgerEntryDialog> {
       );
     } catch (e) {
       debugPrint('Ledger transaction submission failed: $e');
-      // 🔒 تصفير القفل فور حدوث أي خطأ لتمكين التاجر من تصحيح بياناته وإعادة المحاولة دون تعليق
-      _assignedTransactionId = null;
+      // 🛡️ حماية مالية قطعية: نحتفظ بمعرّف الحركة (_assignedTransactionId) كما هو لمنع تدبيل الدين
+      // إذا ضغط التاجر "حفظ" مجدداً لنفس المبلغ والبيان، يتم إرسال نفس المعرّف فيرفض السيرفر تكرار القيد
       if (!mounted) return;
       setState(() => _isSaving = false);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('تعذر تسجيل القيد: $e'),
           backgroundColor: Colors.red.shade700,
+          duration: const Duration(seconds: 4),
         ),
       );
     }

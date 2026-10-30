@@ -81,33 +81,24 @@ class ImagePrecacheService {
     _downloadBatch(urls, concurrency: 6, label: 'brands');
   }
 
-// ══ تحميل وتخزين صور المنتجات وصور جميع الكميات في ذاكرة الهاتف للأوفلاين ══
+// ══ تحميل وتخزين صور المنتجات بحمولة منضبطة لحماية معالج وبطارية الهاتف الاقتصادي ══
   Future<void> prewarmProducts(List<Map<String, dynamic>> products) async {
-    if (kIsWeb) return;
+    if (kIsWeb || _isRunning) return;
     _isCancelled = false;
-    // فحص ذكي للشبكة: إذا كان الاتصال عبر بيانات الجوال (Mobile Data)، نقلل الصور للحفاظ على باقة التاجر.
+
     final connectivity = await Connectivity().checkConnectivity();
     final isMobileData = connectivity.contains(ConnectivityResult.mobile);
-    final limit = isMobileData ? 15 : 60;
+    // سقف تحميل اقتصادي يحمي هواتف 2GB و 3GB RAM من الانهيار (OOM)
+    final limit = isMobileData ? 8 : 16;
 
     final urls = <String>{};
-    // 🚀 تقييد التحميل المسبق
     final targetProducts = products.take(limit);
     for (final p in targetProducts) {
       final pUrl = p['image_url'] as String?;
       if (pUrl != null && pUrl.trim().isNotEmpty) urls.add(pUrl.trim());
-
-      final rawUnits = p['units'];
-      if (rawUnits is List) {
-        for (final u in rawUnits) {
-          if (u is Map) {
-            final uUrl = u['image_url'] as String?;
-            if (uUrl != null && uUrl.trim().isNotEmpty) urls.add(uUrl.trim());
-          }
-        }
-      }
     }
-    _downloadBatch(urls.toList(), concurrency: 3, label: 'products_and_units');
+
+    _downloadBatch(urls.toList(), concurrency: 1, label: 'products_lite');
   }
 
   // ══ هل الصورة موجودة في الـ Disk Cache؟ ══

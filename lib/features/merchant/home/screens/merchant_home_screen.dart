@@ -42,12 +42,14 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
     super.initState();
     _pageController = PageController();
 
-    // 🚀 بدء مزامنة الطلبات المحفوظة حال فتح التطبيق لو كان الإنترنت متوفراً
-    Connectivity().checkConnectivity().then((results) {
+// 🚀 انتظار اكتمال تسوية قيود WAL المالية أولاً قبل إطلاق المزامنة المتوازية
+    Connectivity().checkConnectivity().then((results) async {
       if (!results.every((r) => r == ConnectivityResult.none)) {
+        await WalService.waitForReconciliation;
+        if (!mounted) return;
         _syncPendingOrder();
         _syncPendingReturns();
-        _syncPendingLedger(); // ✅ تشغيل مزامنة ديون الدفتر المسجلة أوفلاين
+        _syncPendingLedger();
       }
     });
     _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
@@ -134,7 +136,6 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
           await AppStorage.removePendingOrder(orderId, orderMerchantId);
           continue;
         }
-
         try {
           // إرسال الطلب وإزالته فوراً وتأكيد الـ WAL
           await OrdersService.placeOrder(
@@ -156,7 +157,7 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
           await AppStorage.removePendingOrder(orderId, currentUserId);
           successCount++;
         } catch (e) {
-          // إذا كان الطلب مسجلاً بالفعل في السيرفر (Idempotent Success) نحذفه بنجاح
+          // إذا كان الطلب مسجلاً بالفعل في السيرفر (Idempotent Success) نؤكد نجاحه في WAL ونحذفه بنجاح
           if (e.toString().contains('already-exists') ||
               e.toString().contains('تم إنشاء الطلب مسبقاً')) {
             final cartRevision = pending['cart_revision']?.toString();
@@ -165,11 +166,12 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
                   .read(cartProvider.notifier)
                   .clearIfRevision(cartRevision);
             }
+            await WalService.instance.markCommitted(orderId);
             await AppStorage.removePendingOrder(orderId, currentUserId);
             successCount++;
             continue;
           }
-       final errorMsg = e.toString().toLowerCase();
+          final errorMsg = e.toString().toLowerCase();
           final bool isStockOrProductIssue =
               errorMsg.contains('product_unavailable') ||
                   errorMsg.contains('out_of_stock') ||
@@ -177,34 +179,51 @@ class _MerchantHomeScreenState extends ConsumerState<MerchantHomeScreen> {
                   errorMsg.contains('failed-precondition');
 
           // 🔒 الاعتماد على الفاحص المركزي لكشف انقطاع الإنترنت اللحظي أو المؤقت
-          final bool isTransientIssue = !isStockOrProductIssue && ConnectivityHelper.isNetworkException(e);
+          final bool isTransientIssue = !isStockOrProductIssue &&
+              ConnectivityHelper.isNetworkException(e);
 
           if (isTransientIssue) {
             if (kDebugMode) {
-              debugPrint('⚠️ تأجيل إرسال الطلب $orderId لحين استقرار الجلسة والاتصال بالإنترنت');
+              debugPrint(
+                  '⚠️ تأجيل إرسال الطلب $orderId لحين استقرار الجلسة والاتصال بالإنترنت');
             }
             continue; // الحفاظ على الطلب في الطابور دون حذفه
           } else {
             await WalService.instance.markAborted(orderId);
-
-            // استخراج الصنف المرفوض بدقة
+// 🛡️ استخراج معرّفات الأصناف المرفوضة بتجزئة رمزية شاملة (Tokenized Parsing)
             final failedIds = <String>{};
-            final exp = RegExp(r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)\[(.*?)\]');
+            final exp = RegExp(
+              r'(?:PRODUCT_UNAVAILABLE_|OUT_OF_STOCK_)(?:\[|\b)([\w\-\:,\s]+)(?:\]|\b)',
+              caseSensitive: false,
+            );
+
             for (final match in exp.allMatches(e.toString())) {
               final raw = match.group(1);
-              if (raw != null) {
-                failedIds.add(raw.contains(':') ? raw.split(':')[0].trim() : raw.trim());
+              if (raw != null && raw.trim().isNotEmpty) {
+                // تقسيم السلسلة على الفواصل والمسافات لالتقاط كل معرف منتج منفرد بدقة
+                final tokens = raw.split(RegExp(r'[,;\s]+'));
+                for (final token in tokens) {
+                  final clean = token.trim();
+                  if (clean.isEmpty) continue;
+                  // فصل معرّف الصنف عن لاحقة الوحدة (مثل prod_123:حبة)
+                  failedIds.add(
+                      clean.contains(':') ? clean.split(':')[0].trim() : clean);
+                }
               }
             }
 
-            // 🔒 حماية السلة: استرجاع كافة الأصناف السليمة حتى لو تعذر جلب المنتجات من السيرفر حالياً
+            // 🔒 استعادة الأصناف المتوفرة فقط وتجريد المنتجات المنتهية أو المحذوفة تماماً من السلة
             final notifier = ref.read(cartProvider.notifier);
             for (final item in pending['items']) {
               final productId = item['product_id']?.toString() ?? '';
-              if (failedIds.contains(productId)) continue; // استبعاد الصنف المرفوض فقط
+              if (productId.isEmpty || failedIds.contains(productId)) {
+                continue; // استبعاد قطعي للأصناف المنتهية
+              }
 
               final rawUnitLabel = item['unit_label']?.toString().trim();
-              final productUnit = (rawUnitLabel != null && rawUnitLabel.isNotEmpty && rawUnitLabel != 'كرتون')
+              final productUnit = (rawUnitLabel != null &&
+                      rawUnitLabel.isNotEmpty &&
+                      rawUnitLabel != 'كرتون')
                   ? ProductUnit(
                       label: rawUnitLabel,
                       qty: (item['unit_qty'] as num?)?.toInt() ?? 1,

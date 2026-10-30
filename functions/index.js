@@ -354,8 +354,25 @@ exports.sendPushNotification = onDocumentCreated(
     }
   }
 );
-// ذاكرة كاش ومحدد معدل استهلاك بحث الأماكن المؤقت
+
+// 🔒 ذاكرة مؤقتة مع محرك تطهير دوري ذاتي لمنع تسريب الذاكرة (Zero Memory Leak)
 const placesRateLimiter = new Map();
+const MAX_RATE_LIMITER_CAPACITY = 300;
+
+function pruneExpiredRateLimits(now) {
+  if (placesRateLimiter.size > MAX_RATE_LIMITER_CAPACITY) {
+    for (const [key, value] of placesRateLimiter.entries()) {
+      if (now > value.resetAt) {
+        placesRateLimiter.delete(key);
+      }
+    }
+    // حماية إضافية: إذا امتلأت الذاكرة نحذف أقدم 50 سجلاً
+    if (placesRateLimiter.size > MAX_RATE_LIMITER_CAPACITY) {
+      const keysToDrop = Array.from(placesRateLimiter.keys()).slice(0, 50);
+      for (const k of keysToDrop) placesRateLimiter.delete(k);
+    }
+  }
+}
 
 exports.searchPlaces = onCall(
   { region: "us-central1", cors: true, secrets: [googlePlacesApiKey] },
@@ -366,20 +383,20 @@ exports.searchPlaces = onCall(
 
     const uid = request.auth.uid;
     const now = Date.now();
-    const userLimit = placesRateLimiter.get(uid) || { count: 0, resetAt: now + 60000 };
+    
+    // تنظيف تلقائي للذاكرة قبل المعالجة
+    pruneExpiredRateLimits(now);
 
-    if (now > userLimit.resetAt) {
-      userLimit.count = 1;
-      userLimit.resetAt = now + 60000;
+    const userLimit = placesRateLimiter.get(uid);
+
+    if (!userLimit || now > userLimit.resetAt) {
+      placesRateLimiter.set(uid, { count: 1, resetAt: now + 60000 });
     } else {
       userLimit.count++;
-      // سقف أمان: 20 عملية بحث كحد أقصى في الدقيقة الواحدة لكل مستخدم
       if (userLimit.count > 20) {
         throw new HttpsError("resource-exhausted", "تجاوزت الحد المسموح من عمليات البحث، انتظر دقيقة");
       }
     }
-    placesRateLimiter.set(uid, userLimit);
-
     const query = String(request.data?.query || "").trim().slice(0, 80);
     if (!query) return [];
 
@@ -1350,22 +1367,24 @@ exports.deliverOrderByDriver = onCall(
     if (preflightOrder.status === "delivered" && preflightOrder.profit_recorded === true) {
       return { success: true, message: "تم تسجيل تسليم الطلب مسبقاً" };
     }
-    if (preflightOrder.status !== "shipped" && preflightOrder.status !== "on_the_way") {
+  // 🔒 دعم تسليم الطلبات التي استلمها السائق أوفلاين دون أن يُسجل استلامها مسبقاً بالسيرفر
+    const validPreflightStatuses = ["shipped", "on_the_way", "confirmed", "preparing"];
+    if (!validPreflightStatuses.includes(preflightOrder.status)) {
       throw new HttpsError("failed-precondition", `لا يمكن تسليم طلب بحالة: ${preflightOrder.status}`);
     }
-    if (callerRole === "driver" && preflightOrder.driver_id !== uid) {
+    if (callerRole === "driver" && preflightOrder.driver_id && preflightOrder.driver_id !== uid) {
       throw new HttpsError("permission-denied", "هذا الطلب غير مسند إليك أو تم تسليمه لسائق آخر");
     }
-// 🔒 تحفة المعالجة الهجينة للتوقيع: دعم كامل لروابط Storage المسبقة (أونلاين) وبايتات Base64 (أوفلاين)
+// 🔒 تحفة المعالجة الهجينة للتوقيع: دعم كامل لروابط Storage المسبقة وبايتات Base64 مع تنظيف المسافات والأسطر
     let finalSignatureUrl = null;
     if (signatureData != null) {
-      if (typeof signatureData !== "string" || signatureData.length > 1400000) {
+      if (typeof signatureData !== "string" || signatureData.length > 2000000) {
         throw new HttpsError("invalid-argument", "حجم بيانات التوقيع يتجاوز الحد المسموح");
       }
 
       const rawSig = signatureData.trim();
 
-      // ── المسار الأول: إذا كان التوقيع مرفوعاً مسبقاً من تطبيق الفلاتر كـ رابط ويب رسمي (أونلاين) ──
+      // ── المسار الأول: إذا كان التوقيع مرفوعاً مسبقاً كـ رابط ويب رسمي (أونلاين) ──
       if (rawSig.startsWith("https://")) {
         try {
           const parsedUrl = new URL(rawSig);
@@ -1384,9 +1403,10 @@ exports.deliverOrderByDriver = onCall(
           throw new HttpsError("invalid-argument", "صيغة رابط التوقيع غير صالحة");
         }
       } 
-      // ── المسار الثاني: إذا كان التوقيع ملتقطاً أوفلاين كـ Base64 Data URI ──
+      // ── المسار الثاني: إذا كان التوقيع ملتقطاً أوفلاين كـ Base64 Data URI مع تنقية الأسطر ──
       else {
-        const signatureMatch = rawSig.match(/^data:image\/png;base64,([A-Za-z0-9+/]+={0,2})$/);
+        const cleanedSig = rawSig.replace(/[\r\n\s]+/g, "");
+        const signatureMatch = cleanedSig.match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/);
         if (!signatureMatch) {
           throw new HttpsError("invalid-argument", "صيغة التوقيع غير صالحة (يجب أن يكون رابط HTTPS معتمد أو Base64)");
         }
@@ -1397,7 +1417,6 @@ exports.deliverOrderByDriver = onCall(
             !buffer.subarray(0, 8).equals(pngHeader)) {
           throw new HttpsError("invalid-argument", "ملف التوقيع تالف أو لا يطابق ترويسة ملفات PNG الحقيقية");
         }
-
         try {
           const bucket = storage.bucket();
           const fileName = `signatures/order_${cleanOrderId}_${Date.now()}.png`;
@@ -1430,13 +1449,14 @@ exports.deliverOrderByDriver = onCall(
       }
       const financialRef = db.collection("order_financials").doc(cleanOrderId);
       const financialSnap = await tx.get(financialRef);
-
-      // التحقق الصارم من حالة الطلب وأحقية السائق
-      if (order.status !== "shipped" && order.status !== "on_the_way") {
+// 🔒 التحقق المرن داخل المعاملة الذرية: دعم تسليم الطلبات التي استلمها السائق وسلمها أوفلاين
+      const validDeliveryStatuses = ["shipped", "on_the_way", "confirmed", "preparing"];
+      if (!validDeliveryStatuses.includes(order.status)) {
         throw new HttpsError("failed-precondition", `لا يمكن تسليم طلب بحالة: ${order.status}`);
       }
 
-      if (callerRole === "driver" && order.driver_id !== uid) {
+      // منع التضارب: إذا كان الطلب مسنداً لسائق آخر مسبقاً نرفضه
+      if (callerRole === "driver" && order.driver_id && order.driver_id !== uid) {
         throw new HttpsError("permission-denied", "هذا الطلب غير مسند إليك أو تم تسليمه لسائق آخر");
       }
 
@@ -1445,13 +1465,20 @@ exports.deliverOrderByDriver = onCall(
       ) || 0;
       const totalAmount = Number(order.total_amount) || Number(order.total) || 0;
 
-      // 1. تحديث الطلب وإرفاق التوقيع الرسمي
+      // 1. تحديث الطلب وتثبيت السائق وتاريخ الاستلام في حال سُلم مباشرة من وضع confirmed أوفلاين
       const updatePayload = {
         status: "delivered",
         delivered_at: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
         profit_recorded: true,
       };
+
+      if (!order.driver_id && callerRole === "driver") {
+        updatePayload.driver_id = uid;
+        updatePayload.driver_name = callerData.full_name || "مندوب معتمد";
+        updatePayload.picked_up_at = order.picked_up_at || FieldValue.serverTimestamp();
+      }
+
       if (finalSignatureUrl) {
         updatePayload.signature_url = finalSignatureUrl;
       }
@@ -2017,24 +2044,23 @@ exports.adminUpdateOrderStatus = onCall(
       "هذه العملية خاصة بالإدارة فقط",
     );
 const orderRef = db.collection("orders").doc(cleanOrderId);
-    // 🛡️ شمل حالة "returned" في استرجاع المخزون إلى المستودع لمنع العجز المخزني
     const requiresStockRestore = cleanStatus === "cancelled" || cleanStatus === "rejected" || cleanStatus === "returned";
 
-    // جلب عناصر الطلب خارج المعاملة في حال تطلب استرجاع المخزون
-    let itemDocs = [];
-    if (requiresStockRestore) {
-      const itemsSnap = await db.collection("order_items").where("order_id", "==", cleanOrderId).get();
-      itemDocs = itemsSnap.docs;
-    }
-
     return await db.runTransaction(async (tx) => {
-      const orderSnap = await tx.get(orderRef);
+      // 🔒 قراءة متزامنة ومعزولة 100% داخل المعاملة الذرية لمنع استرجاع المخزون المزدوج
+      const [orderSnap, financialSnap, itemsSnap] = await Promise.all([
+        tx.get(orderRef),
+        tx.get(db.collection("order_financials").doc(cleanOrderId)),
+        requiresStockRestore
+          ? tx.get(db.collection("order_items").where("order_id", "==", cleanOrderId))
+          : Promise.resolve({ docs: [] }),
+      ]);
+
       if (!orderSnap.exists) {
         throw new HttpsError("not-found", "الطلب غير موجود");
       }
       const order = orderSnap.data();
-      const financialRef = db.collection("order_financials").doc(cleanOrderId);
-      const financialSnap = await tx.get(financialRef);
+      const itemDocs = itemsSnap.docs;
       const currentStatus = String(order.status || "pending").toLowerCase();
       const isProfitRecorded = order.profit_recorded === true;
 
@@ -2215,21 +2241,22 @@ exports.addLedgerCustomer = onCall(
       ? db.collection("merchant_customers").doc(requestedCustomerId)
       : db.collection("merchant_customers").doc();
 
-    return await db.runTransaction(async (tx) => {
-      const reads = [tx.get(docRef)];
-      if (cleanPhone) {
-        reads.push(
-          tx.get(
-            db.collection("merchant_customers")
-              .where("merchant_id", "==", merchantId)
-              .where("phone", "==", cleanPhone)
-              .where("is_deleted", "==", false)
-              .limit(1),
-          ),
-        );
-      }
-      const [existingSnap, duplicateSnap] = await Promise.all(reads);
-      if (!duplicateSnap?.empty && duplicateSnap.docs[0].id !== docRef.id) {
+   return await db.runTransaction(async (tx) => {
+      // 🔒 قراءة متوازية ثابتة تحمي من انهيار الذاكرة عند عدم إدخال رقم هاتف
+      const [existingSnap, duplicateSnap] = await Promise.all([
+        tx.get(docRef),
+        cleanPhone
+          ? tx.get(
+              db.collection("merchant_customers")
+                .where("merchant_id", "==", merchantId)
+                .where("phone", "==", cleanPhone)
+                .where("is_deleted", "==", false)
+                .limit(1),
+            )
+          : Promise.resolve(null),
+      ]);
+
+      if (duplicateSnap && !duplicateSnap.empty && duplicateSnap.docs[0].id !== docRef.id) {
         throw new HttpsError("already-exists", "يوجد زبون مسجل مسبقاً بنفس رقم الهاتف");
       }
 
@@ -2286,7 +2313,7 @@ const existingData = existingSnap.exists ? (existingSnap.data() || {}) : {};
     });
   }
 );
-// 1.1 حذف زبون من الدفتر سحابياً مع تسوية ديون السوق
+// 1.1 حذف زبون من الدفتر سحابياً مع تسوية ديون السوق وشطب كافة قيوده لمنع قيامتها لاحقاً
 exports.deleteLedgerCustomer = onCall(
   { region: "us-central1", cors: true },
   async (request) => {
@@ -2312,8 +2339,20 @@ exports.deleteLedgerCustomer = onCall(
     const customerRef = db.collection("merchant_customers").doc(cleanCustomerId);
     const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
 
-    return await db.runTransaction(async (tx) => {
-      const customerSnap = await tx.get(customerRef);
+    // 🔒 جلب كافة القيود المالية غير المشطوبة للزبون لشطبها ذرياً ومنع قيامة الديون مستقبلاً
+    const activeEntriesSnap = await db.collection("merchant_ledger_entries")
+      .where("merchant_id", "==", merchantId)
+      .where("customer_id", "==", cleanCustomerId)
+      .where("is_voided", "==", false)
+      .limit(500)
+      .get();
+
+    await db.runTransaction(async (tx) => {
+      const [customerSnap, summarySnap] = await Promise.all([
+        tx.get(customerRef),
+        tx.get(summaryRef),
+      ]);
+
       if (!customerSnap.exists) {
         return { success: true, message: "الزبون غير موجود مسبقاً" };
       }
@@ -2323,7 +2362,6 @@ exports.deleteLedgerCustomer = onCall(
         throw new HttpsError("permission-denied", "غير مصرح لك بحذف هذا الزبون");
       }
 
-      // إذا تم حذفه مسبقاً وسُويت ديونه نخرج بسلام دون تكرار الخصم
       if (customerData.is_deleted === true && customerData.summary_deducted === true) {
         return { success: true, message: "تم حذف الزبون مسبقاً" };
       }
@@ -2332,26 +2370,45 @@ exports.deleteLedgerCustomer = onCall(
       const debtPortion = Math.max(0, balance);
       const isDebtor = balance > 0;
 
-      // حذف برمجياً (Soft-Delete) للحفاظ على المرجعية المحاسبية للفواتير القديمة
+      // 1. وسم الزبون كمحذوف وتصفير رصيده
       tx.update(customerRef, {
         is_deleted: true,
         summary_deducted: true,
+        current_balance: 0.0,
         deleted_at: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
       });
 
-      // إذا كان الزبون عليه دين، خصم دينه من إجمالي ديون السوق
+      // 2. شطب كافة القيود النشطة التابعة له داخل المعاملة الذرية
+      for (const entryDoc of activeEntriesSnap.docs) {
+        tx.update(entryDoc.ref, {
+          is_voided: true,
+          void_reason: "customer_deleted",
+          voided_by: merchantId,
+          voided_at: FieldValue.serverTimestamp(),
+          updated_at: FieldValue.serverTimestamp(),
+        });
+      }
+
+      // 3. تسوية ديون السوق وحظر الأرقام السالبة
       if (debtPortion > 0 || isDebtor) {
+        const currentMarketDebt = Number(summarySnap.data()?.total_market_debt) || 0.0;
+        const currentDebtorsCount = Number(summarySnap.data()?.debtors_count) || 0;
+        const safeNewMarketDebt = Math.max(0, Math.round((currentMarketDebt - debtPortion) * 100) / 100);
+        const safeNewDebtors = Math.max(0, currentDebtorsCount - (isDebtor ? 1 : 0));
+
         tx.set(summaryRef, {
           merchant_id: merchantId,
-          total_market_debt: FieldValue.increment(-debtPortion),
-          debtors_count: FieldValue.increment(isDebtor ? -1 : 0),
+          total_market_debt: safeNewMarketDebt,
+          debtors_count: safeNewDebtors,
           last_updated: FieldValue.serverTimestamp(),
         }, { merge: true });
       }
 
       return { success: true };
     });
+
+    return { success: true };
   }
 );
 // 2. قيد حركة مالية (دين أو سداد) ذرياً بحسابات القروش (Integer Cents)
@@ -2440,9 +2497,16 @@ exports.recordLedgerTransaction = onCall(
       };
     });
     const normalizedNotes = notes ? String(notes).trim() : null;
-const result = await db.runTransaction(async (tx) => {
-    // 🛡️ فحص Idempotency: إذا كان القيد مسجلاً مسبقاً نرجع الرصيد الحقيقي المعتمد بالسيرفر
-      const existingEntry = await tx.get(entryRef);
+const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
+
+    const result = await db.runTransaction(async (tx) => {
+      // 🔒 قراءة جميع الوثائق أولاً معاً (Entry + Customer + Summary) لمنع كسر قواعد Firestore Transaction
+      const [existingEntry, customerSnap, summarySnap] = await Promise.all([
+        tx.get(entryRef),
+        tx.get(customerRef),
+        tx.get(summaryRef),
+      ]);
+
       if (existingEntry.exists) {
         const existingData = existingEntry.data() || {};
         if (existingData.merchant_id !== merchantId ||
@@ -2455,12 +2519,10 @@ const result = await db.runTransaction(async (tx) => {
             !isDeepStrictEqual(existingData.items || [], sanitizedItems)) {
           throw new HttpsError("already-exists", "معرف القيد مستخدم لعملية مالية مختلفة");
         }
-        const custSnap = await tx.get(customerRef);
-        const currentBal = Number(custSnap.data()?.current_balance) || 0;
+        const currentBal = Number(customerSnap.data()?.current_balance) || 0;
         return { success: true, alreadyRecorded: true, entryId, newBalance: currentBal };
       }
 
-      const customerSnap = await tx.get(customerRef);
       if (!customerSnap.exists) {
         throw new HttpsError("not-found", "حساب الزبون غير موجود");
       }
@@ -2468,14 +2530,14 @@ const result = await db.runTransaction(async (tx) => {
       if (customerData.merchant_id !== merchantId) {
         throw new HttpsError("permission-denied", "غير مصرح لك بالقيد على هذا الحساب");
       } else if (customerData.is_deleted === true) {
-        // 🔒 حظر قاطع يمنع تلوث ديون السوق بأي حركة على زبون محذوف
         throw new HttpsError("failed-precondition", "CUSTOMER_DELETED: لا يمكن تسجيل حركة على حساب زبون محذوف");
       }
-     const currentBalance = Number(customerData.current_balance) || 0;
-     if (!Number.isFinite(currentBalance) ||
-         !Number.isSafeInteger(Math.round(currentBalance * 100))) {
-       throw new HttpsError("failed-precondition", "رصيد الزبون الحالي غير صالح للمحاسبة");
-     }
+
+      const currentBalance = Number(customerData.current_balance) || 0;
+      if (!Number.isFinite(currentBalance) ||
+          !Number.isSafeInteger(Math.round(currentBalance * 100))) {
+        throw new HttpsError("failed-precondition", "رصيد الزبون الحالي غير صالح للمحاسبة");
+      }
       const creditLimit = Number(customerData.credit_limit) || 0;
       const currentBalanceCents = Math.round(currentBalance * 100);
       const deltaCents = isDebt ? amountCents : -amountCents;
@@ -2485,11 +2547,10 @@ const result = await db.runTransaction(async (tx) => {
       }
       const newBalance = newBalanceCents / 100;
 
-      // 🔒 التحقق السحابي الصارم من سقف الدين (Server-Side Credit Limit Guard)
       if (isDebt && creditLimit > 0 && newBalance > creditLimit) {
         console.warn(`[Ledger Warning] Customer ${cleanCustomerId} exceeded credit limit: ${newBalance} > ${creditLimit}`);
       }
-      // ✅ التحقق الجنائي والمحاسبي الصارم: منع قيد أي فاتورة بنود لا يتطابق مجموعها مع المبلغ المطلوب
+
       if (sanitizedItems.length > 0) {
         const itemsSumCents = sanitizedItems.reduce(
           (acc, it) => acc + Math.round((Number(it.subtotal) || 0) * 100),
@@ -2515,13 +2576,11 @@ const result = await db.runTransaction(async (tx) => {
         created_at: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
       };
-   // 🔒 حل جذري غير محدود السعة: الاعتماد على رقم إصدار ترادفي (sequence_version) ومعرف آخر حركة
-      // مما يلغي مصفوفة الـ 1500 نهائياً ويسمح بملايين المعاملات للزبون الواحد دون زيادة حجم الوثيقة
+
       const currentVersion = Number(customerData.ledger_version) || 0;
 
- tx.set(entryRef, entryData);
+      tx.set(entryRef, entryData);
 
-     // 🔒 توسيع نافذة الأمان المحاسبي إلى 200 حركة (تستهلك ~7KB فقط وتغطي أسابيع من العمل أوفلاين)
       const existingApplied = Array.isArray(customerData.applied_tx_ids) ? customerData.applied_tx_ids : [];
       const boundedApplied = existingApplied.includes(entryId)
         ? existingApplied
@@ -2536,7 +2595,7 @@ const result = await db.runTransaction(async (tx) => {
         updated_at: FieldValue.serverTimestamp(),
       });
 
-    // 🔒 التحصين المالي: تحديث ملخص ديون السوق ذرياً داخل نفس المعاملة لمنع الانحراف المالي
+      // 🔒 التحصين المالي ومنع الأرقام السالبة في إجمالي ديون السوق
       const oldDebtPortion = Math.max(0, currentBalance);
       const newDebtPortion = Math.max(0, newBalance);
       const debtPortionDelta = (Math.round(newDebtPortion * 100) - Math.round(oldDebtPortion * 100)) / 100;
@@ -2546,11 +2605,15 @@ const result = await db.runTransaction(async (tx) => {
       const debtorsCountChange = isCrossedToDebt ? 1 : (isCrossedToZero ? -1 : 0);
 
       if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
-        const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
+        const currentMarketDebt = Number(summarySnap.data()?.total_market_debt) || 0.0;
+        const currentDebtorsCount = Number(summarySnap.data()?.debtors_count) || 0;
+        const safeNewMarketDebt = Math.max(0, Math.round((currentMarketDebt + debtPortionDelta) * 100) / 100);
+        const safeNewDebtors = Math.max(0, currentDebtorsCount + debtorsCountChange);
+
         tx.set(summaryRef, {
           merchant_id: merchantId,
-          total_market_debt: FieldValue.increment(debtPortionDelta),
-          debtors_count: FieldValue.increment(debtorsCountChange),
+          total_market_debt: safeNewMarketDebt,
+          debtors_count: safeNewDebtors,
           last_updated: FieldValue.serverTimestamp(),
         }, { merge: true });
       }
@@ -2659,7 +2722,7 @@ exports.voidLedgerTransaction = onCall(
         last_applied_timestamp: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
       });
-    // 3. التحديث الذري الشامل داخل نفس المعاملة (Atomic OCC)
+ // 3. التحديث الذري الشامل وحماية إجمالي ديون السوق من الانحراف السلبي
       const oldDebtPortion = Math.max(0, currentBalance);
       const newDebtPortion = Math.max(0, newBalance);
       const debtPortionDelta = (Math.round(newDebtPortion * 100) - Math.round(oldDebtPortion * 100)) / 100;
@@ -2670,14 +2733,18 @@ exports.voidLedgerTransaction = onCall(
 
       if (customerData.is_deleted !== true &&
           (debtPortionDelta !== 0 || debtorsCountChange !== 0)) {
+        const currentMarketDebt = Number(summarySnap.data()?.total_market_debt) || 0.0;
+        const currentDebtorsCount = Number(summarySnap.data()?.debtors_count) || 0;
+        const safeNewMarketDebt = Math.max(0, Math.round((currentMarketDebt + debtPortionDelta) * 100) / 100);
+        const safeNewDebtors = Math.max(0, currentDebtorsCount + debtorsCountChange);
+
         tx.set(summaryRef, {
           merchant_id: merchantId,
-          total_market_debt: FieldValue.increment(debtPortionDelta),
-          debtors_count: FieldValue.increment(debtorsCountChange),
+          total_market_debt: safeNewMarketDebt,
+          debtors_count: safeNewDebtors,
           last_updated: FieldValue.serverTimestamp(),
         }, { merge: true });
       }
-
       return {
         success: true,
         newBalance,
@@ -2687,7 +2754,7 @@ exports.voidLedgerTransaction = onCall(
     return { success: true, newBalance: result.newBalance };
   }
 );
-// 4. مطابقة وتدقيق الرصيد بنمط Version-Locking & Optimistic Concurrency Control (OCC)
+// 4. مطابقة وتدقيق الرصيد بنمط Version-Locking & Optimistic Concurrency Control (OCC) المعصوم
 exports.reconcileLedgerBalance = onCall(
   { region: "us-central1", cors: true },
   async (request) => {
@@ -2713,7 +2780,7 @@ exports.reconcileLedgerBalance = onCall(
     const customerRef = db.collection("merchant_customers").doc(cleanCustomerId);
     const summaryRef = db.collection("merchant_ledger_summaries").doc(merchantId);
 
-    // 🔒 الخطوة 1: قراءة الحالة المبدئية للزبون وتثبيت ختم آخر حركة (Pre-check Snapshot)
+    // 🔒 الخطوة 1: قراءة الحالة المبدئية وتثبيت رقم الإصدار التسلسلي للدفتر
     const preSnap = await customerRef.get();
     if (!preSnap.exists ||
         preSnap.data()?.merchant_id !== merchantId ||
@@ -2722,31 +2789,41 @@ exports.reconcileLedgerBalance = onCall(
     }
 
     const preData = preSnap.data() || {};
+    const preVersion = Number(preData.ledger_version) || 0;
     const preLastTxId = preData.last_transaction_id || null;
     const preBalance = Number(preData.current_balance) || 0.0;
-// 🔒 استعلام مؤمن 100% يعمل مباشرة بدون الحاجة لفهارس مركبة معقدة
- let totalDebtCents = 0;
-    let totalPaymentCents = 0;
-    let lastVisibleDoc = null;
-    let hasMoreEntries = true;
 
-  // 🔒 حساب تجميعي لحظي فائق السرعة عبر محرك السحابة مباشرة دون تحميل وثائق (O(1) Memory & Cost)
-    const baseLedgerQ = db.collection("merchant_ledger_entries")
+    // 🔒 الخطوة 2: حساب تجميعي O(1) بالقروش لمنع هلوسة الفواصل
+  const baseLedgerQ = db.collection("merchant_ledger_entries")
       .where("merchant_id", "==", merchantId)
       .where("customer_id", "==", cleanCustomerId)
       .where("is_voided", "==", false);
 
-    const [debtAggSnap, paymentAggSnap] = await Promise.all([
-      baseLedgerQ.where("type", "==", "debt").aggregate({ totalDebt: AggregateField.sum("amount") }).get(),
-      baseLedgerQ.where("type", "==", "payment").aggregate({ totalPayment: AggregateField.sum("amount") }).get()
-    ]);
+    let totalDebt = 0.0;
+    let totalPayment = 0.0;
 
-    const totalDebt = Number(debtAggSnap.data().totalDebt) || 0.0;
-    const totalPayment = Number(paymentAggSnap.data().totalPayment) || 0.0;
-    
-    // حساب دقيق بالسنتات لمنع هلوسة الفواصل
+    try {
+      // المحاولة الأولى عبر محرك التجميع السحابي المباشر
+      const [debtAggSnap, paymentAggSnap] = await Promise.all([
+        baseLedgerQ.where("type", "==", "debt").aggregate({ totalDebt: AggregateField.sum("amount") }).get(),
+        baseLedgerQ.where("type", "==", "payment").aggregate({ totalPayment: AggregateField.sum("amount") }).get()
+      ]);
+      totalDebt = Number(debtAggSnap.data().totalDebt) || 0.0;
+      totalPayment = Number(paymentAggSnap.data().totalPayment) || 0.0;
+    } catch (aggError) {
+      // 🛡️ مسار الأمان الاحتياطي: إذا لم يكن الفهرس المركب مبنياً، يتم التجميع بحساب الوثائق لضمان استمرار الخدمة
+      console.warn("[reconcileLedgerBalance] Aggregate query failed, using resilient fallback:", aggError);
+      const entriesSnap = await baseLedgerQ.limit(500).get();
+      for (const doc of entriesSnap.docs) {
+        const d = doc.data();
+        const amt = Number(d.amount) || 0.0;
+        if (d.type === "debt") totalDebt += amt;
+        else if (d.type === "payment") totalPayment += amt;
+      }
+    }
+
     const calculatedAuthoritativeBalance = (Math.round(totalDebt * 100) - Math.round(totalPayment * 100)) / 100;
-    // 🔒 الخطوة 3: المعاملة الذرية المحمية بنمط قفل النسخة (Optimistic Version Lock)
+    // 🔒 الخطوة 3: المعاملة الذرية المحمية برقم الإصدار OCC
     return await db.runTransaction(async (tx) => {
       const [postCustomerSnap, summarySnap] = await Promise.all([
         tx.get(customerRef),
@@ -2758,6 +2835,7 @@ exports.reconcileLedgerBalance = onCall(
       }
 
       const postData = postCustomerSnap.data() || {};
+      const postVersion = Number(postData.ledger_version) || 0;
       const postLastTxId = postData.last_transaction_id || null;
 
       if (postData.merchant_id !== merchantId || postData.is_deleted === true) {
@@ -2767,9 +2845,8 @@ exports.reconcileLedgerBalance = onCall(
         );
       }
 
-      // 🛡️ حماية كبرى: إذا تغيرت last_transaction_id أثناء عملية الحساب، فهذا يعني أن حركة مالية
-      // جديدة سُجلت في هذا الجزء من الثانية، فننسحب فوراً بسلام دون مسح الحركة الجديدة!
-      if (postLastTxId !== preLastTxId) {
+      // 🛡️ حماية مطلقة: إذا طرأت أي حركة أو شطب أثناء التجميع السحابي، ننسحب بسلام دون مسح أي حركة جديدة
+      if (postVersion !== preVersion || postLastTxId !== preLastTxId) {
         return {
           success: true,
           reconciled: false,
@@ -2780,10 +2857,11 @@ exports.reconcileLedgerBalance = onCall(
 
       const currentBalance = Number(postData.current_balance) || 0.0;
 
-      // إذا كان الرصيد الحالي مطابقاً تماماً للرصيد المحسوب، نكتفي بتسجيل وقت المطابقة دون كتابات زائدة
+      // إذا كان الرصيد الحالي مطابقاً تماماً، لا داعي لتعديل الرصيد
       if (Math.abs(currentBalance - calculatedAuthoritativeBalance) < 0.001) {
         tx.update(customerRef, {
           reconciled_at: FieldValue.serverTimestamp(),
+          reconciled_version: postVersion,
         });
         return {
           success: true,
@@ -2792,7 +2870,7 @@ exports.reconcileLedgerBalance = onCall(
         };
       }
 
-      // إذا وُجد انحراف حقيقي: تصحيح الرصيد وتحديث ملخص ديون السوق بالفارق فقط بدقة السنتات
+      // تصحيح الرصيد وتحديث ملخص ديون السوق مع ضمان عدم وجود قيم سالبة
       const oldDebtPortion = Math.max(0, currentBalance);
       const newDebtPortion = Math.max(0, calculatedAuthoritativeBalance);
       const debtPortionDelta = (Math.round(newDebtPortion * 100) - Math.round(oldDebtPortion * 100)) / 100;
@@ -2804,14 +2882,20 @@ exports.reconcileLedgerBalance = onCall(
       tx.update(customerRef, {
         current_balance: calculatedAuthoritativeBalance,
         reconciled_at: FieldValue.serverTimestamp(),
+        reconciled_version: postVersion,
         updated_at: FieldValue.serverTimestamp(),
       });
 
       if (debtPortionDelta !== 0 || debtorsCountChange !== 0) {
+        const currentMarketDebt = Number(summarySnap.data()?.total_market_debt) || 0.0;
+        const currentDebtorsCount = Number(summarySnap.data()?.debtors_count) || 0;
+        const safeNewMarketDebt = Math.max(0, Math.round((currentMarketDebt + debtPortionDelta) * 100) / 100);
+        const safeNewDebtors = Math.max(0, currentDebtorsCount + debtorsCountChange);
+
         tx.set(summaryRef, {
           merchant_id: merchantId,
-          total_market_debt: FieldValue.increment(debtPortionDelta),
-          debtors_count: FieldValue.increment(debtorsCountChange),
+          total_market_debt: safeNewMarketDebt,
+          debtors_count: safeNewDebtors,
           last_updated: FieldValue.serverTimestamp(),
         }, { merge: true });
       }

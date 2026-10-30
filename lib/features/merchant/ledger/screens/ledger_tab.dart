@@ -76,7 +76,6 @@ class _LedgerTabState extends State<LedgerTab> {
               stream:
                   LedgerService.instance.watchMerchantLedgerSummary(merchantId),
               builder: (context, summarySnap) {
-                final summaryData = summarySnap.data ?? {};
                 if (snapshot.hasError) {
                   return Center(
                     child: Padding(
@@ -882,7 +881,7 @@ class _AddCustomerDialogState extends State<_AddCustomerDialog> {
 }
 
 // ══════════════════════════════════════════════════════
-// كائن السلعة داخل جلسة كاشير الديون
+// كائن السلعة داخل جلسة كاشير الديون (محصن بالقروش Cents لمنع انحراف الفلسات)
 // ══════════════════════════════════════════════════════
 class _PosDebtItem {
   final String productId;
@@ -903,7 +902,10 @@ class _PosDebtItem {
     this.quantity = 1,
   });
 
-  double get total => unitPrice * quantity;
+  // 🔒 احتساب مالي ذري بالقروش الصحيحة يطابق معادلة السيرفر بنسبة 100%
+  int get unitPriceCents => LedgerCustomer.toCents(unitPrice);
+  int get subtotalCents => unitPriceCents * quantity;
+  double get total => LedgerCustomer.fromCents(subtotalCents);
 }
 
 // ══════════════════════════════════════════════════════
@@ -927,15 +929,17 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
   final List<_PosDebtItem> _items = [];
   bool _isSaving = false;
   String? _billTransactionId; // 🔒 مفتاح التثبيت المالي لمنع تكرار الفاتورة
-
+  String? _lastSubmittedSignature; // 👈 إضافة هذا السطر تحل الخطأين فوراً
   @override
   void initState() {
     super.initState();
     _selectedCustomer = widget.initialCustomer;
   }
 
-  double get _grandTotal => _items.fold(0.0, (sum, i) => sum + i.total);
-// ── دالة إضافة سلعة يدوياً بدون باركود (بالاسم والسعر والوحدة كتابة حرة) ──
+// 🔒 تجميع الإجمالي التراكمي بالقروش الصحيحة لمنع خطأ الفلس الواحد نهائياً
+  int get _grandTotalCents => _items.fold(0, (sum, i) => sum + i.subtotalCents);
+  double get _grandTotal => LedgerCustomer.fromCents(
+      _grandTotalCents); // ── دالة إضافة سلعة يدوياً بدون باركود (بالاسم والسعر والوحدة كتابة حرة) ──
   Future<void> _addManualItem() async {
     final nameCtrl = TextEditingController();
     final priceCtrl = TextEditingController();
@@ -1748,6 +1752,15 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
     final merchantId = AppStorage.userId ?? '';
     final safeMId =
         merchantId.length > 5 ? merchantId.substring(0, 5) : merchantId;
+
+    // 🔒 بصمة محتوى الفاتورة: إذا تغير الزبون أو عدد الأصناف أو الإجمالي يتم توليد معرّف جديد تلقائياً
+    final currentBillSignature =
+        '${_selectedCustomer.id}|${_items.length}|${_grandTotal.toStringAsFixed(0)}';
+    if (_lastSubmittedSignature != currentBillSignature) {
+      _billTransactionId = null;
+      _lastSubmittedSignature = currentBillSignature;
+    }
+
     _billTransactionId ??=
         'pos_${safeMId}_${DateTime.now().microsecondsSinceEpoch}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}_${_selectedCustomer.id.substring(0, _selectedCustomer.id.length > 4 ? 4 : _selectedCustomer.id.length)}';
     try {
@@ -1758,17 +1771,20 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
             ? '${i.productName} (${i.unitLabel.trim()})'
             : i.productName;
 
+        // 🔒 مطابقة دقيقة للسعر والإجمالي بالسنتات والقروش لتفادي أي رفض سحابي
+        final safeUnitPrice = LedgerCustomer.fromCents(i.unitPriceCents);
+        final safeSubtotal = LedgerCustomer.fromCents(i.subtotalCents);
+
         return {
           'product_id': i.productId,
           'name': displayName,
           'quantity': i.quantity,
           'unit_label': safeUnit,
-          'unit_price': i.unitPrice,
-          'subtotal': i.total,
+          'unit_price': safeUnitPrice,
+          'subtotal': safeSubtotal,
           'carton_capacity': i.cartonCapacity > 0 ? i.cartonCapacity : 1,
         };
       }).toList();
-
       await LedgerService.instance.recordTransaction(
         merchantId: merchantId,
         customerId: _selectedCustomer.id,
@@ -1778,11 +1794,24 @@ class _DebtPosSheetState extends State<_DebtPosSheet> {
         items: itemsPayload,
         transactionId: _billTransactionId,
       );
-      _billTransactionId = null; // تصفير المعرف فقط عند النجاح التام
+      _billTransactionId = null;
+      // 🔒 تحديث رصيد الزبون محلياً فوراً لمنع تجاوز السقف في الفاتورة التالية في نفس الجلسة
+      _selectedCustomer = LedgerCustomer(
+        id: _selectedCustomer.id,
+        merchantId: _selectedCustomer.merchantId,
+        name: _selectedCustomer.name,
+        phone: _selectedCustomer.phone,
+        currentBalance: LedgerCustomer.sanitizeAmount(
+            _selectedCustomer.currentBalance + _grandTotal),
+        creditLimit: _selectedCustomer.creditLimit,
+        salaryDay: _selectedCustomer.salaryDay,
+        lastReminderSentAt: _selectedCustomer.lastReminderSentAt,
+        createdAt: _selectedCustomer.createdAt,
+        updatedAt: DateTime.now(),
+      );
       if (!mounted) return;
       final messenger = ScaffoldMessenger.of(context);
       Navigator.pop(context);
-
       messenger.showSnackBar(
         SnackBar(
           content: Text(

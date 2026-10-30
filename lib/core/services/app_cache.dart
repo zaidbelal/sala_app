@@ -1,7 +1,3 @@
-// ==================================================
-// FILE: lib/core/services/app_cache.dart
-// ==================================================
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -10,7 +6,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart'; // لـ compute()
 import 'package:path_provider/path_provider.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:sala/core/services/local_storage.dart';
 
 // ══════════════════════════════════════════════════════════
 // AppCache — نظام كاش ثلاثي الطبقات بسرعة الضوء
@@ -312,11 +307,10 @@ class AppCache {
     }
   }
 
-  /// جلب كافة المنتجات المخزنة محلياً في ذاكرة RAM مع القراءة المباشرة من القرص إن كانت الذاكرة فارغة
+  /// جلب كافة المنتجات المخزنة محلياً من ذاكرة RAM فائقة السرعة دون تعليق الـ UI Thread
   List<Map<String, dynamic>> getAllCachedProducts() {
     final Map<String, Map<String, dynamic>> byId = {};
 
-    // 1. محاولة القراءة من RAM
     for (final entry in _ram.entries) {
       if (entry.key == _keyProducts ||
           entry.key.startsWith('${_keyProducts}_')) {
@@ -333,26 +327,9 @@ class AppCache {
       }
     }
 
-    // 2. إذا كانت الـ RAM غير مكتملة، القراءة المتزامنة المباشرة من القرص
+    // 🔒 إذا كانت الذاكرة غير محملة بعد، يتم جدولتها بالخلفية بدلاً من قراءة ملفات ضخمة متزامنة على شاشة المستخدم
     if (byId.isEmpty && !kIsWeb) {
-      try {
-        final path = AppStorage.appDocsPath;
-        if (path != null) {
-          final file = File('$path/$_keyProducts.json');
-          if (file.existsSync()) {
-            final raw = file.readAsStringSync();
-            final decoded = _decodeJson(raw);
-            if (decoded != null) {
-              for (final p in decoded) {
-                final id = p['id']?.toString();
-                if (id != null && id.isNotEmpty) {
-                  byId[id] = p;
-                }
-              }
-            }
-          }
-        }
-      } catch (_) {}
+      Future.microtask(() => _loadFromDisk(_keyProducts));
     }
 
     return byId.values.toList();

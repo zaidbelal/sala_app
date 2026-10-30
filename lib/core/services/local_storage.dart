@@ -100,10 +100,14 @@ class AppStorage {
           if (await file.exists()) await file.delete();
           final revisionFile = File('${dir.path}/sala_cart_v2_$uid.revision');
           if (await revisionFile.exists()) await revisionFile.delete();
+          // 🔒 تطهير ملفات النسخ الاحتياطي لمنع إعادة إحياء السلة القديمة نهائياً
+          final backupFile = File('${dir.path}/sala_cart_v2_$uid.json.bak');
+          if (await backupFile.exists()) await backupFile.delete();
+          final altBackupFile = File('${dir.path}/sala_cart_v2_$uid.bak');
+          if (await altBackupFile.exists()) await altBackupFile.delete();
         } catch (_) {}
       }
     });
-
     await Future.wait([
       clearSecureStorage,
       clearCartFile,
@@ -224,14 +228,51 @@ class AppStorage {
   }
 
 // ╔══════════════════════════════════════════╗
-  // ║      طلبات معلقة (Offline Queue)        ║
+  // ║      طلبات معلقة (Offline Queue الحتمي)   ║
   // ╚══════════════════════════════════════════╝
   static String _userPendingOrderKey([String? uid]) =>
       '${_kPendingOrder}_${uid ?? userId ?? "anonymous"}';
 
+  static const String _kTerminalOrdersPrefix = 'terminal_order_ids';
+  static String _terminalOrdersKey([String? uid]) =>
+      '${_kTerminalOrdersPrefix}_${uid ?? userId ?? "anonymous"}';
+
   static Future<void> _queueLock = Future.value();
 
-  /// يضيف الطلب إلى الطابور المحلي الخاص بالمستخدم الحالي (Thread-Safe)
+  /// وسم معرّف الطلب كمنتهٍ نهائياً لمنع قيامته كطلب شبحي
+  static void markOrderIdTerminal(String orderId, [String? uid]) {
+    final cleanId = orderId.trim();
+    if (cleanId.isEmpty) return;
+    try {
+      final key = _terminalOrdersKey(uid);
+      final raw = _db.getString(key);
+      final set = raw != null && raw.isNotEmpty
+          ? Set<String>.from(jsonDecode(raw) as List)
+          : <String>{};
+      set.add(cleanId);
+      if (set.length > 300) {
+        set.removeAll(set.take(set.length - 300).toList());
+      }
+      _db.setString(key, jsonEncode(set.toList()));
+    } catch (_) {}
+  }
+
+  /// فحص هل الطلب منتهٍ مسبقاً
+  static bool isOrderTerminal(String orderId, [String? uid]) {
+    final cleanId = orderId.trim();
+    if (cleanId.isEmpty) return false;
+    try {
+      final key = _terminalOrdersKey(uid);
+      final raw = _db.getString(key);
+      if (raw == null || raw.isEmpty) return false;
+      final set = Set<String>.from(jsonDecode(raw) as List);
+      return set.contains(cleanId);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// يضيف الطلب إلى الطابور المحلي مع التحقق الحتمي ضد التكرار والطلبات المنتهية
   static Future<void> savePendingOrder(Map<String, dynamic> order) async {
     final previousLock = _queueLock;
     final completer = Completer<void>();
@@ -244,6 +285,13 @@ class AppStorage {
     try {
       final targetUid = order['merchantId']?.toString();
       final targetOrderId = order['orderId']?.toString() ?? '';
+
+      // 🔒 حظر قاطع: منع حفظ أي طلب سبق اعتماده أو حذفه نهائياً
+      if (targetOrderId.isNotEmpty &&
+          isOrderTerminal(targetOrderId, targetUid)) {
+        return;
+      }
+
       final key = _userPendingOrderKey(targetUid);
       final currentQueue = getPendingOrders(targetUid);
 
@@ -256,87 +304,68 @@ class AppStorage {
       if (!await _db.setString(key, json)) {
         throw StateError('تعذر حفظ الطلب المعلق في التخزين المحلي');
       }
-// 🔒 كتابة ذرية آمنة متوافقة مع أنظمة Android و iOS تضمن عدم تلف ملفات الطابور
+
+      // 🔒 كتابة ذرية حتمية لملف القرص الثابت دون توليد ملفات مؤقتة مبعثرة
       if (!kIsWeb && _appDocsPath != null) {
         try {
           final finalFile = File('$_appDocsPath/${key}_backup.json');
-          final nonce = DateTime.now().microsecondsSinceEpoch;
-          final tempFile = File('$_appDocsPath/${key}_tmp_$nonce.json');
-
+          final tempFile = File('$_appDocsPath/${key}.tmp');
           await tempFile.writeAsString(json, flush: true);
-
-          // 🔒 استبدال ذري آمن بدون حذف مسبق: POSIX Atomic Rename
           try {
             await tempFile.rename(finalFile.path);
           } catch (_) {
-            // حل بديل في حال قيود أنظمة الملفات بين الأقسام
             await tempFile.copy(finalFile.path);
             await tempFile.delete().catchError((_) => tempFile);
           }
-        } catch (_) {
-          try {
-            final finalFile = File('$_appDocsPath/${key}_backup.json');
-            await finalFile.writeAsString(json, flush: true);
-          } catch (_) {}
-        }
+        } catch (_) {}
       }
     } finally {
       completer.complete();
     }
   }
 
-  /// يرجع جميع الطلبات المعلقة في الطابور للمستخدم الحالي فقط
+  /// جلب الطلبات المعلقة مع استبعاد الطلبات المنتهية وتوحيد مصدر الحقيقة
   static List<Map<String, dynamic>> getPendingOrders([String? uid]) {
     final targetUid = uid ?? userId;
     if (targetUid == null || targetUid.isEmpty) return [];
     final key = _userPendingOrderKey(targetUid);
     var raw = _db.getString(key);
-    // 🔒 قراءة نظيفة موحدة: فحص الملف الاحتياطي الدائم ثم الملفات المؤقتة الأحدث عند وجود تعطل
+
+    // 🔒 قراءة نظيفة: إذا كانت القيمة مسجلة كـ '[]' صريحة فهي فارغة حتماً ولا نبحث في القرص
+    if (raw == '[]') return [];
+
     if ((raw == null || raw.isEmpty) && !kIsWeb && _appDocsPath != null) {
       try {
         final file = File('$_appDocsPath/${key}_backup.json');
         if (file.existsSync()) {
           raw = file.readAsStringSync();
-        } else {
-          final dir = Directory(_appDocsPath!);
-          if (dir.existsSync()) {
-            final candidates = dir
-                .listSync()
-                .whereType<File>()
-                .where(
-                  (f) =>
-                      f.path.contains('${key}_tmp_') &&
-                      f.path.endsWith('.json'),
-                )
-                .toList();
-            if (candidates.isNotEmpty) {
-              candidates.sort((a, b) =>
-                  b.lastModifiedSync().compareTo(a.lastModifiedSync()));
-              raw = candidates.first.readAsStringSync();
-              try {
-                candidates.first.copySync(file.path);
-              } catch (_) {}
-            }
-          }
         }
       } catch (_) {}
     }
-    if (raw == null || raw.isEmpty) return [];
+
+    if (raw == null || raw.isEmpty || raw == '[]') return [];
     try {
       final decoded = jsonDecode(raw);
+      List<Map<String, dynamic>> list = [];
       if (decoded is List) {
-        return List<Map<String, dynamic>>.from(
+        list = List<Map<String, dynamic>>.from(
             decoded.map((e) => Map<String, dynamic>.from(e as Map)));
       } else if (decoded is Map) {
-        return [Map<String, dynamic>.from(decoded)];
+        list = [Map<String, dynamic>.from(decoded)];
       }
-      return [];
+
+      // 🛡️ تصفية قطعية تسقط أي طلب تم اعتماده أو حذفه مسبقاً (Anti-Ghost Barrier)
+      list.removeWhere((order) {
+        final id = order['orderId']?.toString() ?? '';
+        return id.isNotEmpty && isOrderTerminal(id, targetUid);
+      });
+      return list;
     } catch (_) {
       return [];
     }
   }
 
-  /// يحذف طلباً محدداً من الطابور ويحدث ملف القرص الدائم وينظف كافة الملفات المؤقتة لمنع قيامة الطلبات القديمة نهائياً
+  /// يحذف طلباً محدداً ويثبت حالته كمنتهٍ نهائياً
   static Future<void> removePendingOrder(String orderId, [String? uid]) async {
     final previousLock = _queueLock;
     final completer = Completer<void>();
@@ -352,48 +381,25 @@ class AppStorage {
       final currentQueue = getPendingOrders(targetUid);
       currentQueue.removeWhere((order) => order['orderId'] == orderId);
 
-      // تنظيف شامل وجذري لكافة الملفات المؤقتة التابعة لهذا المفتاح
+      // 🔒 وسم المعرف كمنتهٍ فوراً لمنع قيامته
+      markOrderIdTerminal(orderId, targetUid);
+
+      final json = jsonEncode(currentQueue);
+      // حفظ '[]' صريحة دائماً عند فراغ الطابور بدلاً من ترك الحقل فارغاً
+      await _db.setString(key, json);
+
       if (!kIsWeb && _appDocsPath != null) {
         try {
-          final dir = Directory(_appDocsPath!);
-          if (dir.existsSync()) {
-            final leftovers = dir.listSync().whereType<File>().where(
-                  (f) =>
-                      f.path.contains('${key}_tmp_') &&
-                      f.path.endsWith('.json'),
-                );
-            for (final f in leftovers) {
-              try {
-                f.deleteSync();
-              } catch (_) {}
-            }
+          final finalFile = File('$_appDocsPath/${key}_backup.json');
+          final tempFile = File('$_appDocsPath/${key}.tmp');
+          await tempFile.writeAsString(json, flush: true);
+          try {
+            await tempFile.rename(finalFile.path);
+          } catch (_) {
+            await tempFile.copy(finalFile.path);
+            await tempFile.delete().catchError((_) => tempFile);
           }
         } catch (_) {}
-      }
-
-      if (currentQueue.isEmpty) {
-        await _db.remove(key);
-        await _db.remove(_kPendingOrder);
-        if (!kIsWeb && _appDocsPath != null) {
-          try {
-            final backupFile = File('$_appDocsPath/${key}_backup.json');
-            final tmpFile = File('$_appDocsPath/${key}_backup.tmp');
-            if (await backupFile.exists()) await backupFile.delete();
-            if (await tmpFile.exists()) await tmpFile.delete();
-          } catch (_) {}
-        }
-      } else {
-        final json = jsonEncode(currentQueue);
-        await _db.setString(key, json);
-        if (!kIsWeb && _appDocsPath != null) {
-          try {
-            final backupFile = File('$_appDocsPath/${key}_backup.json');
-            final nonce = DateTime.now().microsecondsSinceEpoch;
-            final tmpFile = File('$_appDocsPath/${key}_backup_$nonce.tmp');
-            await tmpFile.writeAsString(json, flush: true);
-            await tmpFile.rename(backupFile.path);
-          } catch (_) {}
-        }
       }
     } finally {
       completer.complete();
@@ -401,20 +407,35 @@ class AppStorage {
   }
 
   static Future<void> clearPendingOrder([String? uid]) async {
-    final targetUid = uid ?? userId;
-    if (targetUid != null && targetUid.isNotEmpty) {
-      final key = _userPendingOrderKey(targetUid);
-      await _db.remove(key);
-      if (!kIsWeb && _appDocsPath != null) {
-        try {
-          final backupFile = File('$_appDocsPath/${key}_backup.json');
-          final tmpFile = File('$_appDocsPath/${key}_backup.tmp');
-          if (await backupFile.exists()) await backupFile.delete();
-          if (await tmpFile.exists()) await tmpFile.delete();
-        } catch (_) {}
+    final previousLock = _queueLock;
+    final completer = Completer<void>();
+    _queueLock = completer.future;
+
+    try {
+      await previousLock;
+    } catch (_) {}
+
+    try {
+      final targetUid = uid ?? userId;
+      if (targetUid != null && targetUid.isNotEmpty) {
+        final key = _userPendingOrderKey(targetUid);
+        final currentQueue = getPendingOrders(targetUid);
+        for (final o in currentQueue) {
+          final id = o['orderId']?.toString();
+          if (id != null) markOrderIdTerminal(id, targetUid);
+        }
+        await _db.setString(key, '[]');
+        if (!kIsWeb && _appDocsPath != null) {
+          try {
+            final backupFile = File('$_appDocsPath/${key}_backup.json');
+            await backupFile.writeAsString('[]', flush: true);
+          } catch (_) {}
+        }
       }
+      await _db.remove(_kPendingOrder);
+    } finally {
+      completer.complete();
     }
-    await _db.remove(_kPendingOrder);
   }
 
   // ── حركات الدفتر المعلقة (أوفلاين - حماية أموال التاجر) ──
@@ -586,11 +607,11 @@ class AppStorage {
     } finally {
       completer.complete();
     }
-  }
+  } // ── طلبات الإرجاع المعلقة (أوفلاين - دمج ذري متكامل لمنع فقدان الأصناف) ──
 
-  // ── طلبات الإرجاع المعلقة (أوفلاين) ──
   static String _userPendingReturnKey([String? uid]) =>
       '${_kPendingReturns}_${uid ?? userId ?? "anonymous"}';
+
   static Future<void> savePendingReturn(Map<String, dynamic> returnData) async {
     final previousLock = _queueLock;
     final completer = Completer<void>();
@@ -605,15 +626,59 @@ class AppStorage {
       final key = _userPendingReturnKey(targetUid);
       final currentQueue = getPendingReturns(targetUid);
       final targetOrderId = returnData['orderId']?.toString() ?? '';
-      if (targetOrderId.isNotEmpty &&
-          currentQueue.any((r) => r['orderId'] == targetOrderId)) {
-        return;
+
+      // 🛡️ فحص الدمج الذكي: إذا وجد طلب إرجاع أوفلاين سابق لنفس الفاتورة يتم دمج الأصناف والأسباب
+      final existingIndex = targetOrderId.isNotEmpty
+          ? currentQueue.indexWhere((r) => r['orderId'] == targetOrderId)
+          : -1;
+
+      if (existingIndex != -1) {
+        final existingRecord =
+            Map<String, dynamic>.from(currentQueue[existingIndex]);
+        final existingItems = List<Map<String, dynamic>>.from(
+            existingRecord['itemsToReturn'] ?? []);
+        final newItems =
+            List<Map<String, dynamic>>.from(returnData['itemsToReturn'] ?? []);
+
+        // دمج عناصر الإرجاع حسب معرّف الصنف مع جمع الكميات
+        final Map<String, Map<String, dynamic>> mergedMap = {
+          for (final it in existingItems)
+            (it['order_item_id']?.toString() ?? it['id']?.toString() ?? ''):
+                Map<String, dynamic>.from(it)
+        };
+
+        for (final item in newItems) {
+          final id =
+              item['order_item_id']?.toString() ?? item['id']?.toString() ?? '';
+          if (id.isEmpty) continue;
+          if (mergedMap.containsKey(id)) {
+            final oldQty = (mergedMap[id]!['quantity'] as num?)?.toInt() ?? 0;
+            final addedQty = (item['quantity'] as num?)?.toInt() ?? 0;
+            mergedMap[id]!['quantity'] = oldQty + addedQty;
+          } else {
+            mergedMap[id] = Map<String, dynamic>.from(item);
+          }
+        }
+
+        existingRecord['itemsToReturn'] = mergedMap.values.toList();
+
+        // دمج أسباب الإرجاع بفاصل منظم
+        final oldReason = existingRecord['reason']?.toString().trim() ?? '';
+        final newReason = returnData['reason']?.toString().trim() ?? '';
+        if (newReason.isNotEmpty && !oldReason.contains(newReason)) {
+          existingRecord['reason'] =
+              oldReason.isEmpty ? newReason : '$oldReason | $newReason';
+        }
+
+        currentQueue[existingIndex] = existingRecord;
+      } else {
+        currentQueue.add(returnData);
       }
-      currentQueue.add(returnData);
+
       final json = jsonEncode(currentQueue);
       await _db.setString(key, json);
 
-      // 🔒 كتابة ذرية لطلبات الإرجاع أوفلاين على القرص
+      // 🔒 كتابة ذرية آمنة على القرص الصلب
       if (!kIsWeb && _appDocsPath != null) {
         try {
           final nonce = DateTime.now().microsecondsSinceEpoch;

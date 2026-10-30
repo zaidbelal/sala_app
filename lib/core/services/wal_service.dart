@@ -228,247 +228,285 @@ class WalService {
     return _withLock(() => _readUncommittedInternal());
   }
 
-  Future<void> reconcilePendingEntries() async {
-    if (kIsWeb) return;
-    await init();
-    if (_logFile == null || !await _logFile!.exists()) return;
+  static final Completer<void> _reconciliationCompleter = Completer<void>();
+  static Future<void> get waitForReconciliation =>
+      _reconciliationCompleter.isCompleted
+          ? Future.value()
+          : _reconciliationCompleter.future;
 
-    final pending = await getUncommittedEntries();
-    if (pending.isEmpty) {
-      await compactLog();
+  Future<void> reconcilePendingEntries() async {
+    if (kIsWeb) {
+      if (!_reconciliationCompleter.isCompleted) {
+        _reconciliationCompleter.complete();
+      }
       return;
     }
-
-    for (final entry in pending) {
-      try {
-        final merchantId =
-            entry.payload['merchant_id']?.toString() ?? AppStorage.userId ?? '';
-        if (merchantId.isEmpty) {
-          throw StateError('WAL entry has no merchant identity');
-        }
-
-        if (entry.type == WalOperationType.placeOrder) {
-          final items = entry.payload['items'];
-          final expectedTotal =
-              entry.payload['expectedTotal'] ?? entry.payload['expected_total'];
-          if (items is! List || items.isEmpty || expectedTotal is! num) {
-            throw FormatException('WAL order payload is incomplete');
-          }
-          await AppStorage.savePendingOrder({
-            'orderId': entry.id,
-            'merchantId': merchantId,
-            'items': items
-                .map((item) => Map<String, dynamic>.from(item as Map))
-                .toList(),
-            'expectedTotal': expectedTotal,
-            if (entry.payload['notes'] != null) 'notes': entry.payload['notes'],
-            if (entry.payload['extraData'] is Map)
-              'extraData':
-                  Map<String, dynamic>.from(entry.payload['extraData'] as Map),
-            if (entry.payload['cart_revision'] != null)
-              'cart_revision': entry.payload['cart_revision'],
-          });
-        } else {
-          final payload = Map<String, dynamic>.from(entry.payload);
-          if (payload['action'] == 'void') {
-            await AppStorage.savePendingLedgerTx({
-              'id': 'void_${entry.id}',
-              'merchant_id': merchantId,
-              'customer_id': payload['customer_id'],
-              'type': 'void_request',
-              'target_entry_id': entry.id,
-              'amount': payload['amount'],
-              'is_debt': payload['is_debt'],
-              'created_at': entry.timestamp.toIso8601String(),
-            });
-          } else {
-            payload['id'] = entry.id;
-            await AppStorage.savePendingLedgerTx(payload);
-          }
-        }
-      } catch (e, st) {
-        if (kDebugMode) {
-          debugPrint('WAL recovery could not restore ${entry.id}: $e');
-        }
-        if (!kIsWeb) {
-          FirebaseCrashlytics.instance.recordError(
-            e,
-            st,
-            reason: 'WAL intent recovery failed for ${entry.id}',
-          );
-        }
+    try {
+      await init();
+      if (_logFile == null || !await _logFile!.exists()) {
+        return;
       }
-    }
+      final pending = await getUncommittedEntries();
+      if (pending.isEmpty) {
+        await compactLog();
+        return;
+      }
+      final db = FirebaseFirestore.instance;
+      final verifiedIds = <String>[];
+      final verifiedVoidedLedgerIds = <String>{};
+      final verifiedOrderUids = <String>{};
 
-    final db = FirebaseFirestore.instance;
-    final verifiedIds = <String>[];
-    final verifiedVoidedLedgerIds = <String>{};
-    final verifiedOrderUids = <String>{};
-// 🔒 تنفيذ التحقق بالتوازي بمهلة إجمالية واحدة لا تتجاوز 3 ثوانٍ
-    await Future.wait(
-      pending.map((entry) async {
-        try {
-          bool verifiedOnServer = false;
-          if (entry.type == WalOperationType.placeOrder) {
-            final doc = await db
-                .collection('orders')
-                .doc(entry.id)
-                .get(const GetOptions(source: Source.server))
-                .timeout(const Duration(seconds: 3));
-            final merchantId =
-                entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
-            final orderNumber = doc.data()?['order_number']?.toString() ?? '';
-            verifiedOnServer = doc.exists &&
-                doc.data()?['merchant_id'] == merchantId &&
-                orderNumber.isNotEmpty;
-            if (verifiedOnServer) {
-              if (merchantId != null) verifiedOrderUids.add(merchantId);
-            }
-          } else if (entry.type == WalOperationType.ledgerTransaction) {
-            final doc = await db
-                .collection('merchant_ledger_entries')
-                .doc(entry.id)
-                .get(const GetOptions(source: Source.server))
-                .timeout(const Duration(seconds: 3));
-            final data = doc.data();
-            final matchesIntent = doc.exists &&
-                data?['merchant_id'] == entry.payload['merchant_id'] &&
-                data?['customer_id'] == entry.payload['customer_id'];
-            if (matchesIntent && data?['is_voided'] == true) {
-              verifiedVoidedLedgerIds.add(entry.id);
-            }
-            if (entry.payload['action'] == 'void') {
-              verifiedOnServer = matchesIntent && data?['is_voided'] == true;
-            } else {
-              final docAmtCents =
-                  (((data?['amount'] as num?)?.toDouble() ?? 0.0) * 100)
-                      .round();
-              final intentAmtCents =
-                  (((entry.payload['amount'] as num?)?.toDouble() ?? 0.0) * 100)
-                      .round();
-              final persistedNotes = data?['notes'] ?? '';
-              final intentNotes = entry.payload['notes'] ?? '';
-              final persistedItems = data?['items'] ?? const [];
-              final intentItems = entry.payload['items'] ?? const [];
-
-              verifiedOnServer = matchesIntent &&
-                  data?['type'] == entry.payload['type'] &&
-                  docAmtCents == intentAmtCents &&
-                  _matchesJsonValue(persistedNotes, intentNotes) &&
-                  _matchesJsonValue(persistedItems, intentItems);
-            }
-          }
-          if (verifiedOnServer) {
-            verifiedIds.add(entry.id);
-          }
-        } catch (_) {}
-      }),
-    );
-    // حذف السلة فقط إذا كانت سلتها مطابقة لعناصر الطلب المؤكد بالسيرفر لمنع مسح سلة جديدة
-    if (verifiedOrderUids.isNotEmpty) {
-      for (final uid in verifiedOrderUids) {
-        if (!kIsWeb) {
+      // 🔒 الخطوة 1: فحص السيرفر أولاً قبل لمس التخزين المحلي لمنع إحياء الطلبات الملغاة
+      await Future.wait(
+        pending.map((entry) async {
           try {
-            final dir = await getApplicationDocumentsDirectory();
-            final file = File('${dir.path}/sala_cart_v2_$uid.json');
-            if (await file.exists()) {
-              final content = await file.readAsString();
-              if (content.trim().isEmpty || content == '{}') {
-                await file.delete();
-                continue;
+            bool verifiedOnServer = false;
+            if (entry.type == WalOperationType.placeOrder) {
+              final doc = await db
+                  .collection('orders')
+                  .doc(entry.id)
+                  .get(const GetOptions(source: Source.server))
+                  .timeout(const Duration(seconds: 3));
+              final merchantId =
+                  entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
+              final orderNumber = doc.data()?['order_number']?.toString() ?? '';
+              verifiedOnServer = doc.exists &&
+                  doc.data()?['merchant_id'] == merchantId &&
+                  orderNumber.isNotEmpty;
+              if (verifiedOnServer) {
+                if (merchantId != null) verifiedOrderUids.add(merchantId);
               }
-              final decoded = jsonDecode(content);
-              final cartProductIds = (decoded is Map)
-                  ? decoded.values
-                      .map((v) => (v['product']?['id'])?.toString())
-                      .whereType<String>()
-                      .toSet()
-                  : <String>{};
-              final revisionFile =
-                  File('${dir.path}/sala_cart_v2_$uid.revision');
-              final cartRevision = await revisionFile.exists()
-                  ? (await revisionFile.readAsString()).trim()
-                  : '';
-              final matchingEntries = pending.where((e) =>
-                  verifiedIds.contains(e.id) &&
-                  (e.payload['merchant_id']?.toString() ?? AppStorage.userId) ==
-                      uid &&
-                  e.payload['cart_revision']?.toString() == cartRevision);
-
-              final verifiedProductIds = matchingEntries
-                  .expand((e) => (e.payload['items'] as List? ?? []))
-                  .map((it) => (it['product_id'])?.toString())
-                  .whereType<String>()
-                  .toSet();
-
-              // 🔒 التحقق الشامل: مطابقة المعرفات والكميات معاً لضمان عدم مسح سلة جديدة لنفس الصنف
-              final matchingItemsList = matchingEntries
-                  .expand((e) => (e.payload['items'] as List? ?? []))
-                  .toList();
-
-              bool isExactCartMatch = cartProductIds.isNotEmpty &&
-                  cartProductIds.length == verifiedProductIds.length &&
-                  cartProductIds.every((id) => verifiedProductIds.contains(id));
-
-              if (isExactCartMatch && decoded is Map) {
-                for (final itemVal in decoded.values) {
-                  final pId = itemVal['product']?['id']?.toString();
-                  final qty = (itemVal['quantity'] as num?)?.toInt() ?? 0;
-                  final matchingOrderQty = matchingItemsList
-                      .where((m) => m['product_id']?.toString() == pId)
-                      .fold<int>(
-                          0,
-                          (sum, m) =>
-                              sum + ((m['quantity'] as num?)?.toInt() ?? 0));
-                  if (matchingOrderQty != qty) {
-                    isExactCartMatch = false;
-                    break;
-                  }
-                }
+            } else if (entry.type == WalOperationType.ledgerTransaction) {
+              final doc = await db
+                  .collection('merchant_ledger_entries')
+                  .doc(entry.id)
+                  .get(const GetOptions(source: Source.server))
+                  .timeout(const Duration(seconds: 3));
+              final data = doc.data();
+              final matchesIntent = doc.exists &&
+                  data?['merchant_id'] == entry.payload['merchant_id'] &&
+                  data?['customer_id'] == entry.payload['customer_id'];
+              if (matchesIntent && data?['is_voided'] == true) {
+                verifiedVoidedLedgerIds.add(entry.id);
               }
+              if (entry.payload['action'] == 'void') {
+                verifiedOnServer = matchesIntent && data?['is_voided'] == true;
+              } else {
+                final docAmtCents =
+                    (((data?['amount'] as num?)?.toDouble() ?? 0.0) * 100)
+                        .round();
+                final intentAmtCents =
+                    (((entry.payload['amount'] as num?)?.toDouble() ?? 0.0) *
+                            100)
+                        .round();
+                final persistedNotes = data?['notes'] ?? '';
+                final intentNotes = entry.payload['notes'] ?? '';
+                final persistedItems = data?['items'] ?? const [];
+                final intentItems = entry.payload['items'] ?? const [];
 
-              // لا نحذف السلة إلا إذا كانت تطابق مراجعة السلة الدقيقة لنفس العملية المعلقة المؤكدة
-              final hasMatchingRevision = matchingEntries.any(
-                (e) => e.payload['cart_revision']?.toString() == cartRevision,
-              );
-
-              final isAssociatedWithPending = cartRevision.isNotEmpty &&
-                  hasMatchingRevision &&
-                  isExactCartMatch;
-
-              if (isAssociatedWithPending) {
-                await file.delete();
-                await AppStorage.remove('sala_cart_v2_$uid');
+                verifiedOnServer = matchesIntent &&
+                    data?['type'] == entry.payload['type'] &&
+                    docAmtCents == intentAmtCents &&
+                    _matchesJsonValue(persistedNotes, intentNotes) &&
+                    _matchesJsonValue(persistedItems, intentItems);
               }
+            }
+            if (verifiedOnServer) {
+              verifiedIds.add(entry.id);
             }
           } catch (_) {}
+        }),
+      );
+
+      // 🔒 الخطوة 2: استرجاع الطلبات غير المكتملة فقط إذا لم تكن معتمدة مسبقاً ولم تكن منتهية/ملغاة
+      for (final entry in pending) {
+        if (verifiedIds.contains(entry.id)) continue;
+
+        try {
+          final merchantId = entry.payload['merchant_id']?.toString() ??
+              AppStorage.userId ??
+              '';
+          if (merchantId.isEmpty) continue;
+
+          // 🛡️ حظر قاطع: إذا كان الطلب موسوماً بأنه منتهٍ، نلغيه فوراً من WAL ولا نعيد إحياءه أبداً
+          if (entry.type == WalOperationType.placeOrder) {
+            if (AppStorage.isOrderTerminal(entry.id, merchantId)) {
+              await markAborted(entry.id);
+              continue;
+            }
+
+            // استرجاع الطلب فقط إذا كان حديثاً (أقل من 12 ساعة)
+            if (DateTime.now().difference(entry.timestamp).inHours > 12) {
+              await markAborted(entry.id);
+              continue;
+            }
+
+            final items = entry.payload['items'];
+            final expectedTotal = entry.payload['expectedTotal'] ??
+                entry.payload['expected_total'];
+            if (items is List && items.isNotEmpty && expectedTotal is num) {
+              await AppStorage.savePendingOrder({
+                'orderId': entry.id,
+                'merchantId': merchantId,
+                'items': items
+                    .map((item) => Map<String, dynamic>.from(item as Map))
+                    .toList(),
+                'expectedTotal': expectedTotal,
+                if (entry.payload['notes'] != null)
+                  'notes': entry.payload['notes'],
+                if (entry.payload['extraData'] is Map)
+                  'extraData': Map<String, dynamic>.from(
+                      entry.payload['extraData'] as Map),
+                if (entry.payload['cart_revision'] != null)
+                  'cart_revision': entry.payload['cart_revision'],
+              });
+            }
+          } else {
+            final payload = Map<String, dynamic>.from(entry.payload);
+            if (payload['action'] == 'void') {
+              await AppStorage.savePendingLedgerTx({
+                'id': 'void_${entry.id}',
+                'merchant_id': merchantId,
+                'customer_id': payload['customer_id'],
+                'type': 'void_request',
+                'target_entry_id': entry.id,
+                'amount': payload['amount'],
+                'is_debt': payload['is_debt'],
+                'created_at': entry.timestamp.toIso8601String(),
+              });
+            } else {
+              payload['id'] = entry.id;
+              await AppStorage.savePendingLedgerTx(payload);
+            }
+          }
+        } catch (e, st) {
+          if (kDebugMode) {
+            debugPrint('WAL recovery skipped invalid entry ${entry.id}: $e');
+          }
+          if (!kIsWeb) {
+            FirebaseCrashlytics.instance.recordError(
+              e,
+              st,
+              reason: 'WAL intent recovery failed for ${entry.id}',
+            );
+          }
         }
       }
-    }
-    if (verifiedIds.isNotEmpty) {
-      await _withLock(() async {
-        for (final id in verifiedIds) {
-          await _appendStateTransition(id, WalStatus.committed,
-              autoCompact: false);
-        }
-      });
-      for (final entry in pending.where((e) => verifiedIds.contains(e.id))) {
-        final targetMerchantId =
-            entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
-        if (entry.type == WalOperationType.placeOrder) {
-          if (targetMerchantId != null) {
-            await AppStorage.removePendingOrder(entry.id, targetMerchantId);
-          }
-        } else if (entry.type == WalOperationType.ledgerTransaction) {
-          await AppStorage.removePendingLedgerTx(entry.id, targetMerchantId);
-          if (verifiedVoidedLedgerIds.contains(entry.id)) {
-            await AppStorage.removePendingLedgerTx(
-                'void_${entry.id}', targetMerchantId);
+      // حذف السلة فقط إذا كانت سلتها مطابقة لعناصر الطلب المؤكد بالسيرفر لمنع مسح سلة جديدة
+      if (verifiedOrderUids.isNotEmpty) {
+        for (final uid in verifiedOrderUids) {
+          if (!kIsWeb) {
+            try {
+              final dir = await getApplicationDocumentsDirectory();
+              final file = File('${dir.path}/sala_cart_v2_$uid.json');
+              if (await file.exists()) {
+                final content = await file.readAsString();
+                if (content.trim().isEmpty || content == '{}') {
+                  await file.delete();
+                  continue;
+                }
+                final decoded = jsonDecode(content);
+                final cartProductIds = (decoded is Map)
+                    ? decoded.values
+                        .map((v) => (v['product']?['id'])?.toString())
+                        .whereType<String>()
+                        .toSet()
+                    : <String>{};
+                final revisionFile =
+                    File('${dir.path}/sala_cart_v2_$uid.revision');
+                final cartRevision = await revisionFile.exists()
+                    ? (await revisionFile.readAsString()).trim()
+                    : '';
+                final matchingEntries = pending.where((e) =>
+                    verifiedIds.contains(e.id) &&
+                    (e.payload['merchant_id']?.toString() ??
+                            AppStorage.userId) ==
+                        uid &&
+                    e.payload['cart_revision']?.toString() == cartRevision);
+
+                final verifiedProductIds = matchingEntries
+                    .expand((e) => (e.payload['items'] as List? ?? []))
+                    .map((it) => (it['product_id'])?.toString())
+                    .whereType<String>()
+                    .toSet();
+
+                // 🔒 التحقق الشامل: مطابقة المعرفات والكميات معاً لضمان عدم مسح سلة جديدة لنفس الصنف
+                final matchingItemsList = matchingEntries
+                    .expand((e) => (e.payload['items'] as List? ?? []))
+                    .toList();
+
+                bool isExactCartMatch = cartProductIds.isNotEmpty &&
+                    cartProductIds.length == verifiedProductIds.length &&
+                    cartProductIds
+                        .every((id) => verifiedProductIds.contains(id));
+
+                if (isExactCartMatch && decoded is Map) {
+                  for (final itemVal in decoded.values) {
+                    final pId = itemVal['product']?['id']?.toString();
+                    final qty = (itemVal['quantity'] as num?)?.toInt() ?? 0;
+                    final matchingOrderQty = matchingItemsList
+                        .where((m) => m['product_id']?.toString() == pId)
+                        .fold<int>(
+                            0,
+                            (sum, m) =>
+                                sum + ((m['quantity'] as num?)?.toInt() ?? 0));
+                    if (matchingOrderQty != qty) {
+                      isExactCartMatch = false;
+                      break;
+                    }
+                  }
+                }
+
+                // لا نحذف السلة إلا إذا كانت تطابق مراجعة السلة الدقيقة لنفس العملية المعلقة المؤكدة
+                final hasMatchingRevision = matchingEntries.any(
+                  (e) => e.payload['cart_revision']?.toString() == cartRevision,
+                );
+
+                final isAssociatedWithPending = cartRevision.isNotEmpty &&
+                    hasMatchingRevision &&
+                    isExactCartMatch;
+
+                if (isAssociatedWithPending) {
+                  await file.delete();
+                  await AppStorage.remove('sala_cart_v2_$uid');
+                }
+              }
+            } catch (_) {}
           }
         }
       }
+      if (verifiedIds.isNotEmpty) {
+        await _withLock(() async {
+          for (final id in verifiedIds) {
+            await _appendStateTransition(id, WalStatus.committed,
+                autoCompact: false);
+          }
+        });
+        for (final entry in pending.where((e) => verifiedIds.contains(e.id))) {
+          final targetMerchantId =
+              entry.payload['merchant_id']?.toString() ?? AppStorage.userId;
+          if (entry.type == WalOperationType.placeOrder) {
+            if (targetMerchantId != null) {
+              await AppStorage.removePendingOrder(entry.id, targetMerchantId);
+            }
+          } else if (entry.type == WalOperationType.ledgerTransaction) {
+            await AppStorage.removePendingLedgerTx(entry.id, targetMerchantId);
+            if (verifiedVoidedLedgerIds.contains(entry.id)) {
+              await AppStorage.removePendingLedgerTx(
+                  'void_${entry.id}', targetMerchantId);
+            }
+          }
+        }
+      }
+      await compactLog();
+    } catch (e, st) {
+      if (kDebugMode) debugPrint('WAL reconcile error: $e\n$st');
+    } finally {
+      // 🔒 تحصين قاطع: إتمام الـ Completer حتماً لمنع أي تعليق في دورة حياة التطبيق
+      if (!_reconciliationCompleter.isCompleted) {
+        _reconciliationCompleter.complete();
+      }
     }
-    await compactLog();
   }
 
   bool _matchesJsonValue(Object? first, Object? second) {

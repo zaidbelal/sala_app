@@ -339,18 +339,20 @@ class ProductsNotifier
   Future<void> _bgRefresh({String? categoryId}) async {
     if (categoryId == null) {
       try {
-        final updated = await DeltaSyncService.instance.syncProductsDelta();
-        if (updated && !_isDisposed) {
-          final cached = AppCache.instance.getProducts();
-          if (cached != null) {
-            state = AsyncData(cached);
-            _precache(cached);
-            return;
-          }
+        // 🚀 تشغيل المزامنة التفاضلية لجلب التعديلات الجديدة فقط (Delta Sync)
+        await DeltaSyncService.instance.syncProductsDelta();
+
+        // 🔒 حظر الهدر: إذا اكتمل الفحص والكاش متوفر ومحدث، نكتفي به فوراً ونمنع تحميل 2500 منتج
+        final cached = AppCache.instance.getProducts();
+        if (cached != null && cached.isNotEmpty && !_isDisposed) {
+          state = AsyncData(cached);
+          _precache(cached);
+          return; // 👈 خروج فوري يوفر 2500 قراءة Firestore في كل فتحة للتطبيق
         }
       } catch (_) {}
     }
 
+    // لا يتم اللجوء للاستعلام الكامل إلا إذا كان الكاش المحلي فارغاً تماماً
     final fresh = await _silently(
       () => _fetchFromNetwork(categoryId: categoryId),
       tag: 'products-bg-${categoryId ?? "all"}',

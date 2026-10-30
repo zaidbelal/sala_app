@@ -274,7 +274,6 @@ class RealtimeHub {
       _userSubs.remove(_profileSub);
       _profileSub = null;
     }
-
     _profileSub =
         _db.collection('profiles').doc(userId).snapshots().listen((doc) async {
       if (!_initialized || AppStorage.userId != userId) return;
@@ -291,9 +290,10 @@ class RealtimeHub {
         final navContext = NotificationService.navigatorKey.currentContext;
         final container = _container;
 
-        // 🔒 تطهير اشتراكات المستخدم بأمان دون تدمير حاوية التطبيق المركزية
-        await resetOnSignOut();
-
+        // 🔒 جدولة تفريغ الاشتراكات خارج سياق الاستماع لمنع Deadlock
+        Future.microtask(() async {
+          await resetOnSignOut();
+        });
         if (container != null) {
           try {
             container.read(cartProvider.notifier).clear();
@@ -333,6 +333,16 @@ class RealtimeHub {
           name: data['full_name'] as String?,
           phone: data['phone_number'] as String?,
         );
+        unawaited(NotificationService.instance.saveTokenToFirestore(userId));
+
+        // 🚀 تصفير مؤشر الرتبة وإعادة إطلاق قنوات البث المباشر المصرحة فوراً لمنع تجمد الطلبات
+        _activeUserRole = null;
+        Future.microtask(() async {
+          if (AppStorage.userId == userId && _initialized) {
+            await startForUser(userId, role: newRole);
+          }
+        });
+
         final targetRoute = switch (newRole) {
           'admin' ||
           'super_admin' ||
@@ -348,7 +358,6 @@ class RealtimeHub {
         }
         return;
       }
-
       if (newRole != AppStorage.userRole) {
         await AppStorage.saveUserData(
           userId: userId,
@@ -379,10 +388,7 @@ class RealtimeHub {
       }
     }, onError: (_) {});
 
-    if (_profileSub != null) {
-      _userSubs.add(_profileSub!);
-    }
-
+    // تم إلغاء إضافة _profileSub إلى _userSubs لتجنب الإلغاء المزدوج والتعليق البرمجي
     _watchNotifications(userId);
     if (role == 'admin' ||
         role == 'super_admin' ||
@@ -669,6 +675,10 @@ class RealtimeHub {
   }
 
   void _scheduleReconnect() {
+    // 🔒 حظر جدولة إعادة الاتصال إذا كان التطبيق غير مهيأ أو المستخدم مسجل خروجه نهائياً
+    if (!_initialized || !AppStorage.isLoggedIn || _activeUserId == null)
+      return;
+
     _container?.read(realtimeStatusProvider.notifier).state =
         RealtimeStatus.disconnected;
 
@@ -676,7 +686,9 @@ class RealtimeHub {
     if (reconnectAttempts < 6) {
       _reconnectTimer?.cancel();
       _reconnectTimer = Timer(Duration(seconds: 3 * reconnectAttempts), () {
-        if (_initialized) restart();
+        if (_initialized && AppStorage.isLoggedIn && _activeUserId != null) {
+          restart();
+        }
       });
     }
   }
@@ -758,6 +770,8 @@ class RealtimeHub {
       } catch (_) {}
     }
 
+    await _connectivitySub?.cancel();
+    _connectivitySub = null;
     _activeUserId = null;
     _activeUserRole = null;
     reconnectAttempts = 0;

@@ -18,6 +18,7 @@ import 'package:sala/core/constants/app_theme.dart';
 import 'package:sala/app_router.dart';
 import 'package:sala/core/services/image_precache_service.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:sala/core/services/wal_service.dart';
 import 'package:sala/core/services/delta_sync_service.dart';
 
@@ -191,7 +192,7 @@ void main() async {
   if (isFirebaseReady) {
     RealtimeHub().init(container);
     _warmUpCache(container);
-    unawaited(_initializeRemoteConfig());
+    unawaited(_initializeSystemConfig());
 
     if (!kIsWeb) {
       unawaited(_initializeNotifications());
@@ -244,13 +245,31 @@ class _CriticalErrorApp extends StatelessWidget {
   }
 }
 
-Future<void> _initializeRemoteConfig() async {
+Future<void> _initializeSystemConfig() async {
+  // 🔒 1. توحيد مصدر الحقيقة: القراءة المباشرة من نفس مستند Firestore الذي يعتمده السيرفر
+  try {
+    final snap = await FirebaseFirestore.instance
+        .collection('system_config')
+        .doc('app_config')
+        .get(const GetOptions(source: Source.serverAndCache))
+        .timeout(const Duration(seconds: 4));
+
+    if (snap.exists && snap.data() != null) {
+      final val = (snap.data()!['min_order_value'] as num?)?.toDouble();
+      if (val != null && val > 0) {
+        AppConfig.minOrderValue = val;
+        return; // تم التطابق التام مع السيرفر
+      }
+    }
+  } catch (_) {}
+
+  // 2. بديل احتياطي عبر Remote Config في حال تعذر الوصول للوثيقة أو ضعف الاتصال
   try {
     final remoteConfig = FirebaseRemoteConfig.instance;
     await remoteConfig.setConfigSettings(
       RemoteConfigSettings(
-        fetchTimeout: const Duration(seconds: 5),
-        minimumFetchInterval: const Duration(hours: 1),
+        fetchTimeout: const Duration(seconds: 4),
+        minimumFetchInterval: const Duration(minutes: 15),
       ),
     );
     await remoteConfig.setDefaults({'min_order_value': 4250.0});

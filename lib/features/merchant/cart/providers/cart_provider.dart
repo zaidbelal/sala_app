@@ -9,6 +9,7 @@ import '../models/cart_item_model.dart';
 import '../../products/services/products_service.dart';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
+import 'package:sala/core/services/wal_service.dart';
 
 class CartNotifier extends StateNotifier<Map<String, CartItem>> {
   static int _revisionCounter = 0;
@@ -39,12 +40,17 @@ class CartNotifier extends StateNotifier<Map<String, CartItem>> {
   Future<void> _load() async {
     if (kIsWeb) return;
     try {
+      // 🔒 مزامنة خطية: انتظار اكتمال تسوية الـ WAL أولاً بمهلة آمنة لمنع تصادم مسح ملف السلة
+      await WalService.waitForReconciliation.timeout(
+        const Duration(milliseconds: 1500),
+        onTimeout: () => null,
+      );
+
       final revision = await _repository.readRevision(_key);
       if (revision != null) _cartRevision = revision;
       _cartRevision ??= _newCartRevision();
 
       var loaded = await _repository.readCart(_key);
-
       // 🔒 تحفة الترحيل التلقائي: إذا سجل التاجر دخوله وسلته فارغة، ننقل بضائع سلة الزائر السابقة لحسابه فوراً
       final currentUid = AppStorage.userId;
       if ((loaded == null || loaded.isEmpty) &&
@@ -353,46 +359,29 @@ class CartStorageRepository {
 
   Future<Map<String, CartItem>?> readCart(String key) async {
     final file = await _getFile('$key.json');
-    String? raw;
-    if (file != null && await file.exists()) {
-      raw = await file.readAsString();
-    }
-    if (raw != null && raw.trim().isNotEmpty && raw.trim() != '{}') {
-      try {
-        return _decodeCart(raw);
-      } catch (error) {
-        final backupFile = File('${file!.path}.bak');
-        if (await backupFile.exists()) {
-          try {
-            raw = await backupFile.readAsString();
-            final recovered = _decodeCart(raw);
-            try {
-              await backupFile.copy(file.path);
-            } catch (restoreError) {
-              debugPrint('Cart backup recovery could not restore primary file: '
-                  '$restoreError (original parse error: $error)');
-            }
-            return recovered;
-          } catch (backupError) {
-            debugPrint('Cart backup could not be decoded: $backupError');
-          }
-        }
-        raw = null;
-      }
+    if (file == null || !await file.exists()) {
+      // 🔒 إذا كان الملف الأساسي محذوفاً عن قصد، لا نلجأ أبداً للملفات الاحتياطية القديمة
+      return null;
     }
 
-    if (raw == null || raw.trim().isEmpty || raw.trim() == '{}') {
-      final uid = AppStorage.userId ?? 'guest';
-      final fallback = AppStorage.getString('sala_cart_v2_$uid');
-      if (fallback != null &&
-          fallback.trim().isNotEmpty &&
-          fallback.trim() != '{}') {
-        raw = fallback;
-      }
-    }
-    if (raw == null || raw.trim().isEmpty || raw.trim() == '{}') return null;
+    final raw = await file.readAsString();
+    if (raw.trim().isEmpty || raw.trim() == '{}') return null;
 
-    return _decodeCart(raw);
+    try {
+      return _decodeCart(raw);
+    } catch (error) {
+      // لا يُستدعى ملف الباك أب إلا إذا كان الملف الأساسي موجوداً ولكنه تعرض لتلف في محتوى الـ JSON
+      final backupFile = File('${file.path}.bak');
+      if (await backupFile.exists()) {
+        try {
+          final backupRaw = await backupFile.readAsString();
+          final recovered = _decodeCart(backupRaw);
+          await backupFile.copy(file.path);
+          return recovered;
+        } catch (_) {}
+      }
+      return null;
+    }
   }
 
   Map<String, CartItem> _decodeCart(String raw) {

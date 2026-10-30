@@ -451,13 +451,10 @@ class ThermalReceiptWidget extends StatelessWidget {
                           height: 50,
                           fit: BoxFit.contain,
                           errorWidget: (_, __, ___) => const SizedBox.shrink(),
+                          // 🔒 حظر طباعة أي دائرة تحميل على الورق الحراري نهائياً
                           placeholder: (_, __) => const SizedBox(
                             height: 50,
                             width: 50,
-                            child: Center(
-                              child:
-                                  CircularProgressIndicator(strokeWidth: 1.5),
-                            ),
                           ),
                         );
                       }
